@@ -79,6 +79,37 @@ class PackageInfo(BaseModel):
         return self.name.split("/")[1]
 
 
+MAIN_SERVICE_NAME = "main"
+
+
+class VerifierCollectConfig(BaseModel):
+    """A command run in the agent environment after the agent phase ends.
+
+    Collect hooks let tasks snapshot runtime state into files before
+    verification, so artifact entries can transfer them (e.g. capture the
+    agent's change set as ``/logs/artifacts/model.patch`` for a separate
+    verifier). Mirrors Harbor's ``[[verifier.collect]]`` blocks. Pier only
+    supports hooks targeting the main service; hooks targeting compose
+    sidecar services are skipped with a warning.
+    """
+
+    command: str = Field(..., description="Shell command to run in the service.")
+    service: str = Field(
+        default=MAIN_SERVICE_NAME,
+        description="Compose service to run the command in. Defaults to main. "
+        "Pier only runs hooks targeting main (the agent's container).",
+    )
+    timeout_sec: float = Field(
+        default=60.0,
+        description="Timeout in seconds for the collect command.",
+    )
+    user: str | int | None = Field(
+        default=None,
+        description="Username or UID to run the command as. None uses the "
+        "service container's default user.",
+    )
+
+
 class VerifierConfig(BaseModel):
     timeout_sec: float = 600.0
     env: dict[str, str] = Field(default_factory=dict)
@@ -104,6 +135,15 @@ class VerifierConfig(BaseModel):
             "environment_mode='separate'. When unset with "
             "environment_mode='separate', a fresh copy of the top-level "
             "[environment] is used. Conflicts with environment_mode='shared'."
+        ),
+    )
+    collect: list[VerifierCollectConfig] = Field(
+        default_factory=list,
+        description=(
+            "Commands run in the agent environment after the agent phase ends "
+            "and before artifact collection ([[verifier.collect]] blocks in "
+            "task.toml). Use these to snapshot runtime state into files that "
+            "artifact entries can then collect."
         ),
     )
 
