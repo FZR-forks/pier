@@ -866,6 +866,9 @@ class Trial:
                     f"'{hook.service}': {hook.command!r}"
                 )
                 continue
+            self._logger.debug(
+                f"Running collect hook in service '{hook.service}': {hook.command!r}"
+            )
             try:
                 result = await self._environment.exec(
                     command=hook.command,
@@ -874,12 +877,18 @@ class Trial:
                 )
                 if result.return_code != 0:
                     self._logger.warning(
-                        f"Collect hook {hook.command!r} exited {result.return_code}"
+                        f"Collect hook in service '{hook.service}' exited with "
+                        f"code {result.return_code}: {hook.command!r}. "
+                        f"stdout: {result.stdout} stderr: {result.stderr}"
                     )
-            except Exception:
+                else:
+                    self._logger.debug(
+                        f"Collect hook in service '{hook.service}' completed"
+                    )
+            except Exception as exc:
                 self._logger.warning(
-                    f"Collect hook {hook.command!r} failed to run; continuing",
-                    exc_info=True,
+                    f"Collect hook in service '{hook.service}' failed "
+                    f"({hook.command!r}): {exc}"
                 )
 
     async def _maybe_upload_agent_logs(self) -> None:

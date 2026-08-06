@@ -81,16 +81,31 @@ class PackageInfo(BaseModel):
 
 MAIN_SERVICE_NAME = "main"
 
+_COMPOSE_SERVICE_NAME_PATTERN = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_.-]*$")
+
+
+def _validate_compose_service_name(value: str | None) -> str | None:
+    if value is None:
+        return value
+    value = value.strip()
+    if not _COMPOSE_SERVICE_NAME_PATTERN.match(value):
+        raise ValueError(
+            f"Invalid Docker Compose service name: {value!r}. Service names "
+            "must start with an alphanumeric character and contain only "
+            "alphanumeric characters, hyphens, underscores, and dots."
+        )
+    return value
+
 
 class VerifierCollectConfig(BaseModel):
-    """A command run in the agent environment after the agent phase ends.
+    """A command run inside a compose service after the agent phase ends.
 
-    Collect hooks let tasks snapshot runtime state into files before
-    verification, so artifact entries can transfer them (e.g. capture the
-    agent's change set as ``/logs/artifacts/model.patch`` for a separate
-    verifier). Mirrors Harbor's ``[[verifier.collect]]`` blocks. Pier only
-    supports hooks targeting the main service; hooks targeting compose
-    sidecar services are skipped with a warning.
+    Collect hooks let tasks snapshot runtime state into files before the
+    environment is torn down, so the files can be declared as artifacts and
+    read by a separate verifier (e.g. capture the agent's change set as
+    ``/logs/artifacts/model.patch``). Mirrors Harbor's ``[[verifier.collect]]``
+    blocks. Pier only runs hooks targeting the main service; hooks targeting
+    compose sidecar services are skipped with a warning.
     """
 
     command: str = Field(..., description="Shell command to run in the service.")
@@ -108,6 +123,14 @@ class VerifierCollectConfig(BaseModel):
         description="Username or UID to run the command as. None uses the "
         "service container's default user.",
     )
+
+    @field_validator("service")
+    @classmethod
+    def _validate_service(cls, value: str) -> str:
+        validated = _validate_compose_service_name(value)
+        if validated is None:
+            raise ValueError("Collect hook service must not be empty.")
+        return validated
 
 
 class VerifierConfig(BaseModel):
