@@ -14,7 +14,7 @@ from pier.agents.installed.antigravity_sdk_runner import (
     _atomic_json_write,
     build_atif_trajectory,
     isolate_runner_environment,
-    system_first_path,
+    resolve_skill_paths,
     thinking_level,
 )
 from pier.environments.base import BaseEnvironment, ExecResult
@@ -242,17 +242,45 @@ def test_populate_context_validates_trajectory_and_adds_known_cost(
     assert saved.final_metrics.total_cost_usd == 0.25
 
 
-def test_runner_prefers_task_tools_and_isolates_pythonpath(
+def test_runner_preserves_task_path_and_isolates_pythonpath(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    task_path = "/opt/miniconda3/envs/testbed/bin:/usr/local/bin:/usr/bin:/bin"
+    monkeypatch.setenv("PATH", task_path)
     monkeypatch.setenv("PYTHONPATH", "/installed-agent/venv")
     monkeypatch.setenv("PYTHONNOUSERSITE", "1")
 
     isolate_runner_environment()
 
-    assert system_first_path("/agent/bin").startswith("/usr/local/bin:/usr/bin:/bin:")
+    assert os.environ["PATH"] == task_path
     assert "PYTHONPATH" not in os.environ
     assert "PYTHONNOUSERSITE" not in os.environ
+
+
+def test_runner_does_not_create_path_when_unset(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("PATH", raising=False)
+
+    isolate_runner_environment()
+
+    assert "PATH" not in os.environ
+
+
+def test_skill_paths_expand_as_sandbox_user(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("HOME", "/home/agent")
+
+    assert resolve_skill_paths(
+        json.dumps(["~/.claude/skills", "/opt/task-skills"])
+    ) == ["/home/agent/.claude/skills", "/opt/task-skills"]
+    assert resolve_skill_paths("not-json") is None
+    assert resolve_skill_paths(json.dumps({"path": "~/.claude/skills"})) is None
+
+
+def test_default_skill_paths_include_pier_opencode_location() -> None:
+    assert "~/.config/opencode/skills" in AntigravitySDK.DEFAULT_SKILL_PATHS
 
 
 def test_thinking_level_supports_only_sdk_efforts() -> None:

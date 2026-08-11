@@ -2,7 +2,6 @@
 
 import argparse
 import asyncio
-import contextlib
 import enum
 import json
 import logging
@@ -11,8 +10,6 @@ import sys
 from importlib.metadata import version
 from pathlib import Path
 from typing import Any
-
-_SYSTEM_PATH = "/usr/local/bin:/usr/bin:/bin"
 
 
 def _value(value: Any) -> Any:
@@ -55,15 +52,25 @@ def _result_content(result: Any) -> str:
     return _content(value)
 
 
-def system_first_path(path: str) -> str:
-    """Prefer tools from the task image over the runner virtual environment."""
-    return f"{_SYSTEM_PATH}:{path}"
-
-
 def isolate_runner_environment() -> None:
     """Keep runner-only Python packages out of commands executed by the agent."""
     for name in ("PYTHONPATH", "PYTHONNOUSERSITE"):
         os.environ.pop(name, None)
+
+
+def resolve_skill_paths(raw_paths: str | None) -> list[str] | None:
+    """Parse configured skill paths and expand them as the sandbox agent user."""
+    if not raw_paths:
+        return None
+    try:
+        parsed = json.loads(raw_paths)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(parsed, list) or not all(
+        isinstance(path, str) for path in parsed
+    ):
+        return None
+    return [str(Path(path).expanduser()) for path in parsed]
 
 
 def thinking_level(effort: str, levels: Any) -> Any:
@@ -308,7 +315,6 @@ async def run_agent(args: Any) -> None:
     )
 
     logging.getLogger().setLevel(logging.ERROR)
-    os.environ["PATH"] = system_first_path(os.environ.get("PATH", ""))
     isolate_runner_environment()
 
     model = os.environ.get("MODEL_NAME")
@@ -351,14 +357,7 @@ async def run_agent(args: Any) -> None:
         ),
     )
 
-    skills_paths = None
-    if raw_skills_paths := os.environ.get("SKILLS_PATHS_JSON"):
-        with contextlib.suppress(json.JSONDecodeError):
-            parsed = json.loads(raw_skills_paths)
-            if isinstance(parsed, list) and all(
-                isinstance(path, str) for path in parsed
-            ):
-                skills_paths = parsed
+    skills_paths = resolve_skill_paths(os.environ.get("SKILLS_PATHS_JSON"))
 
     trajectory_path = Path(args.trajectory_path)
     raw_events_path = Path(args.logs_dir) / "antigravity-sdk-events.jsonl"

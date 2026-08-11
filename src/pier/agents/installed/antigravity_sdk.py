@@ -33,7 +33,7 @@ class AntigravitySDK(BaseInstalledAgent):
         "~/.codex/skills",
         "~/.agents/skills",
         "~/.gemini/skills",
-        "~/.opencode/skill",
+        "~/.config/opencode/skills",
     ]
 
     def __init__(
