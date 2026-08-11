@@ -94,6 +94,11 @@ def test_agent_is_registered_and_uses_pinned_runtime(tmp_path: Path) -> None:
     assert "google-antigravity==0.1.9" in spec.steps[0].run
     assert "mcp==1.27.2" in spec.steps[0].run
     assert "protobuf==7.35.1" in spec.steps[0].run
+    assert "https://astral.sh/uv/0.7.13/install.sh" in spec.steps[0].run
+    assert "sha256sum -c -" in spec.steps[0].run
+    assert (
+        "curl -LsSf https://astral.sh/uv/0.7.13/install.sh |" not in spec.steps[0].run
+    )
     assert "--require-hashes" in spec.steps[0].run
     assert "--no-deps" in spec.steps[0].run
     assert "-r /installed-agent/antigravity_sdk_requirements.lock" in spec.steps[0].run
@@ -416,6 +421,86 @@ def test_collector_deduplicates_mcp_calls_and_matches_idless_results() -> None:
     ]
     assert response["observation"]["results"] == [
         {"source_call_id": "call-1", "content": "It timed out."}
+    ]
+
+
+def test_collector_updates_cumulative_tool_output_and_prefers_hook_result() -> None:
+    collector = AtifCollector("Investigate", "gemini-3.6-flash", "model")
+    call = SimpleNamespace(
+        id="call-1",
+        name="run_command",
+        server_name=None,
+        args={"command": "pytest"},
+        output="",
+    )
+    dispatch = _step(id="tool", type="TOOL_CALL", tool_calls=[call])
+
+    collector.record_step(dispatch)
+    call.output = "partial"
+    collector.record_step(dispatch)
+    collector.record_tool_result(
+        SimpleNamespace(
+            id="call-1",
+            name="run_command",
+            server_name=None,
+            result="complete",
+            error=None,
+        )
+    )
+    call.output = "late snapshot"
+    collector.record_step(dispatch)
+
+    assert collector.steps[1]["observation"]["results"] == [
+        {"source_call_id": "call-1", "content": "complete"}
+    ]
+
+
+def test_idless_result_does_not_replace_another_calls_snapshot() -> None:
+    collector = AtifCollector("Investigate", "gemini-3.6-flash", "model")
+    collector.record_step(
+        _step(
+            id="first-tool",
+            type="TOOL_CALL",
+            tool_calls=[
+                SimpleNamespace(
+                    id="call-1",
+                    name="run_command",
+                    server_name=None,
+                    args={"command": "first"},
+                    output="first result",
+                )
+            ],
+        )
+    )
+    collector.record_step(
+        _step(
+            id="second-tool",
+            type="TOOL_CALL",
+            tool_calls=[
+                SimpleNamespace(
+                    id="call-2",
+                    name="run_command",
+                    server_name=None,
+                    args={"command": "second"},
+                    output=None,
+                )
+            ],
+        )
+    )
+
+    collector.record_tool_result(
+        SimpleNamespace(
+            id=None,
+            name="run_command",
+            server_name=None,
+            result="second result",
+            error=None,
+        )
+    )
+
+    assert collector.steps[1]["observation"]["results"] == [
+        {"source_call_id": "call-1", "content": "first result"},
+        {"source_call_id": "call-2", "content": "second result"},
     ]
 
 

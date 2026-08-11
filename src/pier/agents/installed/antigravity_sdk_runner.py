@@ -118,6 +118,7 @@ class AtifCollector:
         self._content: dict[str, str] = {}
         self._thinking: dict[str, str] = {}
         self._seen_tool_results: set[str] = set()
+        self._tool_output_snapshots: set[str] = set()
         self._tool_groups: dict[str, dict[str, Any]] = {}
         self._tool_metadata: dict[str, tuple[str, str | None]] = {}
         self._unmatched_results: list[Any] = []
@@ -228,6 +229,7 @@ class AtifCollector:
             elif call_id not in self._seen_tool_results:
                 existing.update(converted)
             if getattr(call, "output", None) is not None:
+                self._tool_output_snapshots.add(call_id)
                 self._add_observation(call_id, _content(call.output))
         self._match_results()
 
@@ -261,6 +263,7 @@ class AtifCollector:
                 candidate
                 for candidate, (name, server) in self._tool_metadata.items()
                 if candidate not in self._seen_tool_results
+                and candidate not in self._tool_output_snapshots
                 and name == result_name
                 and (result_server is None or server == result_server)
             ]
@@ -272,17 +275,32 @@ class AtifCollector:
         if call_id in self._seen_tool_results:
             return True
         self._seen_tool_results.add(call_id)
-        self._add_observation(call_id, _result_content(result))
+        self._add_observation(call_id, _result_content(result), authoritative=True)
         return True
 
-    def _add_observation(self, call_id: str, content: str) -> None:
+    def _add_observation(
+        self, call_id: str, content: str, *, authoritative: bool = False
+    ) -> None:
         step = self._tool_groups.get(call_id)
         if step is None:
             return
-        observation = step.setdefault("observation", {"results": []})
-        if any(item["source_call_id"] == call_id for item in observation["results"]):
+        if not authoritative and call_id in self._seen_tool_results:
             return
-        observation["results"].append({"source_call_id": call_id, "content": content})
+        observation = step.setdefault("observation", {"results": []})
+        existing = next(
+            (
+                item
+                for item in observation["results"]
+                if item["source_call_id"] == call_id
+            ),
+            None,
+        )
+        if existing is None:
+            observation["results"].append(
+                {"source_call_id": call_id, "content": content}
+            )
+        else:
+            existing["content"] = content
 
     def totals(self) -> tuple[int, int, int]:
         prompt = sum(

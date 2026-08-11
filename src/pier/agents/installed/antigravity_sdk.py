@@ -15,6 +15,10 @@ from pier.utils.trajectory_metrics import populate_context_from_final_metrics
 from pier.utils.trajectory_utils import format_trajectory_json
 
 _SDK_VERSION = "0.1.9"
+_UV_VERSION = "0.7.13"
+_UV_INSTALLER_SHA256 = (
+    "1bd6dcfae3377079ed9ebeb47cc814b0a9b6f42a81089e97de49cd26f7b9d2d2"
+)
 _REASONING_EFFORTS = frozenset(("minimal", "low", "medium", "high"))
 _REQUIREMENTS_LOCK = "antigravity_sdk_requirements.lock"
 
@@ -96,7 +100,11 @@ elif command -v yum >/dev/null 2>&1; then
 else
   command -v curl >/dev/null 2>&1
 fi
-curl -LsSf https://astral.sh/uv/0.7.13/install.sh | env UV_INSTALL_DIR=/usr/local/bin sh
+command -v sha256sum >/dev/null 2>&1
+UV_INSTALLER=/tmp/uv-{_UV_VERSION}-installer.sh
+curl -LsSf https://astral.sh/uv/{_UV_VERSION}/install.sh -o "$UV_INSTALLER"
+echo "{_UV_INSTALLER_SHA256}  $UV_INSTALLER" | sha256sum -c -
+env UV_INSTALL_DIR=/usr/local/bin sh "$UV_INSTALLER"
 mkdir -p /installed-agent
 uv venv --python 3.12 /installed-agent/venv
 cat > /installed-agent/{_REQUIREMENTS_LOCK} <<'PIER_ANTIGRAVITY_REQUIREMENTS'
@@ -125,6 +133,7 @@ chmod +x /installed-agent/venv/lib/python3.12/site-packages/google/antigravity/b
             verification_command=self.get_version_command(),
             metadata={
                 "python": "3.12",
+                "uv": _UV_VERSION,
                 "google-antigravity": _SDK_VERSION,
                 "requirements-lock": _REQUIREMENTS_LOCK,
             },
