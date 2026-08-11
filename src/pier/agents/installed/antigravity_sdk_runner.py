@@ -202,7 +202,9 @@ class AtifCollector:
         content = getattr(step, "content", "") or ""
         if content or step_key not in self._content:
             self._content[step_key] = content
-        self._thinking[step_key] = getattr(step, "thinking", "") or ""
+        thinking = getattr(step, "thinking", "") or ""
+        if thinking or step_key not in self._thinking:
+            self._thinking[step_key] = thinking
         group["message"] = "\n".join(
             value
             for key, value in self._content.items()

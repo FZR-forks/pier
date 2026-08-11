@@ -333,6 +333,15 @@ def test_collector_keeps_only_latest_cumulative_model_text() -> None:
     assert collector.complete_response_seen
 
 
+def test_empty_cumulative_update_does_not_erase_reasoning_chunk() -> None:
+    collector = AtifCollector("Fix it", "gemini-3.6-flash", "model")
+    collector.record_step(_step(id="thinking-1", thinking="First thought"))
+    collector.record_step(_step(id="thinking-2", thinking="Second thought"))
+    collector.record_step(_step(id="thinking-1", thinking=""))
+
+    assert collector.steps[1]["reasoning_content"] == ("First thought\nSecond thought")
+
+
 def test_system_originated_mcp_call_remains_an_agent_action() -> None:
     collector = AtifCollector("Fix it", "gemini-3.6-flash", "model")
     collector.record_step(
