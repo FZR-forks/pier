@@ -15,7 +15,8 @@ from pier.utils.trajectory_metrics import populate_context_from_final_metrics
 from pier.utils.trajectory_utils import format_trajectory_json
 
 _SDK_VERSION = "0.1.9"
-_REASONING_EFFORTS = frozenset(("minimal", "low", "medium", "high", "xhigh", "max"))
+_REASONING_EFFORTS = frozenset(("minimal", "low", "medium", "high"))
+_REQUIREMENTS_LOCK = "antigravity_sdk_requirements.lock"
 
 
 class AntigravitySDK(BaseInstalledAgent):
@@ -38,7 +39,7 @@ class AntigravitySDK(BaseInstalledAgent):
     def __init__(
         self,
         *args: Any,
-        reasoning_effort: str = "medium",
+        reasoning_effort: str | None = "medium",
         load_skills: bool = True,
         skill_paths: list[str] | None = None,
         version: str | None = None,
@@ -49,7 +50,9 @@ class AntigravitySDK(BaseInstalledAgent):
                 f"Antigravity SDK runner requires google-antigravity=={_SDK_VERSION}; "
                 f"got version={version!r}"
             )
-        normalized_effort = reasoning_effort.lower()
+        normalized_effort = (
+            reasoning_effort if reasoning_effort is not None else "medium"
+        ).lower()
         if normalized_effort not in _REASONING_EFFORTS:
             raise ValueError(
                 f"Invalid reasoning_effort {reasoning_effort!r}. Valid values: "
@@ -78,6 +81,7 @@ class AntigravitySDK(BaseInstalledAgent):
 
     @override
     def install_spec(self) -> AgentInstallSpec:
+        requirements_lock = Path(__file__).with_name(_REQUIREMENTS_LOCK).read_text()
         install = f"""
 set -euo pipefail
 if command -v apt-get >/dev/null 2>&1; then
@@ -95,11 +99,13 @@ fi
 curl -LsSf https://astral.sh/uv/0.7.13/install.sh | env UV_INSTALL_DIR=/usr/local/bin sh
 mkdir -p /installed-agent
 uv venv --python 3.12 /installed-agent/venv
+cat > /installed-agent/{_REQUIREMENTS_LOCK} <<'PIER_ANTIGRAVITY_REQUIREMENTS'
+{requirements_lock.rstrip()}
+PIER_ANTIGRAVITY_REQUIREMENTS
 uv pip install --python {self._PYTHON_PATH} \
-  cryptography==46.0.7 \
-  fastapi==0.141.1 \
-  google-antigravity=={_SDK_VERSION} \
-  protobuf==7.35.1
+  --require-hashes \
+  --no-deps \
+  -r /installed-agent/{_REQUIREMENTS_LOCK}
 chmod -R a+rX /installed-agent/venv
 chmod +x /installed-agent/venv/lib/python3.12/site-packages/google/antigravity/bin/localharness
 """.strip()
@@ -117,7 +123,11 @@ chmod +x /installed-agent/venv/lib/python3.12/site-packages/google/antigravity/b
                 InstallStep(user="agent", run=self.get_version_command() or "true"),
             ],
             verification_command=self.get_version_command(),
-            metadata={"python": "3.12", "google-antigravity": _SDK_VERSION},
+            metadata={
+                "python": "3.12",
+                "google-antigravity": _SDK_VERSION,
+                "requirements-lock": _REQUIREMENTS_LOCK,
+            },
         )
 
     @override

@@ -105,9 +105,11 @@ A few things we've learned plumbing this through Respan and OpenRouter:
 ```
 
 **Antigravity SDK** runs Google's Python SDK with its platform-specific local
-harness in an isolated Python 3.12 environment. It supports Pier skills, stdio
-and streamable-HTTP MCP servers, and live ATIF checkpoints. SSE MCP servers are
-not supported by google-antigravity 0.1.9.
+harness in an isolated Python 3.12 environment with hash-verified, fully locked
+dependencies. It supports Pier skills, stdio and streamable-HTTP MCP servers,
+and live ATIF checkpoints. `reasoning_effort` accepts `minimal`, `low`, `medium`,
+or `high`; `None` uses `medium`. SSE MCP servers are not supported by
+google-antigravity 0.1.9.
 
 ```yaml
 - name: antigravity-sdk

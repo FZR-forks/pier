@@ -1,8 +1,4 @@
-"""Run google-antigravity 0.1.9 and persist its stream as ATIF v1.7.
-
-Adapted from Shadow's runner in sdlc-samples, which in turn follows Harbor's
-Antigravity integration at revision 72bc40b1e58b47a9cc6e0f14c29aced3a9e53767.
-"""
+"""Run google-antigravity 0.1.9 and persist its stream as ATIF v1.7."""
 
 import argparse
 import asyncio
@@ -71,14 +67,12 @@ def isolate_runner_environment() -> None:
 
 
 def thinking_level(effort: str, levels: Any) -> Any:
-    """Map Pier's effort vocabulary onto Antigravity's supported levels."""
+    """Map a validated effort value onto Antigravity's supported levels."""
     mapping = {
         "minimal": levels.MINIMAL,
         "low": levels.LOW,
         "medium": levels.MEDIUM,
         "high": levels.HIGH,
-        "xhigh": levels.HIGH,
-        "max": levels.HIGH,
     }
     if effort not in mapping:
         raise ValueError(f"invalid REASONING_EFFORT value: {effort}")

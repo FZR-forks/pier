@@ -91,7 +91,12 @@ def test_agent_is_registered_and_uses_pinned_runtime(tmp_path: Path) -> None:
     assert spec.version == "0.1.9"
     assert "uv venv --python 3.12 /installed-agent/venv" in spec.steps[0].run
     assert "google-antigravity==0.1.9" in spec.steps[0].run
+    assert "mcp==1.27.2" in spec.steps[0].run
     assert "protobuf==7.35.1" in spec.steps[0].run
+    assert "--require-hashes" in spec.steps[0].run
+    assert "--no-deps" in spec.steps[0].run
+    assert "-r /installed-agent/antigravity_sdk_requirements.lock" in spec.steps[0].run
+    assert spec.metadata["requirements-lock"] == "antigravity_sdk_requirements.lock"
     assert spec.steps[-1].user == "agent"
     assert "google-antigravity" in spec.steps[-1].run
 
@@ -169,6 +174,14 @@ def test_invalid_version_and_reasoning_effort_fail_early(tmp_path: Path) -> None
         _agent(tmp_path, version="0.2.0")
     with pytest.raises(ValueError, match="Invalid reasoning_effort"):
         _agent(tmp_path, reasoning_effort="maximum")
+    with pytest.raises(ValueError, match="Invalid reasoning_effort"):
+        _agent(tmp_path, reasoning_effort="xhigh")
+
+
+def test_none_reasoning_effort_uses_medium_default(tmp_path: Path) -> None:
+    agent = _agent(tmp_path, reasoning_effort=None)
+
+    assert agent._reasoning_effort == "medium"
 
 
 @pytest.mark.asyncio
@@ -242,14 +255,12 @@ def test_runner_prefers_task_tools_and_isolates_pythonpath(
     assert "PYTHONNOUSERSITE" not in os.environ
 
 
-def test_thinking_level_folds_pier_efforts_and_rejects_unknown() -> None:
+def test_thinking_level_supports_only_sdk_efforts() -> None:
     levels = SimpleNamespace(MINIMAL="minimal", LOW="low", MEDIUM="medium", HIGH="high")
 
     assert thinking_level("medium", levels) == "medium"
-    assert thinking_level("xhigh", levels) == "high"
-    assert thinking_level("max", levels) == "high"
     with pytest.raises(ValueError, match="REASONING_EFFORT"):
-        thinking_level("maximum", levels)
+        thinking_level("xhigh", levels)
 
 
 def test_collector_groups_cumulative_text_thinking_tools_and_usage() -> None:
