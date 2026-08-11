@@ -99,6 +99,8 @@ def test_agent_is_registered_and_uses_pinned_runtime(tmp_path: Path) -> None:
     assert (
         "curl -LsSf https://astral.sh/uv/0.7.13/install.sh |" not in spec.steps[0].run
     )
+    assert "UV_PYTHON_INSTALL_DIR=/installed-agent/python" in spec.steps[0].run
+    assert "chmod -R a+rX /installed-agent" in spec.steps[0].run
     assert "--require-hashes" in spec.steps[0].run
     assert "--no-deps" in spec.steps[0].run
     assert "-r /installed-agent/antigravity_sdk_requirements.lock" in spec.steps[0].run

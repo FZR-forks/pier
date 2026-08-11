@@ -106,6 +106,7 @@ curl -LsSf https://astral.sh/uv/{_UV_VERSION}/install.sh -o "$UV_INSTALLER"
 echo "{_UV_INSTALLER_SHA256}  $UV_INSTALLER" | sha256sum -c -
 env UV_INSTALL_DIR=/usr/local/bin sh "$UV_INSTALLER"
 mkdir -p /installed-agent
+export UV_PYTHON_INSTALL_DIR=/installed-agent/python
 uv venv --python 3.12 /installed-agent/venv
 cat > /installed-agent/{_REQUIREMENTS_LOCK} <<'PIER_ANTIGRAVITY_REQUIREMENTS'
 {requirements_lock.rstrip()}
@@ -114,7 +115,7 @@ uv pip install --python {self._PYTHON_PATH} \
   --require-hashes \
   --no-deps \
   -r /installed-agent/{_REQUIREMENTS_LOCK}
-chmod -R a+rX /installed-agent/venv
+chmod -R a+rX /installed-agent
 chmod +x /installed-agent/venv/lib/python3.12/site-packages/google/antigravity/bin/localharness
 """.strip()
         return AgentInstallSpec(
