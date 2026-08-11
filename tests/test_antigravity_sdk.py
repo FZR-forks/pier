@@ -1,6 +1,5 @@
 import enum
 import json
-import os
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
@@ -14,7 +13,6 @@ from pier.agents.installed.antigravity_sdk_runner import (
     _append_jsonl,
     _atomic_json_write,
     build_atif_trajectory,
-    isolate_runner_environment,
     resolve_skill_paths,
     thinking_level,
 )
@@ -250,31 +248,6 @@ def test_populate_context_validates_trajectory_and_adds_known_cost(
     assert saved.final_metrics.total_cost_usd == 0.25
 
 
-def test_runner_preserves_task_path_and_isolates_pythonpath(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    task_path = "/opt/miniconda3/envs/testbed/bin:/usr/local/bin:/usr/bin:/bin"
-    monkeypatch.setenv("PATH", task_path)
-    monkeypatch.setenv("PYTHONPATH", "/installed-agent/venv")
-    monkeypatch.setenv("PYTHONNOUSERSITE", "1")
-
-    isolate_runner_environment()
-
-    assert os.environ["PATH"] == task_path
-    assert "PYTHONPATH" not in os.environ
-    assert "PYTHONNOUSERSITE" not in os.environ
-
-
-def test_runner_does_not_create_path_when_unset(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.delenv("PATH", raising=False)
-
-    isolate_runner_environment()
-
-    assert "PATH" not in os.environ
-
-
 def test_skill_paths_expand_as_sandbox_user(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -389,6 +362,41 @@ def test_system_originated_mcp_call_remains_an_agent_action() -> None:
     assert mcp_step.tool_calls[0].function_name == "mcp_user_message_user"
     assert mcp_step.observation is not None
     assert mcp_step.observation.results[0].content == "hello, world"
+
+
+def test_cumulative_system_note_is_promoted_before_agent_fields_are_added() -> None:
+    collector = AtifCollector("Fix it", "gemini-3.6-flash", "model", "high")
+    collector.record_step(
+        _step(id="system-step", source="system", content="Preparing", status="DONE")
+    )
+    collector.record_step(
+        _step(
+            id="system-step",
+            source="system",
+            type="TOOL_CALL",
+            content="",
+            tool_calls=[
+                SimpleNamespace(
+                    id="call-1",
+                    name="run_command",
+                    server_name=None,
+                    args={"command": "pytest"},
+                    output="passed",
+                )
+            ],
+            usage_metadata=_usage(),
+        )
+    )
+
+    trajectory = Trajectory.model_validate(
+        build_atif_trajectory(collector.steps, *collector.totals())
+    )
+    promoted = trajectory.steps[1]
+    assert promoted.source == "agent"
+    assert promoted.message == "Preparing"
+    assert promoted.reasoning_effort == "high"
+    assert promoted.tool_calls is not None
+    assert promoted.metrics is not None
 
 
 def test_collector_deduplicates_mcp_calls_and_matches_idless_results() -> None:

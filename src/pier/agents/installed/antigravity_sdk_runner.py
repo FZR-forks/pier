@@ -52,12 +52,6 @@ def _result_content(result: Any) -> str:
     return _content(value)
 
 
-def isolate_runner_environment() -> None:
-    """Keep runner-only Python packages out of commands executed by the agent."""
-    for name in ("PYTHONPATH", "PYTHONNOUSERSITE"):
-        os.environ.pop(name, None)
-
-
 def resolve_skill_paths(raw_paths: str | None) -> list[str] | None:
     """Parse configured skill paths and expand them as the sandbox agent user."""
     if not raw_paths:
@@ -188,10 +182,26 @@ class AtifCollector:
                     "message": step.content,
                 }
                 self._step_groups[step_key] = system_step
+                self._content[step_key] = system_step["message"]
                 self.steps.append(system_step)
             return
 
-        self._content[step_key] = getattr(step, "content", "") or ""
+        if group["source"] != "agent" and starts_call:
+            group.update(
+                {
+                    "source": "agent",
+                    "model_name": self.normalized_model,
+                    "llm_call_count": 1,
+                }
+            )
+            if self.reasoning_effort:
+                group["reasoning_effort"] = self.reasoning_effort
+            self._current = group
+            self._current_closed = False
+
+        content = getattr(step, "content", "") or ""
+        if content or step_key not in self._content:
+            self._content[step_key] = content
         self._thinking[step_key] = getattr(step, "thinking", "") or ""
         group["message"] = "\n".join(
             value
@@ -334,7 +344,6 @@ async def run_agent(args: Any) -> None:
     )
 
     logging.getLogger().setLevel(logging.ERROR)
-    isolate_runner_environment()
 
     model = os.environ.get("MODEL_NAME")
     api_key = os.environ.get("GEMINI_API_KEY")
