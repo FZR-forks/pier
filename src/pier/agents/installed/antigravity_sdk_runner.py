@@ -213,10 +213,11 @@ class AtifCollector:
                 getattr(call, "server_name", None),
             )
             tool_calls = group.setdefault("tool_calls", [])
+            arguments = _value(call.args or {})
             converted = {
                 "tool_call_id": call_id,
                 "function_name": _tool_name(call),
-                "arguments": call.args or {},
+                "arguments": arguments if isinstance(arguments, dict) else {},
             }
             existing = next(
                 (item for item in tool_calls if item["tool_call_id"] == call_id),

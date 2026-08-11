@@ -1,3 +1,4 @@
+import enum
 import json
 import os
 from pathlib import Path
@@ -416,6 +417,43 @@ def test_collector_deduplicates_mcp_calls_and_matches_idless_results() -> None:
     assert response["observation"]["results"] == [
         {"source_call_id": "call-1", "content": "It timed out."}
     ]
+
+
+def test_collector_normalizes_tool_arguments_to_json_safe_dict(
+    tmp_path: Path,
+) -> None:
+    class Mode(enum.Enum):
+        FAST = "fast"
+
+    collector = AtifCollector("Investigate", "gemini-3.6-flash", "model")
+    collector.record_step(
+        _step(
+            id="tool",
+            type="TOOL_CALL",
+            tool_calls=[
+                SimpleNamespace(
+                    id="call-1",
+                    name="run_command",
+                    server_name=None,
+                    args={"mode": Mode.FAST},
+                ),
+                SimpleNamespace(
+                    id="call-2",
+                    name="run_command",
+                    server_name=None,
+                    args=Mode.FAST,
+                ),
+            ],
+        )
+    )
+
+    tool_calls = collector.steps[1]["tool_calls"]
+    assert tool_calls[0]["arguments"] == {"mode": "fast"}
+    assert tool_calls[1]["arguments"] == {}
+    _atomic_json_write(
+        tmp_path / "trajectory.json",
+        build_atif_trajectory(collector.steps, 0, 0, 0),
+    )
 
 
 def test_live_persistence_and_incomplete_marker(tmp_path: Path) -> None:
