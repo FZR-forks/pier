@@ -19,7 +19,7 @@ Pier is a fork. We wanted a smaller, more opinionated base to build on. On top o
 
 - **Task format:** Harbor-compatible.
 - **Environments:** `docker`, `modal`. Per-agent install specs and network allowlists are honored on both, so installed agents work under `allow_internet = false`.
-- **Agents:** `nop`, `oracle`, `antigravity-sdk`, `claude-code`, `codex`, `cursor-cli`, `gemini-cli`, `opencode`, `mini-swe-agent`. All emit augmented ATIF v1.7.
+- **Agents:** `nop`, `oracle`, `antigravity-sdk`, `claude-code`, `codex`, `cursor-cli`, `gemini-cli`, `opencode`, `mini-swe-agent`, `pi`. All emit augmented ATIF v1.7.
 - **Datasets:** local Harbor-format task directories via `-p` / `--path`.
 - **CLI:** `pier run`, `pier job`, `pier view`, `pier critique run`, `pier check` / `pier analyze` (vendored from Harbor)
 
@@ -133,6 +133,29 @@ through your env file.
 ```
 
 **OpenCode** uses `opencode_config` to add unknown providers or override known ones. To redirect Google to Respan, override just `options.baseURL`; to add a fully custom provider, use `opencode_config.provider.<name>` with the npm package, options, and models.
+
+**Pi** resolves `--model` against its own built-in catalog, so a gateway or proxy needs a provider entry in `models.json`. Setting the provider's base-URL env var (`OPENAI_BASE_URL`, `ANTHROPIC_BASE_URL`) generates one automatically, which routes pi's built-in models through the endpoint while keeping their shipped cost and capability metadata. Use `pi_config` to declare a slug that is not in the catalog; supply its `cost` (per million tokens) so pi can price it, otherwise Pier falls back to the LiteLLM price table and leaves `cost_usd` unset for a private slug. `pi_config` is deep-merged over the generated config, and any `baseUrl` in it is added to the network allowlist.
+
+Pi has no built-in MCP support (configured MCP servers are ignored with a warning) and no resume support. Skills are copied to `~/.agents/skills`. `PI_OFFLINE=1` and `PI_SKIP_VERSION_CHECK=1` are set by default so pi's startup update check does not hit the egress proxy on no-network tasks; override them via `env` if needed.
+
+```yaml
+- name: pi
+  model_name: openai/my-proxy-slug
+  env:
+    OPENAI_API_KEY: ${OPENAI_API_KEY}
+    OPENAI_BASE_URL: ${OPENAI_BASE_URL}
+  kwargs:
+    thinking: medium
+    pi_config:
+      providers:
+        openai:
+          api: openai-completions
+          models:
+            - id: my-proxy-slug
+              reasoning: true
+              contextWindow: 400000
+              cost: { input: 1.25, output: 10.0, cacheRead: 0.125 }
+```
 
 **mini-swe-agent** picks a native adapter from the model-name prefix: `openai/...` → `litellm_response` (OpenAI Responses end-to-end), `openrouter/...` → `openrouter` (BYOK costs from `cost_details.upstream_inference_cost`), everything else → LiteLLM auto.
 
