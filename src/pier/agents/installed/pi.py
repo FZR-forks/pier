@@ -266,7 +266,7 @@ class Pi(BaseInstalledAgent):
         escaped = shlex.quote(json.dumps(config, indent=2))
         return (
             f'mkdir -p "$(dirname {self._MODELS_JSON_PATH})" && '
-            f"echo {escaped} > {self._MODELS_JSON_PATH}"
+            f"printf '%s\\n' {escaped} > {self._MODELS_JSON_PATH}"
         )
 
     def _build_register_skills_command(self) -> str | None:
@@ -515,6 +515,8 @@ class Pi(BaseInstalledAgent):
 
         observation_results: list[ObservationResult] = []
         tool_input = tool_output = 0
+        tool_cached = tool_cache_write = tool_cache_write_1h = 0
+        tool_reasoning = 0
         tool_cost = 0.0
         for result in record["tool_results"]:
             observation_results.append(
@@ -530,6 +532,10 @@ class Pi(BaseInstalledAgent):
                 tool_usage = result["usage"]
                 tool_input += int(tool_usage.get("input") or 0)
                 tool_output += int(tool_usage.get("output") or 0)
+                tool_cached += int(tool_usage.get("cacheRead") or 0)
+                tool_cache_write += int(tool_usage.get("cacheWrite") or 0)
+                tool_cache_write_1h += int(tool_usage.get("cacheWrite1h") or 0)
+                tool_reasoning += int(tool_usage.get("reasoning") or 0)
                 cost = tool_usage.get("cost")
                 if isinstance(cost, dict):
                     tool_cost += float(cost.get("total") or 0.0)
@@ -599,11 +605,12 @@ class Pi(BaseInstalledAgent):
             step_kwargs["extra"] = step_extra
 
         totals: dict[str, int | float] = {
-            "prompt": prompt_tokens + tool_input,
+            "prompt": prompt_tokens + tool_input + tool_cached + tool_cache_write,
             "completion": output_tokens + tool_output,
-            "cached": cache_read,
-            "cache_write": cache_write,
-            "reasoning": reasoning_tokens,
+            "cached": cache_read + tool_cached,
+            "cache_write": cache_write + tool_cache_write,
+            "cache_write_1h": cache_write_1h + tool_cache_write_1h,
+            "reasoning": reasoning_tokens + tool_reasoning,
             "cost": cost_total + tool_cost,
         }
         return Step(**step_kwargs), totals
@@ -619,6 +626,8 @@ class Pi(BaseInstalledAgent):
         output_tokens = int(usage.get("output") or 0)
         cache_read = int(usage.get("cacheRead") or 0)
         cache_write = int(usage.get("cacheWrite") or 0)
+        cache_write_1h = int(usage.get("cacheWrite1h") or 0)
+        reasoning_tokens = int(usage.get("reasoning") or 0)
         cost_total = 0.0
         if isinstance(usage.get("cost"), dict):
             cost_total = float(usage["cost"].get("total") or 0.0)
@@ -642,6 +651,9 @@ class Pi(BaseInstalledAgent):
                 "prompt_tokens": prompt_tokens,
                 "completion_tokens": output_tokens,
                 "cached_tokens": cache_read,
+                "cache_write_tokens": cache_write,
+                "cache_write_1h_tokens": cache_write_1h,
+                "reasoning_tokens": reasoning_tokens,
                 "cost_usd": cost_total,
             }
 
@@ -657,7 +669,8 @@ class Pi(BaseInstalledAgent):
             "completion": output_tokens,
             "cached": cache_read,
             "cache_write": cache_write,
-            "reasoning": 0,
+            "cache_write_1h": cache_write_1h,
+            "reasoning": reasoning_tokens,
             "cost": cost_total,
         }
         return Step(**step_kwargs), totals
@@ -727,14 +740,16 @@ class Pi(BaseInstalledAgent):
             "completion": 0,
             "cached": 0,
             "cache_write": 0,
+            "cache_write_1h": 0,
             "reasoning": 0,
             "cost": 0.0,
         }
         summarization_count = 0
         compaction_reasons: list[str] = []
 
-        # The instruction is passed as a CLI argument rather than emitted as an
-        # event, so the opening user step is synthesised from what was sent.
+        # The instruction is piped through stdin rather than passed as a CLI
+        # argument or emitted as an event, so the opening user step is synthesised
+        # from what was sent.
         if self._instruction:
             steps.append(Step(step_id=1, source="user", message=self._instruction))
 
@@ -767,6 +782,8 @@ class Pi(BaseInstalledAgent):
         final_extra: dict[str, Any] = {}
         if totals["cache_write"]:
             final_extra["total_cache_write_tokens"] = totals["cache_write"]
+        if totals["cache_write_1h"]:
+            final_extra["total_cache_write_1h_tokens"] = totals["cache_write_1h"]
         if totals["reasoning"]:
             final_extra["total_reasoning_tokens"] = totals["reasoning"]
         if summarization_count:
@@ -787,7 +804,7 @@ class Pi(BaseInstalledAgent):
             extra=extra_with_context_metrics(
                 final_extra or None,
                 peak_context_tokens=peak_context_tokens_from_steps(steps),
-                summarization_count=summarization_count or None,
+                summarization_count=summarization_count,
             ),
         )
 

@@ -1,7 +1,9 @@
 import json
+import re
 from pathlib import Path
 from typing import Any, cast
 
+import litellm
 import pytest
 
 from pier.agents.factory import AgentFactory
@@ -54,6 +56,7 @@ def usage(
     output: int = 0,
     cache_read: int = 0,
     cache_write: int = 0,
+    cache_write_1h: int = 0,
     reasoning: int = 0,
     cost: float = 0.0,
 ) -> dict:
@@ -63,6 +66,7 @@ def usage(
         "output": output,
         "cacheRead": cache_read,
         "cacheWrite": cache_write,
+        "cacheWrite1h": cache_write_1h,
         "reasoning": reasoning,
         "totalTokens": input + output + cache_read + cache_write,
         "cost": {
@@ -204,9 +208,10 @@ class TestRunCommand:
     ):
         await self._run(agent, fake_environment)
         command = fake_environment.commands[-1]
-        assert "message_update" in command
-        assert "entry_appended" in command
-        assert "agent_end" in command
+        assert (
+            '| grep -Ev \'"type":"(message_update|entry_appended|agent_end)"\' '
+            in command
+        )
 
     @pytest.mark.asyncio
     async def test_offline_env_is_set_and_overridable(
@@ -364,6 +369,7 @@ class TestModelsJson:
         command = agent._build_register_models_command()
         assert command is not None
         assert "$HOME/.pi/agent/models.json" in command
+        assert "printf '%s\\n'" in command
 
 
 class TestNetworkAllowlist:
@@ -425,6 +431,7 @@ class TestTrajectoryConversion:
             output=50,
             cache_read=20,
             cache_write=10,
+            cache_write_1h=4,
             reasoning=8,
             cost=0.005,
         )
@@ -512,6 +519,7 @@ class TestTrajectoryConversion:
         assert metrics["cached_tokens"] == 20
         assert metrics["cost_usd"] == pytest.approx(0.005)
         assert metrics["extra"]["cache_write_tokens"] == 10
+        assert metrics["extra"]["cache_write_1h_tokens"] == 4
         assert metrics["extra"]["reasoning_tokens"] == 8
 
         context = result["context"]
@@ -523,15 +531,26 @@ class TestTrajectoryConversion:
 
         final = result["trajectory"]["final_metrics"]
         assert final["extra"]["total_cache_write_tokens"] == 10
+        assert final["extra"]["total_cache_write_1h_tokens"] == 4
         assert final["extra"]["total_reasoning_tokens"] == 8
 
     def test_tool_reported_usage_is_included_in_totals(self, agent: Pi):
         """pi bills usage reported by tools, so the run totals must include it."""
         events = self._basic_events()
-        events[-1]["toolResults"][0]["usage"] = usage(input=11, output=4, cost=0.002)
+        events[-1]["toolResults"][0]["usage"] = usage(
+            input=11,
+            output=4,
+            cache_read=2,
+            cache_write=3,
+            cache_write_1h=1,
+            cost=0.002,
+        )
         final = self._convert(agent, events)["trajectory"]["final_metrics"]
-        assert final["total_prompt_tokens"] == 141
+        assert final["total_prompt_tokens"] == 146
         assert final["total_completion_tokens"] == 54
+        assert final["total_cached_tokens"] == 22
+        assert final["extra"]["total_cache_write_tokens"] == 13
+        assert final["extra"]["total_cache_write_1h_tokens"] == 5
         assert final["total_cost_usd"] == pytest.approx(0.007)
 
     def test_tool_error_is_flagged(self, agent: Pi):
@@ -575,7 +594,13 @@ class TestCompaction:
                     "firstKeptEntryId": "abcd1234",
                     "tokensBefore": 120000,
                     "estimatedTokensAfter": 20000,
-                    "usage": usage(input=1000, output=200, cost=0.004),
+                    "usage": usage(
+                        input=1000,
+                        output=200,
+                        cache_write=30,
+                        cache_write_1h=12,
+                        cost=0.004,
+                    ),
                 },
             },
             {"type": "turn_end", "message": second, "toolResults": []},
@@ -600,6 +625,9 @@ class TestCompaction:
         assert step["extra"]["compaction"]["reason"] == "threshold"
         assert step["extra"]["compaction"]["tokens_before"] == 120000
         assert step["extra"]["compaction"]["estimated_tokens_after"] == 20000
+        usage_extra = step["extra"]["compaction"]["usage"]
+        assert usage_extra["cache_write_tokens"] == 30
+        assert usage_extra["cache_write_1h_tokens"] == 12
 
     def test_compaction_is_counted_and_flagged(self, agent: Pi):
         result = self._convert(agent, self._events_with_compaction())
@@ -614,15 +642,17 @@ class TestCompaction:
         final = self._convert(agent, self._events_with_compaction())["trajectory"][
             "final_metrics"
         ]
-        assert final["total_prompt_tokens"] == 1140
+        assert final["total_prompt_tokens"] == 1170
         assert final["total_completion_tokens"] == 215
         assert final["total_cost_usd"] == pytest.approx(0.006)
+        assert final["extra"]["total_cache_write_tokens"] == 30
+        assert final["extra"]["total_cache_write_1h_tokens"] == 12
 
     def test_aborted_compaction_is_not_counted(self, agent: Pi):
         trajectory = self._convert(agent, self._events_with_compaction(aborted=True))[
             "trajectory"
         ]
-        assert "summarization_count" not in (trajectory["final_metrics"]["extra"] or {})
+        assert trajectory["final_metrics"]["extra"]["summarization_count"] == 0
         assert all(step["source"] != "system" for step in trajectory["steps"])
 
     def test_compaction_steps_do_not_count_as_agent_steps(self, agent: Pi):
@@ -650,7 +680,9 @@ class TestErrorSurfacing:
                 },
             ],
         )
-        with pytest.raises(NonZeroAgentExitCodeError, match="Connection error."):
+        with pytest.raises(
+            NonZeroAgentExitCodeError, match=re.escape("Connection error.")
+        ):
             agent.populate_context_post_run(AgentContext())
 
     def test_recovered_intermediate_error_does_not_raise(self, agent: Pi):
@@ -702,12 +734,31 @@ class TestErrorSurfacing:
 
 
 class TestCostFallback:
-    def test_litellm_fallback_prices_known_model(self, tmp_path: Path):
+    @staticmethod
+    def _patch_model_cost(monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(
+            litellm,
+            "model_cost",
+            {
+                "anthropic/claude-haiku-4-5": {
+                    "input_cost_per_token": 1e-6,
+                    "output_cost_per_token": 2e-6,
+                }
+            },
+        )
+
+    def test_litellm_fallback_prices_known_model(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        self._patch_model_cost(monkeypatch)
         agent = Pi(logs_dir=tmp_path, model_name="anthropic/claude-haiku-4-5")
         cost = agent._compute_cost_from_pricing(1000, 500, 0)
         assert cost is not None and cost > 0
 
-    def test_unknown_model_yields_no_cost(self, tmp_path: Path):
+    def test_unknown_model_yields_no_cost(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        self._patch_model_cost(monkeypatch)
         agent = Pi(logs_dir=tmp_path, model_name="openai/definitely-not-a-real-slug")
         assert agent._compute_cost_from_pricing(1000, 500, 0) is None
 
@@ -729,7 +780,10 @@ class TestCostFallback:
         agent.populate_context_post_run(context)
         assert context.cost_usd == pytest.approx(0.25)
 
-    def test_zero_reported_cost_falls_back_to_litellm(self, tmp_path: Path):
+    def test_zero_reported_cost_falls_back_to_litellm(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        self._patch_model_cost(monkeypatch)
         agent = Pi(logs_dir=tmp_path, model_name="anthropic/claude-haiku-4-5")
         write_stdout(
             agent.logs_dir / "pi.txt",
