@@ -672,13 +672,17 @@ class ClaudeCode(BaseInstalledAgent):
         flush()
         return result
 
-    def _parse_total_cost_from_stream_json(self) -> float | None:
-        """Extract authoritative `total_cost_usd` from Claude Code's stdout stream.
+    def _parse_result_event_from_stream_json(self) -> dict[str, Any] | None:
+        """Return Claude Code's terminal ``result`` event from its stdout stream.
 
         Claude Code's `--output-format=stream-json --print` mode emits a final
-        ``{"type":"result", ..., "total_cost_usd": <float>, ...}`` line to stdout,
-        which Pier tees to ``<logs_dir>/claude-code.txt``. Returns ``None`` if
-        the file is missing, malformed, or the result event lacks the field.
+        ``{"type":"result", ..., "total_cost_usd": <float>, "usage": {...}}``
+        line to stdout, which Pier tees to ``<logs_dir>/claude-code.txt``. This
+        event is authoritative: its ``usage`` and ``total_cost_usd`` are built
+        from the root cost ledger that Task (subagent) contexts share, so they
+        already include delegated subagent usage exactly once.
+
+        Returns ``None`` if the file is missing or contains no result event.
         """
         stream_path = self.logs_dir / "claude-code.txt"
         try:
@@ -694,14 +698,20 @@ class ClaudeCode(BaseInstalledAgent):
             except json.JSONDecodeError:
                 continue
             if event.get("type") == "result":
-                cost = event.get("total_cost_usd")
-                if cost is None:
-                    return None
-                try:
-                    return float(cost)
-                except (TypeError, ValueError):
-                    return None
+                return event
         return None
+
+    @staticmethod
+    def _total_cost_from_result(result: dict[str, Any] | None) -> float | None:
+        if not result:
+            return None
+        cost = result.get("total_cost_usd")
+        if cost is None:
+            return None
+        try:
+            return float(cost)
+        except (TypeError, ValueError):
+            return None
 
     def _convert_events_to_trajectory(self, session_dir: Path) -> Trajectory | None:
         """Convert Claude session into an ATIF trajectory."""
@@ -1047,6 +1057,19 @@ class ClaudeCode(BaseInstalledAgent):
         total_completion_tokens = sum(completion_values) if completion_values else None
         total_cached_tokens = sum(cached_values) if cached_values else None
 
+        # The primary session transcript excludes Task (subagent) turns, which
+        # Claude Code writes to a separate `<session-id>/subagents/` tree. Its
+        # terminal result event, however, reports session-tree-wide totals. Use
+        # those as a *replacement* for the per-step sums (never a sum with them,
+        # which would double count the primary session).
+        result_event = self._parse_result_event_from_stream_json()
+        result_usage = (result_event or {}).get("usage")
+        result_metrics = self._build_metrics(result_usage)
+        if result_metrics:
+            total_prompt_tokens = result_metrics.prompt_tokens
+            total_completion_tokens = result_metrics.completion_tokens
+            total_cached_tokens = result_metrics.cached_tokens
+
         service_tiers: set[str] = set()
         cache_creation_total, cache_read_total = 0, 0
         cache_creation_seen, cache_read_seen = False, False
@@ -1073,6 +1096,15 @@ class ClaudeCode(BaseInstalledAgent):
         final_extra: dict[str, Any] | None = {}
         if service_tiers:
             final_extra["service_tiers"] = sorted(service_tiers)
+        if isinstance(result_usage, dict):
+            # Prefer the session-tree-wide cache figures for the same reason.
+            cache_creation = result_usage.get("cache_creation_input_tokens")
+            if isinstance(cache_creation, int):
+                cache_creation_total, cache_creation_seen = cache_creation, True
+            cache_read = result_usage.get("cache_read_input_tokens")
+            if isinstance(cache_read, int):
+                cache_read_total, cache_read_seen = cache_read, True
+
         if cache_creation_seen:
             final_extra["total_cache_creation_input_tokens"] = cache_creation_total
         if cache_read_seen:
@@ -1091,7 +1123,7 @@ class ClaudeCode(BaseInstalledAgent):
             total_prompt_tokens=total_prompt_tokens,
             total_completion_tokens=total_completion_tokens,
             total_cached_tokens=total_cached_tokens,
-            total_cost_usd=self._parse_total_cost_from_stream_json(),
+            total_cost_usd=self._total_cost_from_result(result_event),
             total_steps=len(steps),
             extra=final_extra,
         )
@@ -1287,12 +1319,26 @@ class ClaudeCode(BaseInstalledAgent):
         elif self._get_env("ANTHROPIC_MODEL"):
             env["ANTHROPIC_MODEL"] = self._get_env("ANTHROPIC_MODEL") or ""
 
-        # When using custom base URL, set all model aliases to the same model
-        if "ANTHROPIC_BASE_URL" in env and "ANTHROPIC_MODEL" in env:
-            env["ANTHROPIC_DEFAULT_SONNET_MODEL"] = env["ANTHROPIC_MODEL"]
-            env["ANTHROPIC_DEFAULT_OPUS_MODEL"] = env["ANTHROPIC_MODEL"]
-            env["ANTHROPIC_DEFAULT_HAIKU_MODEL"] = env["ANTHROPIC_MODEL"]
-            env["CLAUDE_CODE_SUBAGENT_MODEL"] = env["ANTHROPIC_MODEL"]
+        # Pin every model-selection channel to the benchmark model, for all auth
+        # modes. A benchmark run evaluates one model, so Task subagents and
+        # internal small/fast calls must not resolve to anything else.
+        #
+        # `CLAUDE_CODE_SUBAGENT_MODEL` must be the concrete model id, not
+        # `inherit`: Claude Code skips the literal `inherit` and falls back
+        # through the per-call Task `model` argument, agent frontmatter, and
+        # parent inheritance, none of which are a hard same-model guarantee.
+        # The family aliases and small/fast model matter for a proxy that only
+        # serves the one benchmark model, where `haiku` would not resolve.
+        if "ANTHROPIC_MODEL" in env:
+            pinned_model = env["ANTHROPIC_MODEL"]
+            env["CLAUDE_CODE_SUBAGENT_MODEL"] = pinned_model
+            env["ANTHROPIC_DEFAULT_SONNET_MODEL"] = pinned_model
+            env["ANTHROPIC_DEFAULT_OPUS_MODEL"] = pinned_model
+            env["ANTHROPIC_DEFAULT_HAIKU_MODEL"] = pinned_model
+            env["ANTHROPIC_SMALL_FAST_MODEL"] = pinned_model
+            # ponytail: leaves managed-policy channels (settings.json
+            # modelOverrides / enforceAvailableModels) alone; harden those only
+            # if benchmark environments ever ship managed settings.
 
         # Disable adaptive thinking if requested
         if os.environ.get("CLAUDE_CODE_DISABLE_ADAPTIVE_THINKING", "").strip() == "1":
