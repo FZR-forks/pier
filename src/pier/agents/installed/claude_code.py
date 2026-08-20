@@ -676,11 +676,13 @@ class ClaudeCode(BaseInstalledAgent):
         """Return Claude Code's terminal ``result`` event from its stdout stream.
 
         Claude Code's `--output-format=stream-json --print` mode emits a final
-        ``{"type":"result", ..., "total_cost_usd": <float>, "usage": {...}}``
-        line to stdout, which Pier tees to ``<logs_dir>/claude-code.txt``. This
-        event is authoritative: its ``usage`` and ``total_cost_usd`` are built
-        from the root cost ledger that Task (subagent) contexts share, so they
-        already include delegated subagent usage exactly once.
+        ``{"type":"result", ..., "total_cost_usd": <float>, "modelUsage": {...}}``
+        line to stdout, which Pier tees to ``<logs_dir>/claude-code.txt``.
+
+        Per Anthropic's cost-tracking docs, ``total_cost_usd`` and
+        ``modelUsage`` include delegated subagent activity, while the ``usage``
+        sibling covers the root session only.
+        https://code.claude.com/docs/en/agent-sdk/cost-tracking
 
         Returns ``None`` if the file is missing or contains no result event.
         """
@@ -700,6 +702,44 @@ class ClaudeCode(BaseInstalledAgent):
             if event.get("type") == "result":
                 return event
         return None
+
+    @staticmethod
+    def _usage_from_result_model_usage(
+        result: dict[str, Any] | None,
+    ) -> dict[str, int] | None:
+        """Aggregate a result event's ``modelUsage`` into a usage dict.
+
+        Per Anthropic's cost-tracking docs, the terminal result's ``usage``
+        covers the root session only, while ``modelUsage`` (keyed by model, with
+        camelCase token fields) covers the whole session tree including
+        subagents and is the intended source for token accounting.
+
+        Returns ``None`` if ``modelUsage`` is missing or carries no usable
+        integer token counts, so callers can fall back to per-step sums.
+        """
+        model_usage = (result or {}).get("modelUsage")
+        if not isinstance(model_usage, dict):
+            return None
+
+        fields = {
+            "input_tokens": "inputTokens",
+            "output_tokens": "outputTokens",
+            "cache_read_input_tokens": "cacheReadInputTokens",
+            "cache_creation_input_tokens": "cacheCreationInputTokens",
+        }
+        usage = dict.fromkeys(fields, 0)
+        seen = False
+        for per_model in model_usage.values():
+            if not isinstance(per_model, dict):
+                continue
+            for key, source_key in fields.items():
+                value = per_model.get(source_key)
+                # bool is an int subclass; reject it along with floats/strings.
+                if isinstance(value, int) and not isinstance(value, bool):
+                    usage[key] += value
+                    seen = True
+
+        return usage if seen else None
 
     @staticmethod
     def _total_cost_from_result(result: dict[str, Any] | None) -> float | None:
@@ -1058,12 +1098,13 @@ class ClaudeCode(BaseInstalledAgent):
         total_cached_tokens = sum(cached_values) if cached_values else None
 
         # The primary session transcript excludes Task (subagent) turns, which
-        # Claude Code writes to a separate `<session-id>/subagents/` tree. Its
-        # terminal result event, however, reports session-tree-wide totals. Use
-        # those as a *replacement* for the per-step sums (never a sum with them,
-        # which would double count the primary session).
+        # Claude Code writes to a separate `<session-id>/subagents/` tree. The
+        # terminal result event's `modelUsage` does cover the whole tree (its
+        # `usage` sibling does not), so use it as a *replacement* for the
+        # per-step sums (never a sum with them, which would double count the
+        # primary session).
         result_event = self._parse_result_event_from_stream_json()
-        result_usage = (result_event or {}).get("usage")
+        result_usage = self._usage_from_result_model_usage(result_event)
         result_metrics = self._build_metrics(result_usage)
         if result_metrics:
             total_prompt_tokens = result_metrics.prompt_tokens
@@ -1096,7 +1137,7 @@ class ClaudeCode(BaseInstalledAgent):
         final_extra: dict[str, Any] | None = {}
         if service_tiers:
             final_extra["service_tiers"] = sorted(service_tiers)
-        if isinstance(result_usage, dict):
+        if result_usage:
             # Prefer the session-tree-wide cache figures for the same reason.
             cache_creation = result_usage.get("cache_creation_input_tokens")
             if isinstance(cache_creation, int):

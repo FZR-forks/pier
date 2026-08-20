@@ -47,9 +47,9 @@ def test_final_metrics_include_subagent_usage_without_adding_subagent_steps(
     """Claude Code writes Task (subagent) turns to a separate `subagents/` tree.
 
     Those turns never appear in the primary transcript, so the per-step sums
-    under-report a delegated run. The terminal `result` event reports totals for
-    the whole session tree, and must be used instead of (never added to) the
-    per-step sums.
+    under-report a delegated run. The terminal `result` event's `modelUsage`
+    covers the whole session tree (its `usage` sibling covers the root session
+    only), and must be used instead of (never added to) the per-step sums.
     """
     logs_dir = tmp_path / "logs"
     project_dir = logs_dir / "sessions" / "projects" / "-app"
@@ -67,17 +67,29 @@ def test_final_metrics_include_subagent_usage_without_adding_subagent_steps(
         _assistant_turn("msg_child", {"input_tokens": 100, "output_tokens": 20}) + "\n",
         encoding="utf-8",
     )
-    # Claude Code's terminal result reports the tree-wide aggregate.
+    # Claude Code's terminal result: `usage` is root-only, `modelUsage` is the
+    # tree-wide aggregate split across the models that served the run.
     (logs_dir / "claude-code.txt").write_text(
         json.dumps(
             {
                 "type": "result",
                 "total_cost_usd": 0.5,
-                "usage": {
-                    "input_tokens": 110,
-                    "output_tokens": 22,
-                    "cache_read_input_tokens": 7,
-                    "cache_creation_input_tokens": 3,
+                "usage": {"input_tokens": 10, "output_tokens": 2},
+                "modelUsage": {
+                    "claude-sonnet-4-5": {
+                        "inputTokens": 10,
+                        "outputTokens": 2,
+                        "cacheReadInputTokens": 5,
+                        "cacheCreationInputTokens": 3,
+                        "costUSD": 0.1,
+                    },
+                    "claude-sonnet-4-5-subagent": {
+                        "inputTokens": 100,
+                        "outputTokens": 20,
+                        "cacheReadInputTokens": 2,
+                        "cacheCreationInputTokens": 0,
+                        "costUSD": 0.4,
+                    },
                 },
             }
         )
@@ -89,7 +101,8 @@ def test_final_metrics_include_subagent_usage_without_adding_subagent_steps(
     context = AgentContext()
     agent.populate_context_post_run(context)
 
-    # Subagent usage is counted: 110 + 7 cache read + 3 cache creation.
+    # modelUsage totals, not the root-only `usage`: 110 input + 7 cache read
+    # + 3 cache creation.
     assert context.n_input_tokens == 120
     assert context.n_output_tokens == 22
     assert context.n_cache_tokens == 7
