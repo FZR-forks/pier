@@ -540,3 +540,59 @@ async def test_all_claude_model_channels_are_pinned(
         "ANTHROPIC_SMALL_FAST_MODEL",
     ):
         assert env[key] == env["ANTHROPIC_MODEL"]
+
+
+@pytest.mark.asyncio
+async def test_bedrock_haiku_region_override_is_dropped_when_pinning(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """The Haiku-class region override would split a pinned run across regions.
+
+    On Bedrock it only takes effect once a Haiku-class model variable is set,
+    which pinning now always does, so it must not survive the pin.
+    """
+    monkeypatch.delenv("ANTHROPIC_BASE_URL", raising=False)
+    monkeypatch.setenv("CLAUDE_CODE_USE_BEDROCK", "1")
+    monkeypatch.setenv("ANTHROPIC_SMALL_FAST_MODEL_AWS_REGION", "us-west-2")
+
+    agent = ClaudeCode(
+        logs_dir=tmp_path,
+        model_name="bedrock/global.anthropic.claude-sonnet-4-5-20250929-v1:0",
+    )
+    environment = FakeEnvironment()
+    await agent.run("Fix the bug", cast(BaseEnvironment, environment), AgentContext())
+
+    env = environment.envs[-1]
+    assert env["ANTHROPIC_SMALL_FAST_MODEL"] == env["ANTHROPIC_MODEL"]
+    assert "ANTHROPIC_SMALL_FAST_MODEL_AWS_REGION" not in env
+
+
+@pytest.mark.asyncio
+async def test_no_model_leaves_every_selection_channel_unset(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """With nothing to pin to, the pin must not invent a model."""
+    for key in (
+        "ANTHROPIC_BASE_URL",
+        "ANTHROPIC_MODEL",
+        "CLAUDE_CODE_USE_BEDROCK",
+        "AWS_BEARER_TOKEN_BEDROCK",
+    ):
+        monkeypatch.delenv(key, raising=False)
+
+    agent = ClaudeCode(logs_dir=tmp_path)
+    environment = FakeEnvironment()
+    await agent.run("Fix the bug", cast(BaseEnvironment, environment), AgentContext())
+
+    env = environment.envs[-1]
+    for key in (
+        "ANTHROPIC_MODEL",
+        "CLAUDE_CODE_SUBAGENT_MODEL",
+        "ANTHROPIC_DEFAULT_SONNET_MODEL",
+        "ANTHROPIC_DEFAULT_OPUS_MODEL",
+        "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+        "ANTHROPIC_SMALL_FAST_MODEL",
+    ):
+        assert key not in env

@@ -1369,6 +1369,13 @@ class ClaudeCode(BaseInstalledAgent):
             env["ANTHROPIC_SMALL_FAST_MODEL"] = env["ANTHROPIC_MODEL"]
             env["CLAUDE_CODE_SUBAGENT_MODEL"] = env["ANTHROPIC_MODEL"]
 
+            # On Bedrock this region override only takes effect once a
+            # Haiku-class model variable is set, which it now always is. It
+            # would send the pinned benchmark model to a region chosen for a
+            # small/fast model, so drop it rather than split the run across
+            # two regions.
+            env.pop("ANTHROPIC_SMALL_FAST_MODEL_AWS_REGION", None)
+
         # Disable adaptive thinking if requested
         if os.environ.get("CLAUDE_CODE_DISABLE_ADAPTIVE_THINKING", "").strip() == "1":
             env["CLAUDE_CODE_DISABLE_ADAPTIVE_THINKING"] = "1"
