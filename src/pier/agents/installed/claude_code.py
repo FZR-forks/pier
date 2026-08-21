@@ -1342,11 +1342,31 @@ class ClaudeCode(BaseInstalledAgent):
         elif self._get_env("ANTHROPIC_MODEL"):
             env["ANTHROPIC_MODEL"] = self._get_env("ANTHROPIC_MODEL") or ""
 
-        # When using custom base URL, set all model aliases to the same model
-        if "ANTHROPIC_BASE_URL" in env and "ANTHROPIC_MODEL" in env:
+        # A benchmark run evaluates one model, so every LLM call the harness
+        # makes must land on it. Native delegation stays enabled -- deciding to
+        # split work across subagents is part of the harness under test -- but
+        # each model-selection channel is pinned to the resolved benchmark
+        # model, for every auth mode rather than only for a custom base URL.
+        #
+        # `CLAUDE_CODE_SUBAGENT_MODEL` outranks both a Task invocation's `model`
+        # parameter and a subagent definition's `model` frontmatter. It is
+        # deliberately set to the concrete model ID: since Claude Code v2.1.196
+        # `inherit` is equivalent to leaving it unset, so it re-enters the
+        # resolution chain instead of restricting it.
+        #
+        # The alias variables cover the family aliases a subagent or an internal
+        # call may name directly. `ANTHROPIC_SMALL_FAST_MODEL` is the deprecated
+        # spelling of `ANTHROPIC_DEFAULT_HAIKU_MODEL`, which also governs
+        # background token usage such as the internal classifier; it is set for
+        # older CLI builds that only read the deprecated name.
+        #
+        # This diverges from upstream Harbor, which pins only on the
+        # custom-base-url path.
+        if "ANTHROPIC_MODEL" in env:
             env["ANTHROPIC_DEFAULT_SONNET_MODEL"] = env["ANTHROPIC_MODEL"]
             env["ANTHROPIC_DEFAULT_OPUS_MODEL"] = env["ANTHROPIC_MODEL"]
             env["ANTHROPIC_DEFAULT_HAIKU_MODEL"] = env["ANTHROPIC_MODEL"]
+            env["ANTHROPIC_SMALL_FAST_MODEL"] = env["ANTHROPIC_MODEL"]
             env["CLAUDE_CODE_SUBAGENT_MODEL"] = env["ANTHROPIC_MODEL"]
 
         # Disable adaptive thinking if requested
