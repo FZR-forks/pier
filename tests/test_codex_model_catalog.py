@@ -103,7 +103,8 @@ def test_narrow_model_catalog_keeps_selected_metadata_and_requested_effort(
         {"effort": "low", "description": "Fast"}
     ]
     expected["default_reasoning_level"] = "low"  # type: ignore[index]
-    expected["prefer_websockets"] = False  # type: ignore[index]
+    # Narrowing constrains model and effort only; transport preference is the
+    # supplied entry's own metadata and must survive untouched.
     assert narrowed == {"models": [expected]}
     assert mini_catalog == original
 
@@ -116,7 +117,8 @@ def test_narrow_model_catalog_leaves_reasoning_levels_untouched_without_effort(
     narrowed = Codex.narrow_model_catalog(mini_catalog, MODEL, None)
 
     expected = copy.deepcopy(mini_catalog["models"][0])  # type: ignore[index]
-    expected["prefer_websockets"] = False  # type: ignore[index]
+    # Narrowing constrains model and effort only; transport preference is the
+    # supplied entry's own metadata and must survive untouched.
     assert narrowed == {"models": [expected]}
     assert mini_catalog == original
 

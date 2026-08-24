@@ -173,25 +173,6 @@ class Codex(BaseInstalledAgent):
             ],
         )
 
-    def _get_session_dir(self) -> Path | None:
-        """Get the single session directory."""
-        sessions_dir = self.logs_dir / "sessions"
-        if not sessions_dir.exists():
-            return None
-
-        session_dirs = [d for d in sessions_dir.rglob("*") if d.is_dir()]
-        if not session_dirs:
-            return None
-        max_depth = max(len(d.parts) for d in session_dirs)
-        session_dirs = [d for d in session_dirs if len(d.parts) == max_depth]
-        if not session_dirs:
-            return None
-
-        # Sanity check: there should be exactly one session
-        if len(session_dirs) != 1:
-            raise ValueError(f"Expected exactly 1 session, found {len(session_dirs)}")
-        return session_dirs[0]
-
     @staticmethod
     def _extract_message_text(content: list[Any]) -> str:
         """Extract joined text from Codex content blocks."""
@@ -708,6 +689,10 @@ class Codex(BaseInstalledAgent):
             if rollout["thread_id"]
         }
 
+        # Known before conversion so the root thread (and only the root) can fall
+        # back to the stdout usage when its rollout carries no token events.
+        stdout_root_id = self._root_thread_id_from_stdout()
+
         trajectories: list[Trajectory] = []
         for rollout in rollouts:
             parent_events = events_by_thread.get(rollout["parent_id"])
@@ -722,7 +707,10 @@ class Codex(BaseInstalledAgent):
                     rollout["parent_id"],
                 )
             trajectory = self._convert_session_file_to_trajectory(
-                rollout["file"], local_events, metrics_complete=complete
+                rollout["file"],
+                local_events,
+                metrics_complete=complete,
+                is_root_thread=rollout["thread_id"] == stdout_root_id,
             )
             if trajectory is not None:
                 trajectories.append(trajectory)
@@ -1021,6 +1009,7 @@ class Codex(BaseInstalledAgent):
         session_file: Path,
         raw_events: list[dict[str, Any]] | None = None,
         metrics_complete: bool = True,
+        is_root_thread: bool = False,
     ) -> Trajectory | None:
         """Convert a single Codex rollout into an ATIF trajectory.
 
@@ -1350,6 +1339,14 @@ class Codex(BaseInstalledAgent):
         # child), so a child's cumulative total can already contain inherited
         # parent usage; summing cumulative totals across a tree double-counts.
         usage = self._sum_incremental_usage(raw_events)
+        if usage is None and is_root_thread:
+            usage = self._root_usage_from_stdout()
+            if usage is not None:
+                self.logger.debug(
+                    "Recovered root usage from %s; the rollout had no token_count "
+                    "events",
+                    self._OUTPUT_FILENAME,
+                )
 
         total_metrics: FinalMetrics | None = None
         if usage is not None:
@@ -1490,6 +1487,50 @@ class Codex(BaseInstalledAgent):
             if refs:
                 results[0]["subagent_trajectory_ref"] = refs
 
+    def _root_usage_from_stdout(self) -> dict[str, int] | None:
+        """Recover the root thread's usage from `codex exec --json` stdout.
+
+        Backport of the Codex half of harbor-framework/harbor#970: when a rollout
+        carries no `token_count` events, usage would otherwise be reported as
+        nothing at all. Codex emits a cumulative `turn.completed.usage` on stdout,
+        and the last one is the run's total.
+
+        Measured against a real delegating run, that figure covers the ROOT
+        thread only - it matched the root exactly and excluded the child - so it
+        can restore the root's own metrics but can never stand in for the tree.
+        """
+        stdout_path = self.logs_dir / self._OUTPUT_FILENAME
+        if not stdout_path.exists():
+            return None
+
+        usage: dict[str, int] | None = None
+        try:
+            with open(stdout_path, "r") as handle:
+                for line in handle:
+                    stripped = line.strip()
+                    if not stripped.startswith("{"):
+                        continue
+                    try:
+                        event = json.loads(stripped)
+                    except json.JSONDecodeError:
+                        continue
+                    if event.get("type") != "turn.completed":
+                        continue
+                    payload = event.get("usage")
+                    if not isinstance(payload, dict):
+                        continue
+                    usage = {
+                        "prompt_tokens": payload.get("input_tokens") or 0,
+                        "completion_tokens": payload.get("output_tokens") or 0,
+                        "cached_tokens": payload.get("cached_input_tokens") or 0,
+                        "reasoning_tokens": payload.get("reasoning_output_tokens") or 0,
+                        "total_tokens": 0,
+                    }
+        except OSError as exc:
+            self.logger.debug(f"Failed to read {stdout_path}: {exc}")
+
+        return usage
+
     def _with_tree_metrics(self, root: Trajectory) -> Trajectory:
         """Put whole-tree totals on the root, keeping root-only figures alongside.
 
@@ -1527,13 +1568,26 @@ class Codex(BaseInstalledAgent):
         peak_context: int | None = None
         summarizations: int | None = None
 
+        cost_complete = True
         for node in nodes:
             metrics = node.final_metrics
             if metrics is None:
+                # A thread with no metrics at all contributes unknown usage.
+                # Skipping it silently would publish a total that omits a whole
+                # agent while still claiming to describe the tree.
+                complete = False
+                cost_complete = False
                 continue
             extra = metrics.extra or {}
             if extra.get("metrics_complete") is False:
                 complete = False
+            if metrics.total_cost_usd is None and (
+                metrics.total_prompt_tokens or metrics.total_completion_tokens
+            ):
+                # Usage that could not be priced (no pricing entry for that
+                # thread's model) must not be summed into a tree cost as if the
+                # thread were free.
+                cost_complete = False
             for field in (
                 "total_prompt_tokens",
                 "total_completion_tokens",
@@ -1566,6 +1620,7 @@ class Codex(BaseInstalledAgent):
             }
         tree_extra["subagent_count"] = len(nodes) - 1
         tree_extra["tree_metrics_complete"] = complete
+        tree_extra["tree_cost_complete"] = cost_complete
         if peak_context is not None:
             tree_extra["peak_context_tokens"] = peak_context
         if summarizations is not None:
@@ -1578,7 +1633,7 @@ class Codex(BaseInstalledAgent):
                 "total_prompt_tokens": totals["total_prompt_tokens"] or None,
                 "total_completion_tokens": totals["total_completion_tokens"] or None,
                 "total_cached_tokens": totals["total_cached_tokens"] or None,
-                "total_cost_usd": total_cost,
+                "total_cost_usd": total_cost if cost_complete else None,
                 "total_steps": totals["total_steps"] or None,
             }
             if complete
@@ -1609,13 +1664,16 @@ class Codex(BaseInstalledAgent):
         Converts the Codex session JSONL file into an ATIF trajectory, persists it,
         and propagates usage metrics back to the Pier context.
         """
-        session_dir = self._get_session_dir()
-        if not session_dir:
+        # Scan the whole sessions tree. The previous single-directory lookup
+        # required exactly one deepest `<YYYY>/<MM>/<DD>` directory, which a run
+        # crossing midnight (or a subagent starting after it) violates.
+        sessions_dir = self.logs_dir / "sessions"
+        if not sessions_dir.exists():
             self.logger.debug("No Codex session directory found")
             return
 
         try:
-            trajectory = self._convert_events_to_trajectory(session_dir)
+            trajectory = self._convert_events_to_trajectory(sessions_dir)
         except Exception:
             self.logger.exception("Failed to convert Codex events to trajectory")
             return
@@ -1692,11 +1750,11 @@ class Codex(BaseInstalledAgent):
             entry["supported_reasoning_levels"] = levels
             entry["default_reasoning_level"] = effort
 
-        # Gateways fronting Codex commonly expose HTTPS only. Measured against
-        # codex-cli 0.149.1 this does not by itself stop the WebSocket attempts
-        # (it still tries and falls back to HTTPS), so treat it as declaring the
-        # transport the benchmark expects rather than as a fix for the retries.
-        entry["prefer_websockets"] = False
+        # Deliberately no transport mutation here: measured against codex-cli
+        # 0.149.1, `prefer_websockets = false` does not prevent the WebSocket
+        # attempts anyway, and a future release that does honour it would make
+        # restrict_model_catalog silently change transport semantics as well as
+        # model availability. This narrowing constrains model and effort only.
         return {"models": [entry]}
 
     async def _install_model_catalog(
@@ -1708,6 +1766,28 @@ class Codex(BaseInstalledAgent):
         refresh: the metadata then depends only on the installed Codex version and
         never on the gateway or the credentials in play.
         """
+        if self._model_catalog_file:
+            # A supplied catalog is narrowed exactly like a derived one. It is the
+            # path used for models Codex ships no metadata for, so it is also the
+            # path that most needs the guarantee: uploading it verbatim would let
+            # a multi-entry file leave other models (and other reasoning efforts)
+            # spawnable, which is the enforcement this option exists to provide.
+            # Every other field of the chosen entry is preserved untouched,
+            # including a context window Codex knows nothing about.
+            try:
+                supplied = json.loads(Path(self._model_catalog_file).read_text())
+            except (OSError, json.JSONDecodeError) as exc:
+                raise RuntimeError(
+                    f"Could not read model_catalog_file "
+                    f"{self._model_catalog_file}: {exc}"
+                ) from exc
+
+            narrowed = self.narrow_model_catalog(
+                supplied, model, self._benchmark_reasoning_effort()
+            )
+            await self._write_model_catalog(environment, narrowed, model, env)
+            return
+
         # The full bundled catalog is hundreds of kilobytes (every model carries
         # its complete instructions template), which is too much to pull back
         # through the exec channel. Select the one entry in the sandbox and do the
@@ -1754,12 +1834,22 @@ class Codex(BaseInstalledAgent):
         narrowed = self.narrow_model_catalog(
             catalog, model, self._benchmark_reasoning_effort()
         )
-        payload = json.dumps(narrowed)
+        await self._write_model_catalog(environment, narrowed, model, env)
+
+    async def _write_model_catalog(
+        self,
+        environment: BaseEnvironment,
+        catalog: dict[str, Any],
+        model: str,
+        env: dict[str, str],
+    ) -> None:
+        """Write a narrowed catalog into the sandbox."""
+        payload = json.dumps(catalog)
         await self.exec_as_agent(
             environment,
             command=(
-                f"cat >{shlex.quote(self._REMOTE_MODEL_CATALOG.as_posix())} <<'CATALOG'\n"
-                f"{payload}\nCATALOG"
+                f"cat >{shlex.quote(self._REMOTE_MODEL_CATALOG.as_posix())} "
+                f"<<'CATALOG'\n{payload}\nCATALOG"
             ),
             env=env,
         )
@@ -1925,23 +2015,6 @@ class Codex(BaseInstalledAgent):
 
         setup_command += config_toml_block
 
-        if self._model_catalog_file:
-            # An explicit catalog is the supported path for models Codex does not
-            # ship metadata for; it is used verbatim rather than derived, because
-            # guessing a third-party model's context window or tool mode from an
-            # unrelated entry would silently misconfigure the run.
-            await environment.upload_file(
-                self._model_catalog_file, self._REMOTE_MODEL_CATALOG.as_posix()
-            )
-            if environment.default_user is not None:
-                await self.exec_as_root(
-                    environment,
-                    command=(
-                        f"chown {environment.default_user} "
-                        f"{self._REMOTE_MODEL_CATALOG.as_posix()}"
-                    ),
-                )
-
         skills_command = self._build_register_skills_command()
         if skills_command:
             setup_command += f"\n{skills_command}"
@@ -1957,7 +2030,7 @@ class Codex(BaseInstalledAgent):
                 env=env,
             )
 
-        if self._restrict_model_catalog and not self._model_catalog_file:
+        if self._restrict_model_catalog:
             await self._install_model_catalog(environment, model, env)
         try:
             await self.exec_as_agent(
