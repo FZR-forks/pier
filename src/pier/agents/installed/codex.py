@@ -45,6 +45,7 @@ class Codex(BaseInstalledAgent):
     SUPPORTS_ATIF: bool = True
     _OUTPUT_FILENAME = "codex.txt"
     _REMOTE_CODEX_HOME = PurePosixPath("/tmp/codex-home")
+    _REMOTE_MODEL_CATALOG = _REMOTE_CODEX_HOME / "model-catalog.json"
     _REMOTE_CODEX_SECRETS_DIR = PurePosixPath("/tmp/codex-secrets")
 
     CLI_FLAGS = [
@@ -1694,8 +1695,6 @@ class Codex(BaseInstalledAgent):
 
         if trajectory.final_metrics:
             populate_context_from_final_metrics(context, trajectory.final_metrics)
-
-    _REMOTE_MODEL_CATALOG = PurePosixPath("/tmp/codex-home/model-catalog.json")
 
     def _benchmark_reasoning_effort(self) -> str | None:
         """Reasoning effort configured for this run, if any."""

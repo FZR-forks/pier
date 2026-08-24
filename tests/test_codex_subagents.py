@@ -96,7 +96,7 @@ def _turns(
     contexts = contexts or [None] * len(usages)
     total_usage = total_usage or [None] * len(usages)
     for index, ((input_tokens, output_tokens), context, cumulative) in enumerate(
-        zip(usages, contexts, total_usage), start=1
+        zip(usages, contexts, total_usage, strict=True), start=1
     ):
         events.extend(
             [

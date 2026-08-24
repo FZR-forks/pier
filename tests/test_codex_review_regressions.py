@@ -1,5 +1,7 @@
 import json
 from pathlib import Path
+
+from pier.trial.trial import _agent_step_count_from_trajectory_path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -332,3 +334,15 @@ def test_child_usage_does_not_fall_back_to_root_stdout(tmp_path: Path) -> None:
     assert (trajectory.final_metrics.extra or {})["tree_metrics_complete"] is False
     assert trajectory.final_metrics.total_prompt_tokens is None
     assert trajectory.final_metrics.total_completion_tokens is None
+
+
+def test_step_count_ignores_non_dict_trajectory_documents(tmp_path: Path) -> None:
+    """A malformed trajectory.json must not crash trial finalization.
+
+    The counter runs while the trial is being finalized, so an uncaught
+    AttributeError here would take down a run that had otherwise succeeded.
+    """
+    for payload in ("[]", "null", "42", '"text"'):
+        path = tmp_path / "trajectory.json"
+        path.write_text(payload)
+        assert _agent_step_count_from_trajectory_path(path) is None, payload

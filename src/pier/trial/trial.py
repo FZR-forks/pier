@@ -143,6 +143,9 @@ def _agent_step_count_from_trajectory_path(trajectory_path: Path) -> int | None:
             found_steps = found_steps or child_found
         return total, found_steps
 
+    if not isinstance(trajectory, dict):
+        return None
+
     total, found_steps = count(trajectory)
     return total if found_steps else None
 
