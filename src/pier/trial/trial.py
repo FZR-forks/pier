@@ -123,14 +123,30 @@ def _agent_step_count_from_trajectory_path(trajectory_path: Path) -> int | None:
     except (OSError, json.JSONDecodeError):
         return None
 
-    total = 0
-    found_steps = False
-    for step in trajectory.get("steps") or []:
-        if not isinstance(step, dict):
-            continue
-        found_steps = True
-        if step.get("source") == "agent":
-            total += 1
+    def count(node: dict) -> tuple[int, bool]:
+        """Count agent steps in a trajectory and every embedded subagent."""
+        total = 0
+        found_steps = False
+        for step in node.get("steps") or []:
+            if not isinstance(step, dict):
+                continue
+            found_steps = True
+            if step.get("source") == "agent":
+                total += 1
+        # Agents that delegate (e.g. Codex) keep each spawned thread as its own
+        # nested trajectory, so a run's step count has to include the whole tree.
+        for child in node.get("subagent_trajectories") or []:
+            if not isinstance(child, dict):
+                continue
+            child_total, child_found = count(child)
+            total += child_total
+            found_steps = found_steps or child_found
+        return total, found_steps
+
+    if not isinstance(trajectory, dict):
+        return None
+
+    total, found_steps = count(trajectory)
     return total if found_steps else None
 
 
@@ -752,10 +768,7 @@ class Trial:
                 artifacts_dir = await self._collect_step_artifacts(step_cfg)
                 mode = resolve_step_verifier_mode(self._task.config, step_cfg)
 
-                if (
-                    mode == VerifierEnvironmentMode.SEPARATE
-                    and i == len(steps) - 1
-                ):
+                if mode == VerifierEnvironmentMode.SEPARATE and i == len(steps) - 1:
                     await self._stop_agent_environment(keep_images=True)
 
                 if not self.config.verifier.disable:
@@ -828,17 +841,13 @@ class Trial:
             return
         target = "/tmp/.pier-pre-artifacts.sh"
         try:
-            await self._environment.upload_file(
-                source_path=script, target_path=target
-            )
+            await self._environment.upload_file(source_path=script, target_path=target)
             result = await self._environment.exec(
                 command=f"bash {target}",
                 timeout_sec=300,
             )
             if result.return_code != 0:
-                self._logger.warning(
-                    f"pre_artifacts.sh exited {result.return_code}"
-                )
+                self._logger.warning(f"pre_artifacts.sh exited {result.return_code}")
         except Exception:
             self._logger.warning(
                 "pre_artifacts.sh failed to run; continuing without it",
