@@ -335,6 +335,31 @@ class TestModelsJson:
         assert config["providers"]["openai"]["apiKey"] == "$OPENAI_API_KEY"
         assert "sk-secret" not in json.dumps(config)
 
+    def test_custom_provider_uses_configured_endpoint_and_key_envs(self, tmp_path: Path):
+        agent = Pi(
+            logs_dir=tmp_path,
+            model_name="litellm/gpt-5.6-luna",
+            extra_env={
+                "LITELLM_BASE_URL": "https://proxy.example.com/v1",
+                "LITELLM_API_KEY": "sk-secret",
+            },
+            provider_base_url_env="LITELLM_BASE_URL",
+            provider_api_key_env="LITELLM_API_KEY",
+            pi_config={
+                "providers": {
+                    "litellm": {
+                        "api": "openai-responses",
+                        "models": [{"id": "gpt-5.6-luna", "contextWindow": 272000}],
+                    }
+                }
+            },
+        )
+        provider = agent._build_models_config()["providers"]["litellm"]
+        assert provider["baseUrl"] == "https://proxy.example.com/v1"
+        assert provider["apiKey"] == "$LITELLM_API_KEY"
+        assert provider["models"][0]["contextWindow"] == 272000
+        assert "sk-secret" not in json.dumps(provider)
+
     def test_pi_config_deep_merges_and_adds_custom_slug(self, tmp_path: Path):
         agent = Pi(
             logs_dir=tmp_path,
@@ -387,6 +412,15 @@ class TestNetworkAllowlist:
             extra_env={"OPENAI_BASE_URL": "https://proxy.example.com/v1"},
         )
         assert {"api.openai.com", "proxy.example.com"} <= self._domains(agent)
+
+    def test_custom_provider_base_url_env_is_allowlisted(self, tmp_path: Path):
+        agent = Pi(
+            logs_dir=tmp_path,
+            model_name="litellm/gpt-5.6-luna",
+            extra_env={"LITELLM_BASE_URL": "https://proxy.example.com/v1"},
+            provider_base_url_env="LITELLM_BASE_URL",
+        )
+        assert "proxy.example.com" in self._domains(agent)
 
     def test_base_url_from_pi_config_is_allowlisted(self, tmp_path: Path):
         agent = Pi(

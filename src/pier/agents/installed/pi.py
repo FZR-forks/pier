@@ -154,9 +154,18 @@ class Pi(BaseInstalledAgent):
         "xai": ["api.x.ai"],
     }
 
-    def __init__(self, *args, pi_config: dict[str, Any] | None = None, **kwargs):
+    def __init__(
+        self,
+        *args,
+        pi_config: dict[str, Any] | None = None,
+        provider_base_url_env: str | None = None,
+        provider_api_key_env: str | None = None,
+        **kwargs,
+    ):
         super().__init__(*args, **kwargs)
         self._pi_config: dict[str, Any] = pi_config or {}
+        self._provider_base_url_env = provider_base_url_env
+        self._provider_api_key_env = provider_api_key_env
         self._instruction: str | None = None
 
     @staticmethod
@@ -225,7 +234,10 @@ class Pi(BaseInstalledAgent):
         if provider is None:
             return []
         values: list[str] = []
-        for env_name in self._PROVIDER_BASE_URL_ENVS.get(provider, ()):
+        env_names = list(self._PROVIDER_BASE_URL_ENVS.get(provider, ()))
+        if self._provider_base_url_env:
+            env_names.insert(0, self._provider_base_url_env)
+        for env_name in env_names:
             if value := self._get_env(env_name):
                 values.append(value)
         return values
@@ -249,7 +261,7 @@ class Pi(BaseInstalledAgent):
             base_urls = self._base_url_values()
             if base_urls:
                 provider_entry["baseUrl"] = base_urls[0]
-            key_env = self._PROVIDER_API_KEY_ENVS.get(provider)
+            key_env = self._provider_api_key_env or self._PROVIDER_API_KEY_ENVS.get(provider)
             if key_env and self._has_env(key_env):
                 # Reference the variable by name so the key is not written to disk.
                 provider_entry["apiKey"] = f"${key_env}"
