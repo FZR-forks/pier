@@ -309,52 +309,31 @@ class Codex(BaseInstalledAgent):
         }
 
     @staticmethod
-    def _sum_incremental_usage(
+    def _final_cumulative_usage(
         raw_events: list[dict[str, Any]],
         initial_total_usage: dict[str, Any] | None = None,
     ) -> tuple[dict[str, int] | None, bool]:
-        """Sum a thread's own per-API-call token usage from token snapshots.
+        """Read a thread's final cumulative Codex usage snapshot.
 
-        ``token_count`` is a snapshot event, not an API-call event. Codex emits it
-        after real model usage, but also after rate-limit-only updates and local
-        context recomputation. Those extra snapshots retain the previous
-        ``last_token_usage`` and therefore must not be summed again.
+        This deliberately follows Harbor's Codex adapter: final token totals come
+        from the last ``token_count.info.total_token_usage`` snapshot, rather than
+        summing ``last_token_usage`` records. Codex re-emits token snapshots for
+        non-inference events such as rate-limit updates, so summing every
+        ``last_token_usage`` can double count a model call.
 
-        A real model call advances cumulative ``total_token_usage.input_tokens``
-        by exactly ``last_token_usage.input_tokens``. We use that invariant to
-        distinguish usage updates from repeated snapshots, then sum the complete
-        incremental usage payload. Input tokens are a suitable discriminator
-        because every model request has a non-empty prompt, while local
-        recomputation/context-full markers set the incremental billable fields to
-        zero.
+        Pier's only extension is for full-history subagents. Codex seeds those
+        child counters with the copied parent history, so ``initial_total_usage``
+        is subtracted from the child's final cumulative snapshot. The baseline is
+        captured from the copied block before that block is removed from the child
+        trajectory. This is the minimum delta needed to make Harbor-style
+        cumulative accounting composable across a trajectory tree.
 
-        Full-history subagents can start from a parent's cumulative token state.
-        ``initial_total_usage`` is the last cumulative snapshot copied from that
-        parent and stripped from the child's rollout. Without that baseline, the
-        first child rate-limit snapshot could be mistaken for a new model call.
-
-        Returns ``(usage, complete)``. ``complete`` is false if the cumulative
-        counter changes in a way that cannot be reconciled with the incremental
-        usage. The caller can then withhold authoritative tree totals rather than
-        publish a guessed number.
+        Returns ``(usage, complete)``. A negative child delta means the cumulative
+        counter was reset or the inherited baseline is otherwise incompatible;
+        in that case the caller must withhold token totals instead of guessing.
         """
-        totals = {
-            "prompt_tokens": 0,
-            "completion_tokens": 0,
-            "cached_tokens": 0,
-            "reasoning_tokens": 0,
-            "total_tokens": 0,
-        }
-        seen_usage = False
-        complete = True
-
-        previous_total_input: int | None = None
-        if isinstance(initial_total_usage, dict):
-            baseline = initial_total_usage.get("input_tokens")
-            if isinstance(baseline, int):
-                previous_total_input = baseline
-
-        for event in raw_events:
+        final_total_usage: dict[str, Any] | None = None
+        for event in reversed(raw_events):
             if event.get("type") != "event_msg":
                 continue
             payload = event.get("payload")
@@ -363,68 +342,44 @@ class Codex(BaseInstalledAgent):
             info = payload.get("info")
             if not isinstance(info, dict):
                 continue
-            usage = info.get("last_token_usage")
             cumulative = info.get("total_token_usage")
-            if not isinstance(usage, dict) or not isinstance(cumulative, dict):
+            if not isinstance(cumulative, dict):
                 continue
+            final_total_usage = cumulative
+            break
 
-            last_input = usage.get("input_tokens")
-            total_input = cumulative.get("input_tokens")
-            if not isinstance(last_input, int) or not isinstance(total_input, int):
-                complete = False
-                continue
+        if final_total_usage is None:
+            return None, True
 
-            # Local context recomputation and context-window-full markers carry
-            # no billable input. They can still reset the cumulative billable
-            # fields (set_total_tokens_full does exactly that), so keep their new
-            # baseline for the next actual model call.
-            if last_input <= 0:
-                previous_total_input = total_input
-                continue
+        field_map = {
+            "prompt_tokens": "input_tokens",
+            "completion_tokens": "output_tokens",
+            "cached_tokens": "cached_input_tokens",
+            "reasoning_tokens": "reasoning_output_tokens",
+            "total_tokens": "total_tokens",
+        }
+        usage: dict[str, int] = {}
+        for target, source in field_map.items():
+            value = final_total_usage.get(source)
+            if value is None:
+                value = 0
+            if not isinstance(value, int):
+                return None, False
 
-            # New/root rollouts and some non-full-history child rollouts have no
-            # persisted baseline to compare with. Their first non-zero snapshot
-            # is the only available representation of that first model call, so
-            # accept its incremental payload and use its cumulative state as the
-            # baseline for all later snapshots. Full-history children pass an
-            # inherited baseline above and therefore do not take this path.
-            if previous_total_input is None:
-                seen_usage = True
-                totals["prompt_tokens"] += usage.get("input_tokens") or 0
-                totals["completion_tokens"] += usage.get("output_tokens") or 0
-                totals["cached_tokens"] += usage.get("cached_input_tokens") or 0
-                totals["reasoning_tokens"] += usage.get("reasoning_output_tokens") or 0
-                totals["total_tokens"] += usage.get("total_tokens") or 0
-                previous_total_input = total_input
-                continue
+            baseline = 0
+            if initial_total_usage is not None:
+                inherited = initial_total_usage.get(source)
+                if inherited is not None:
+                    if not isinstance(inherited, int):
+                        return None, False
+                    baseline = inherited
 
-            delta_input = total_input - previous_total_input
-            if delta_input == 0:
-                # Same cumulative state with the old non-zero last usage: Codex
-                # re-emitted a snapshot (for example after a rate-limit update).
-                continue
+            delta = value - baseline
+            if delta < 0:
+                return None, False
+            usage[target] = delta
 
-            is_usage_update = delta_input == last_input
-            if not is_usage_update and total_input < previous_total_input:
-                # A counter can be reset independently of the conversation
-                # history. If the new cumulative value is exactly this call's
-                # usage, the reset baseline was zero and the call is unambiguous.
-                is_usage_update = total_input == last_input
-
-            if not is_usage_update:
-                complete = False
-                previous_total_input = total_input
-                continue
-
-            seen_usage = True
-            totals["prompt_tokens"] += usage.get("input_tokens") or 0
-            totals["completion_tokens"] += usage.get("output_tokens") or 0
-            totals["cached_tokens"] += usage.get("cached_input_tokens") or 0
-            totals["reasoning_tokens"] += usage.get("reasoning_output_tokens") or 0
-            totals["total_tokens"] += usage.get("total_tokens") or 0
-            previous_total_input = total_input
-
-        return (totals if seen_usage else None), complete
+        return usage, True
 
     @staticmethod
     def _extract_context_metrics(
@@ -1428,11 +1383,11 @@ class Codex(BaseInstalledAgent):
         if spawned:
             trajectory_extra["spawned_threads"] = spawned
 
-        # Codex token_count entries are cumulative snapshots. Count a
-        # last_token_usage only when the cumulative input counter proves that a
-        # new model request occurred; rate-limit and local-context snapshots can
-        # otherwise repeat the previous non-zero last usage verbatim.
-        usage, usage_complete = self._sum_incremental_usage(
+        # Match Harbor's authoritative final-metrics source: the latest
+        # cumulative total_token_usage snapshot. Full-history children subtract
+        # the cumulative baseline copied from their parent so tree totals remain
+        # child-local instead of counting inherited history again.
+        usage, usage_complete = self._final_cumulative_usage(
             raw_events, initial_total_usage
         )
         metrics_complete = metrics_complete and usage_complete
@@ -1445,29 +1400,38 @@ class Codex(BaseInstalledAgent):
                     self._OUTPUT_FILENAME,
                 )
 
+        final_extra: dict[str, Any] = {}
+        if summarization_count:
+            final_extra["compacted"] = True
+        final_extra = dict(
+            extra_with_context_metrics(
+                final_extra,
+                peak_context_tokens=peak_context_tokens,
+                summarization_count=summarization_count,
+            )
+            or {}
+        )
+
         total_metrics: FinalMetrics | None = None
-        if usage is not None:
+        if not metrics_complete:
+            final_extra["metrics_complete"] = False
+            total_metrics = FinalMetrics(
+                total_prompt_tokens=None,
+                total_completion_tokens=None,
+                total_cached_tokens=None,
+                total_cost_usd=None,
+                total_steps=len(steps),
+                extra=final_extra,
+            )
+        elif usage is not None:
             total_cost_usd = self._compute_cost_from_pricing(
                 prompt_tokens=usage["prompt_tokens"],
                 completion_tokens=usage["completion_tokens"],
                 cached_tokens=usage["cached_tokens"],
                 model_name=default_model_name,
             )
-
-            final_extra: dict[str, Any] = {
-                "reasoning_output_tokens": usage["reasoning_tokens"] or None,
-                "total_tokens": usage["total_tokens"] or None,
-            }
-            if summarization_count:
-                final_extra["compacted"] = True
-            final_extra = extra_with_context_metrics(
-                final_extra,
-                peak_context_tokens=peak_context_tokens,
-                summarization_count=summarization_count,
-            )
-            final_extra = dict(final_extra or {})
-            if not metrics_complete:
-                final_extra["metrics_complete"] = False
+            final_extra["reasoning_output_tokens"] = usage["reasoning_tokens"] or None
+            final_extra["total_tokens"] = usage["total_tokens"] or None
 
             total_metrics = FinalMetrics(
                 total_prompt_tokens=usage["prompt_tokens"] or None,
@@ -1678,6 +1642,7 @@ class Codex(BaseInstalledAgent):
             extra = metrics.extra or {}
             if extra.get("metrics_complete") is False:
                 complete = False
+                cost_complete = False
             if metrics.total_cost_usd is None and (
                 metrics.total_prompt_tokens or metrics.total_completion_tokens
             ):
@@ -1725,13 +1690,14 @@ class Codex(BaseInstalledAgent):
 
         # An incomplete tree must not publish aggregates that would silently omit
         # (or double count) a thread's usage; keep the root-only view instead.
+        aggregate_steps = sum(len(node.steps) for node in nodes) or None
         aggregate = (
             {
                 "total_prompt_tokens": totals["total_prompt_tokens"] or None,
                 "total_completion_tokens": totals["total_completion_tokens"] or None,
                 "total_cached_tokens": totals["total_cached_tokens"] or None,
                 "total_cost_usd": total_cost if cost_complete else None,
-                "total_steps": totals["total_steps"] or None,
+                "total_steps": aggregate_steps,
             }
             if complete
             else {
@@ -1739,7 +1705,7 @@ class Codex(BaseInstalledAgent):
                 "total_completion_tokens": None,
                 "total_cached_tokens": None,
                 "total_cost_usd": None,
-                "total_steps": None,
+                "total_steps": aggregate_steps,
             }
         )
 

@@ -408,11 +408,16 @@ def test_f6_unavailable_ancestor_marks_metrics_incomplete(tmp_path: Path):
 
     assert metrics.extra is not None
     assert metrics.extra["tree_metrics_complete"] is False
+    assert metrics.extra["tree_cost_complete"] is False
+    assert metrics.extra["self_only"]["total_prompt_tokens"] is None
+    assert metrics.extra["self_only"]["total_completion_tokens"] is None
+    assert metrics.extra["self_only"]["total_cost_usd"] is None
+    assert metrics.extra["self_only"]["total_steps"] == 2
     assert metrics.total_prompt_tokens is None
     assert metrics.total_completion_tokens is None
     assert metrics.total_cached_tokens is None
     assert metrics.total_cost_usd is None
-    assert metrics.total_steps is None
+    assert metrics.total_steps == 2
 
 
 # Structure group
@@ -583,6 +588,7 @@ def test_m0_rate_limit_snapshot_does_not_repeat_last_usage(tmp_path: Path):
 
     assert metrics.total_prompt_tokens == 14_727
     assert metrics.total_completion_tokens == 93
+    assert metrics.total_steps == 1
 
 
 def test_m0_two_identical_incremental_calls_are_both_counted(tmp_path: Path):
@@ -629,39 +635,7 @@ def test_m0_local_context_snapshot_is_not_billed_as_model_usage(tmp_path: Path):
 
     assert metrics.total_prompt_tokens == 10
     assert metrics.total_completion_tokens == 2
-
-
-def test_m0_context_full_reset_rebases_next_real_call(tmp_path: Path):
-    root_events = _thread_events(ROOT, [(10, 2)], total_usage=[(10, 2)])
-    root_events.append(
-        {
-            "type": "event_msg",
-            "payload": {
-                "type": "token_count",
-                "info": {
-                    "total_token_usage": {
-                        "input_tokens": 0,
-                        "output_tokens": 0,
-                        "cached_input_tokens": 0,
-                        "total_tokens": 272_000,
-                    },
-                    "last_token_usage": {
-                        "input_tokens": 0,
-                        "output_tokens": 0,
-                        "cached_input_tokens": 0,
-                        "total_tokens": 271_988,
-                    },
-                },
-            },
-        }
-    )
-    root_events.extend(_turns(ROOT, [(5, 1)], total_usage=[(5, 1)]))
-    _write_rollout(tmp_path, "rollout-root.jsonl", root_events)
-
-    metrics = _metrics(_convert(tmp_path))
-
-    assert metrics.total_prompt_tokens == 15
-    assert metrics.total_completion_tokens == 3
+    assert metrics.total_steps == 1
 
 
 def test_m0_full_history_child_uses_copied_total_as_snapshot_baseline(
@@ -693,6 +667,37 @@ def test_m0_full_history_child_uses_copied_total_as_snapshot_baseline(
     assert _metrics(trajectory).total_completion_tokens == 3
 
 
+def test_m0_full_history_child_counter_reset_is_incomplete(tmp_path: Path):
+    root_events = _thread_events(ROOT, [(10, 2)], total_usage=[(10, 2)])
+    child_events = _forked_events(
+        root_events,
+        CHILD,
+        [(5, 1)],
+        # Lower than the inherited parent baseline: the child cumulative counter
+        # cannot be converted to a trustworthy child-local delta.
+        total_usage=[(5, 1)],
+    )
+    _write_rollout(tmp_path, "rollout-root.jsonl", root_events)
+    _write_rollout(tmp_path, "rollout-child.jsonl", child_events)
+    _write_stdout(tmp_path, ROOT)
+
+    trajectory = _convert(tmp_path)
+    child_metrics = _metrics(_children(trajectory)[0])
+    tree_metrics = _metrics(trajectory)
+
+    assert child_metrics.extra is not None
+    assert child_metrics.extra["metrics_complete"] is False
+    assert child_metrics.total_prompt_tokens is None
+    assert child_metrics.total_completion_tokens is None
+    assert child_metrics.total_cost_usd is None
+    assert child_metrics.total_steps == 1
+    assert tree_metrics.extra["tree_metrics_complete"] is False
+    assert tree_metrics.total_prompt_tokens is None
+    assert tree_metrics.total_completion_tokens is None
+    assert tree_metrics.total_cost_usd is None
+    assert tree_metrics.total_steps == 2
+
+
 def test_m1_root_has_tree_totals_self_only_and_scoped_child_metrics(tmp_path: Path):
     root_events = _thread_events(ROOT, [(4, 1)], total_usage=[(4, 1)])
     child_events = _thread_events(
@@ -702,7 +707,7 @@ def test_m1_root_has_tree_totals_self_only_and_scoped_child_metrics(tmp_path: Pa
         nickname="Euclid",
         source={"subagent": {}},
         thread_source="subagent",
-        total_usage=[(10, 3)],
+        total_usage=[(6, 2)],
     )
     _write_rollout(tmp_path, "rollout-root.jsonl", root_events)
     _write_rollout(tmp_path, "rollout-child.jsonl", child_events)
