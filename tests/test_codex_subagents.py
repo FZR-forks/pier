@@ -638,6 +638,83 @@ def test_m0_local_context_snapshot_is_not_billed_as_model_usage(tmp_path: Path):
     assert metrics.total_steps == 1
 
 
+def test_m0_context_window_full_snapshot_preserves_prior_billed_usage(
+    tmp_path: Path,
+):
+    root_events = _thread_events(ROOT, [(10, 2)], total_usage=[(10, 2)])
+    root_events.append(
+        {
+            "type": "event_msg",
+            "payload": {
+                "type": "token_count",
+                "info": {
+                    "model_context_window": 272_000,
+                    "total_token_usage": {
+                        "input_tokens": 0,
+                        "cached_input_tokens": 0,
+                        "cache_write_input_tokens": 0,
+                        "output_tokens": 0,
+                        "reasoning_output_tokens": 0,
+                        "total_tokens": 272_000,
+                    },
+                    "last_token_usage": {
+                        "input_tokens": 0,
+                        "cached_input_tokens": 0,
+                        "cache_write_input_tokens": 0,
+                        "output_tokens": 0,
+                        "reasoning_output_tokens": 0,
+                        "total_tokens": 271_988,
+                    },
+                },
+            },
+        }
+    )
+    _write_rollout(tmp_path, "rollout-root.jsonl", root_events)
+
+    metrics = _metrics(_convert(tmp_path))
+
+    assert metrics.total_prompt_tokens == 10
+    assert metrics.total_completion_tokens == 2
+    assert metrics.total_steps == 1
+
+
+def test_m0_context_window_full_without_prior_usage_does_not_invent_usage(
+    tmp_path: Path,
+):
+    root_events = [
+        _session_meta(ROOT),
+        {
+            "type": "event_msg",
+            "payload": {
+                "type": "token_count",
+                "info": {
+                    "model_context_window": 272_000,
+                    "total_token_usage": {
+                        "input_tokens": 0,
+                        "cached_input_tokens": 0,
+                        "cache_write_input_tokens": 0,
+                        "output_tokens": 0,
+                        "reasoning_output_tokens": 0,
+                        "total_tokens": 272_000,
+                    },
+                    "last_token_usage": {
+                        "input_tokens": 0,
+                        "cached_input_tokens": 0,
+                        "cache_write_input_tokens": 0,
+                        "output_tokens": 0,
+                        "reasoning_output_tokens": 0,
+                        "total_tokens": 272_000,
+                    },
+                },
+            },
+        },
+    ]
+    usage, complete = Codex._final_cumulative_usage(root_events)
+
+    assert usage is None
+    assert complete is True
+
+
 def test_m0_full_history_child_uses_copied_total_as_snapshot_baseline(
     tmp_path: Path,
 ):

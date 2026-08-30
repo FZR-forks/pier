@@ -328,11 +328,17 @@ class Codex(BaseInstalledAgent):
         trajectory. This is the minimum delta needed to make Harbor-style
         cumulative accounting composable across a trajectory tree.
 
+        Codex also emits a special context-window-full snapshot whose cumulative
+        billable fields are zeroed. That snapshot is skipped in favor of the last
+        real cumulative provider-usage snapshot so a failed overflow attempt does
+        not erase usage already incurred by the thread.
+
         Returns ``(usage, complete)``. A negative child delta means the cumulative
         counter was reset or the inherited baseline is otherwise incompatible;
         in that case the caller must withhold token totals instead of guessing.
         """
         final_total_usage: dict[str, Any] | None = None
+        saw_context_full_snapshot = False
         for event in reversed(raw_events):
             if event.get("type") != "event_msg":
                 continue
@@ -345,11 +351,42 @@ class Codex(BaseInstalledAgent):
             cumulative = info.get("total_token_usage")
             if not isinstance(cumulative, dict):
                 continue
+
+            # Codex 0.151.0's `set_total_tokens_full()` is a context-overflow
+            # marker, not a provider usage report. `fill_to_context_window()`
+            # replaces the cumulative billable fields with zeros and sets only
+            # total_tokens=model_context_window. If it is the final snapshot,
+            # treating it as cumulative billing would erase all known usage.
+            # Walk back to the last real cumulative snapshot instead.
+            model_context_window = info.get("model_context_window")
+            detailed_fields = (
+                "input_tokens",
+                "cached_input_tokens",
+                "cache_write_input_tokens",
+                "output_tokens",
+                "reasoning_output_tokens",
+            )
+            is_context_full_snapshot = (
+                isinstance(model_context_window, int)
+                and model_context_window > 0
+                and cumulative.get("total_tokens") == model_context_window
+                and all((cumulative.get(field) or 0) == 0 for field in detailed_fields)
+            )
+            if is_context_full_snapshot:
+                saw_context_full_snapshot = True
+                continue
+
             final_total_usage = cumulative
             break
 
         if final_total_usage is None:
-            return None, True
+            # A full-history child may overflow before making its first successful
+            # request. Its seeded parent baseline is then still the final known
+            # cumulative usage, which means zero child-local usage.
+            if saw_context_full_snapshot and initial_total_usage is not None:
+                final_total_usage = initial_total_usage
+            else:
+                return None, True
 
         field_map = {
             "prompt_tokens": "input_tokens",
@@ -686,11 +723,11 @@ class Codex(BaseInstalledAgent):
         descendants are embedded in ``subagent_trajectories``, keeping their real
         parent/child nesting.
 
-        Based on harbor-framework/harbor#2366, with Pier extensions: rollouts are
-        discovered recursively (a run crossing midnight, or a subagent started
-        after it, lands in a different ``<YYYY>/<MM>/<DD>`` directory), the root
-        is identified from the run's stdout rather than by file order, and only
-        threads actually descended from that root are embedded.
+        Pier-specific multi-agent handling: rollouts are discovered recursively
+        (a run crossing midnight, or a subagent started after it, lands in a
+        different ``<YYYY>/<MM>/<DD>`` directory), the root is identified from
+        the run's stdout rather than by file order, and only threads actually
+        descended from that root are embedded.
         """
         session_files = sorted(session_dir.rglob("*.jsonl"))
 
@@ -1006,9 +1043,9 @@ class Codex(BaseInstalledAgent):
         """Nest the root's descendants under it and drop unrelated rollouts.
 
         Only threads reachable from the root through ``parent_thread_id`` belong to
-        this run. Harbor#2366 embeds every remaining rollout, which silently adopts
-        the orphan left behind by an aborted attempt and corrupts both the tree and
-        its totals.
+        this run. Unrelated rollouts can remain in the same sessions tree after an
+        aborted attempt, so embedding every discovered rollout would corrupt both
+        the trajectory tree and its totals.
         """
         children_by_parent: dict[str, list[Trajectory]] = {}
         for trajectory in trajectories:
