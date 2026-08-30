@@ -292,9 +292,12 @@ def test_f2_identical_later_token_payload_is_not_globally_deduplicated(
         root_events,
         CHILD,
         [(7, 3)],
-        total_usage=[(7, 3)],
+        total_usage=[(14, 6)],
     )
-    assert child_events[-1]["payload"] == root_events[-1]["payload"]
+    assert (
+        child_events[-1]["payload"]["info"]["last_token_usage"]
+        == root_events[-1]["payload"]["info"]["last_token_usage"]
+    )
     _write_rollout(tmp_path, "rollout-root.jsonl", root_events)
     _write_rollout(tmp_path, "rollout-child.jsonl", child_events)
     _write_stdout(tmp_path, ROOT)
@@ -564,6 +567,130 @@ def test_s6_single_rollout_keeps_shape_and_own_totals(tmp_path: Path):
 
 
 # Metrics group
+
+
+def test_m0_rate_limit_snapshot_does_not_repeat_last_usage(tmp_path: Path):
+    root_events = _thread_events(ROOT, [(14_727, 93)], total_usage=[(14_727, 93)])
+    repeated = json.loads(json.dumps(root_events[-1]))
+    repeated["payload"]["rate_limits"] = {
+        "limit_id": "premium",
+        "rate_limit_reached_type": "workspace_member_credits_depleted",
+    }
+    root_events.append(repeated)
+    _write_rollout(tmp_path, "rollout-root.jsonl", root_events)
+
+    metrics = _metrics(_convert(tmp_path))
+
+    assert metrics.total_prompt_tokens == 14_727
+    assert metrics.total_completion_tokens == 93
+
+
+def test_m0_two_identical_incremental_calls_are_both_counted(tmp_path: Path):
+    root_events = _thread_events(
+        ROOT,
+        [(7, 3), (7, 3)],
+        total_usage=[(7, 3), (14, 6)],
+    )
+    _write_rollout(tmp_path, "rollout-root.jsonl", root_events)
+
+    metrics = _metrics(_convert(tmp_path))
+
+    assert metrics.total_prompt_tokens == 14
+    assert metrics.total_completion_tokens == 6
+
+
+def test_m0_local_context_snapshot_is_not_billed_as_model_usage(tmp_path: Path):
+    root_events = _thread_events(ROOT, [(10, 2)], total_usage=[(10, 2)])
+    root_events.append(
+        {
+            "type": "event_msg",
+            "payload": {
+                "type": "token_count",
+                "info": {
+                    "total_token_usage": {
+                        "input_tokens": 10,
+                        "output_tokens": 2,
+                        "cached_input_tokens": 0,
+                        "total_tokens": 12,
+                    },
+                    "last_token_usage": {
+                        "input_tokens": 0,
+                        "output_tokens": 0,
+                        "cached_input_tokens": 0,
+                        "total_tokens": 50_000,
+                    },
+                },
+            },
+        }
+    )
+    _write_rollout(tmp_path, "rollout-root.jsonl", root_events)
+
+    metrics = _metrics(_convert(tmp_path))
+
+    assert metrics.total_prompt_tokens == 10
+    assert metrics.total_completion_tokens == 2
+
+
+def test_m0_context_full_reset_rebases_next_real_call(tmp_path: Path):
+    root_events = _thread_events(ROOT, [(10, 2)], total_usage=[(10, 2)])
+    root_events.append(
+        {
+            "type": "event_msg",
+            "payload": {
+                "type": "token_count",
+                "info": {
+                    "total_token_usage": {
+                        "input_tokens": 0,
+                        "output_tokens": 0,
+                        "cached_input_tokens": 0,
+                        "total_tokens": 272_000,
+                    },
+                    "last_token_usage": {
+                        "input_tokens": 0,
+                        "output_tokens": 0,
+                        "cached_input_tokens": 0,
+                        "total_tokens": 271_988,
+                    },
+                },
+            },
+        }
+    )
+    root_events.extend(_turns(ROOT, [(5, 1)], total_usage=[(5, 1)]))
+    _write_rollout(tmp_path, "rollout-root.jsonl", root_events)
+
+    metrics = _metrics(_convert(tmp_path))
+
+    assert metrics.total_prompt_tokens == 15
+    assert metrics.total_completion_tokens == 3
+
+
+def test_m0_full_history_child_uses_copied_total_as_snapshot_baseline(
+    tmp_path: Path,
+):
+    root_events = _thread_events(ROOT, [(10, 2)], total_usage=[(10, 2)])
+    child_events = _forked_events(
+        root_events,
+        CHILD,
+        [(5, 1)],
+        total_usage=[(15, 3)],
+    )
+    # A rate-limit-only emission can repeat the parent's last non-zero usage
+    # before the child's first real model response. It is local to the child and
+    # therefore is not removed with the copied history block.
+    repeated_parent_snapshot = json.loads(json.dumps(root_events[-1]))
+    repeated_parent_snapshot["payload"]["rate_limits"] = {"limit_id": "premium"}
+    child_events.insert(1 + len(root_events), repeated_parent_snapshot)
+    _write_rollout(tmp_path, "rollout-root.jsonl", root_events)
+    _write_rollout(tmp_path, "rollout-child.jsonl", child_events)
+    _write_stdout(tmp_path, ROOT)
+
+    trajectory = _convert(tmp_path)
+    child = _children(trajectory)[0]
+
+    assert _metrics(child).total_prompt_tokens == 5
+    assert _metrics(child).total_completion_tokens == 1
+    assert _metrics(trajectory).total_prompt_tokens == 15
+    assert _metrics(trajectory).total_completion_tokens == 3
 
 
 def test_m1_root_has_tree_totals_self_only_and_scoped_child_metrics(tmp_path: Path):
