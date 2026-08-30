@@ -311,13 +311,32 @@ class Codex(BaseInstalledAgent):
     @staticmethod
     def _sum_incremental_usage(
         raw_events: list[dict[str, Any]],
-    ) -> dict[str, int] | None:
-        """Sum a thread's own per-API-call token usage.
+        initial_total_usage: dict[str, Any] | None = None,
+    ) -> tuple[dict[str, int] | None, bool]:
+        """Sum a thread's own per-API-call token usage from token snapshots.
 
-        Uses the incremental ``last_token_usage`` of each ``token_count`` event
-        rather than the thread's final cumulative ``total_token_usage``: Codex
-        seeds a forked child's cumulative counter from its parent, so cumulative
-        totals overlap across a tree and cannot be added together.
+        ``token_count`` is a snapshot event, not an API-call event. Codex emits it
+        after real model usage, but also after rate-limit-only updates and local
+        context recomputation. Those extra snapshots retain the previous
+        ``last_token_usage`` and therefore must not be summed again.
+
+        A real model call advances cumulative ``total_token_usage.input_tokens``
+        by exactly ``last_token_usage.input_tokens``. We use that invariant to
+        distinguish usage updates from repeated snapshots, then sum the complete
+        incremental usage payload. Input tokens are a suitable discriminator
+        because every model request has a non-empty prompt, while local
+        recomputation/context-full markers set the incremental billable fields to
+        zero.
+
+        Full-history subagents can start from a parent's cumulative token state.
+        ``initial_total_usage`` is the last cumulative snapshot copied from that
+        parent and stripped from the child's rollout. Without that baseline, the
+        first child rate-limit snapshot could be mistaken for a new model call.
+
+        Returns ``(usage, complete)``. ``complete`` is false if the cumulative
+        counter changes in a way that cannot be reconciled with the incremental
+        usage. The caller can then withhold authoritative tree totals rather than
+        publish a guessed number.
         """
         totals = {
             "prompt_tokens": 0,
@@ -326,7 +345,14 @@ class Codex(BaseInstalledAgent):
             "reasoning_tokens": 0,
             "total_tokens": 0,
         }
-        seen = False
+        seen_usage = False
+        complete = True
+
+        previous_total_input: int | None = None
+        if isinstance(initial_total_usage, dict):
+            baseline = initial_total_usage.get("input_tokens")
+            if isinstance(baseline, int):
+                previous_total_input = baseline
 
         for event in raw_events:
             if event.get("type") != "event_msg":
@@ -338,17 +364,67 @@ class Codex(BaseInstalledAgent):
             if not isinstance(info, dict):
                 continue
             usage = info.get("last_token_usage")
-            if not isinstance(usage, dict):
+            cumulative = info.get("total_token_usage")
+            if not isinstance(usage, dict) or not isinstance(cumulative, dict):
                 continue
 
-            seen = True
+            last_input = usage.get("input_tokens")
+            total_input = cumulative.get("input_tokens")
+            if not isinstance(last_input, int) or not isinstance(total_input, int):
+                complete = False
+                continue
+
+            # Local context recomputation and context-window-full markers carry
+            # no billable input. They can still reset the cumulative billable
+            # fields (set_total_tokens_full does exactly that), so keep their new
+            # baseline for the next actual model call.
+            if last_input <= 0:
+                previous_total_input = total_input
+                continue
+
+            # New/root rollouts and some non-full-history child rollouts have no
+            # persisted baseline to compare with. Their first non-zero snapshot
+            # is the only available representation of that first model call, so
+            # accept its incremental payload and use its cumulative state as the
+            # baseline for all later snapshots. Full-history children pass an
+            # inherited baseline above and therefore do not take this path.
+            if previous_total_input is None:
+                seen_usage = True
+                totals["prompt_tokens"] += usage.get("input_tokens") or 0
+                totals["completion_tokens"] += usage.get("output_tokens") or 0
+                totals["cached_tokens"] += usage.get("cached_input_tokens") or 0
+                totals["reasoning_tokens"] += usage.get("reasoning_output_tokens") or 0
+                totals["total_tokens"] += usage.get("total_tokens") or 0
+                previous_total_input = total_input
+                continue
+
+            delta_input = total_input - previous_total_input
+            if delta_input == 0:
+                # Same cumulative state with the old non-zero last usage: Codex
+                # re-emitted a snapshot (for example after a rate-limit update).
+                continue
+
+            is_usage_update = delta_input == last_input
+            if not is_usage_update and total_input < previous_total_input:
+                # A counter can be reset independently of the conversation
+                # history. If the new cumulative value is exactly this call's
+                # usage, the reset baseline was zero and the call is unambiguous.
+                is_usage_update = total_input == last_input
+
+            if not is_usage_update:
+                complete = False
+                previous_total_input = total_input
+                continue
+
+            seen_usage = True
             totals["prompt_tokens"] += usage.get("input_tokens") or 0
             totals["completion_tokens"] += usage.get("output_tokens") or 0
             totals["cached_tokens"] += usage.get("cached_input_tokens") or 0
             totals["reasoning_tokens"] += usage.get("reasoning_output_tokens") or 0
             totals["total_tokens"] += usage.get("total_tokens") or 0
+            previous_total_input = total_input
 
-        return totals if seen else None
+        return (totals if seen_usage else None), complete
 
     @staticmethod
     def _extract_context_metrics(
@@ -697,7 +773,7 @@ class Codex(BaseInstalledAgent):
         trajectories: list[Trajectory] = []
         for rollout in rollouts:
             parent_events = events_by_thread.get(rollout["parent_id"])
-            local_events, complete = self._local_rollout_events(
+            local_events, complete, inherited_total_usage = self._local_rollout_events(
                 rollout["events"], parent_events
             )
             if not complete:
@@ -712,6 +788,7 @@ class Codex(BaseInstalledAgent):
                 local_events,
                 metrics_complete=complete,
                 is_root_thread=rollout["thread_id"] == stdout_root_id,
+                initial_total_usage=inherited_total_usage,
             )
             if trajectory is not None:
                 trajectories.append(trajectory)
@@ -786,7 +863,7 @@ class Codex(BaseInstalledAgent):
         self,
         raw_events: list[dict[str, Any]],
         parent_events: list[dict[str, Any]] | None,
-    ) -> tuple[list[dict[str, Any]], bool]:
+    ) -> tuple[list[dict[str, Any]], bool, dict[str, Any] | None]:
         """Drop history a full-history fork copied in from the parent thread.
 
         Codex's ``retain_forked_item`` keeps ``EventMsg`` and ``SessionMeta`` items
@@ -800,19 +877,22 @@ class Codex(BaseInstalledAgent):
         event that does not continue that sequence, so an identical payload the
         child emits later on its own is kept.
 
-        Returns ``(local_events, complete)``. ``complete`` is False when the
-        rollout looks forked but the parent's rollout was unavailable, in which
-        case the caller must not publish totals that would include inherited usage.
+        Returns ``(local_events, complete, inherited_total_usage)``. The final
+        cumulative token snapshot in the copied segment is retained as an
+        accounting baseline even though the copied event itself is removed.
+        ``complete`` is False when the rollout looks forked but the parent's
+        rollout was unavailable, in which case the caller must not publish totals
+        that would include inherited usage.
         """
         if not raw_events:
-            return raw_events, True
+            return raw_events, True, None
 
         _, _, has_copied_meta = self._rollout_thread_ids(raw_events)
 
         if not parent_events:
             # Nothing to compare against. Only a copied session_meta proves that
             # inherited history is present; without the parent we cannot strip it.
-            return raw_events, not has_copied_meta
+            return raw_events, not has_copied_meta, None
 
         start = 1
         if has_copied_meta:
@@ -844,14 +924,28 @@ class Codex(BaseInstalledAgent):
             parent_cursor = match_at + 1
 
         if index == start:
-            return raw_events, True
+            return raw_events, True, None
+
+        inherited_total_usage: dict[str, Any] | None = None
+        for event in raw_events[start:index]:
+            if event.get("type") != "event_msg":
+                continue
+            payload = event.get("payload")
+            if not isinstance(payload, dict) or payload.get("type") != "token_count":
+                continue
+            info = payload.get("info")
+            if not isinstance(info, dict):
+                continue
+            cumulative = info.get("total_token_usage")
+            if isinstance(cumulative, dict):
+                inherited_total_usage = cumulative
 
         stripped = raw_events[:start] + raw_events[index:]
         self.logger.debug(
             "Stripped %d inherited event(s) copied from the parent rollout",
             index - start,
         )
-        return stripped, True
+        return stripped, True, inherited_total_usage
 
     def _root_thread_id_from_stdout(self) -> str | None:
         """Return the root thread id that ``codex exec --json`` reported.
@@ -1011,6 +1105,7 @@ class Codex(BaseInstalledAgent):
         raw_events: list[dict[str, Any]] | None = None,
         metrics_complete: bool = True,
         is_root_thread: bool = False,
+        initial_total_usage: dict[str, Any] | None = None,
     ) -> Trajectory | None:
         """Convert a single Codex rollout into an ATIF trajectory.
 
@@ -1333,14 +1428,15 @@ class Codex(BaseInstalledAgent):
         if spawned:
             trajectory_extra["spawned_threads"] = spawned
 
-        # Per-thread totals are summed from each API call's incremental
-        # `last_token_usage` rather than read off the thread's final cumulative
-        # `total_token_usage`. Codex seeds a forked child's token state from its
-        # parent (multi-agent V1 `fork_context=true` creates a FullHistory
-        # child), so a child's cumulative total can already contain inherited
-        # parent usage; summing cumulative totals across a tree double-counts.
-        usage = self._sum_incremental_usage(raw_events)
-        if usage is None and is_root_thread:
+        # Codex token_count entries are cumulative snapshots. Count a
+        # last_token_usage only when the cumulative input counter proves that a
+        # new model request occurred; rate-limit and local-context snapshots can
+        # otherwise repeat the previous non-zero last usage verbatim.
+        usage, usage_complete = self._sum_incremental_usage(
+            raw_events, initial_total_usage
+        )
+        metrics_complete = metrics_complete and usage_complete
+        if usage is None and usage_complete and is_root_thread:
             usage = self._root_usage_from_stdout()
             if usage is not None:
                 self.logger.debug(

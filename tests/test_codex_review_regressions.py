@@ -41,16 +41,18 @@ def _token_count(
     output_tokens: int,
     cached_input_tokens: int = 0,
 ) -> dict[str, object]:
+    usage = {
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "cached_input_tokens": cached_input_tokens,
+    }
     return {
         "type": "event_msg",
         "payload": {
             "type": "token_count",
             "info": {
-                "last_token_usage": {
-                    "input_tokens": input_tokens,
-                    "output_tokens": output_tokens,
-                    "cached_input_tokens": cached_input_tokens,
-                }
+                "last_token_usage": dict(usage),
+                "total_token_usage": dict(usage),
             },
         },
     }
