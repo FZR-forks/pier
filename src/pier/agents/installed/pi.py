@@ -717,11 +717,20 @@ class Pi(BaseInstalledAgent):
 
         input_rate = pricing.get("input_cost_per_token") or 0.0
         output_rate = pricing.get("output_cost_per_token") or 0.0
-        cache_read_rate = pricing.get("cache_read_input_token_cost") or input_rate
-        cache_write_rate = pricing.get("cache_creation_input_token_cost") or input_rate
-        cache_write_1h_rate = (
-            pricing.get("cache_creation_input_token_cost_above_1hr") or cache_write_rate
+        # Each cache rate falls back to the next-coarser one only when LiteLLM has
+        # no entry at all. A rate of exactly 0.0 is meaningful -- DeepSeek, for
+        # one, does not charge for cache writes -- so it must survive the fallback.
+        cache_read_rate = pricing.get("cache_read_input_token_cost", input_rate)
+        if cache_read_rate is None:
+            cache_read_rate = input_rate
+        cache_write_rate = pricing.get("cache_creation_input_token_cost", input_rate)
+        if cache_write_rate is None:
+            cache_write_rate = input_rate
+        cache_write_1h_rate = pricing.get(
+            "cache_creation_input_token_cost_above_1hr", cache_write_rate
         )
+        if cache_write_1h_rate is None:
+            cache_write_1h_rate = cache_write_rate
 
         cached = cached_tokens or 0
         cache_write = cache_write_tokens or 0
