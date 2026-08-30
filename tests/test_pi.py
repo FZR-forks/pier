@@ -747,6 +747,92 @@ class TestCostFallback:
             },
         )
 
+    @staticmethod
+    def _patch_cache_model_cost(monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(
+            litellm,
+            "model_cost",
+            {
+                "anthropic/claude-haiku-4-5": {
+                    "input_cost_per_token": 1e-6,
+                    "output_cost_per_token": 2e-6,
+                    "cache_read_input_token_cost": 1e-7,
+                    "cache_creation_input_token_cost": 1.25e-6,
+                    "cache_creation_input_token_cost_above_1hr": 2e-6,
+                }
+            },
+        )
+
+    def test_cache_writes_priced_apart_from_input(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        self._patch_cache_model_cost(monkeypatch)
+        agent = Pi(logs_dir=tmp_path, model_name="anthropic/claude-haiku-4-5")
+        # prompt = 200 uncached + 500 cache read + 300 cache write.
+        cost = agent._compute_cost_from_pricing(1000, 500, 500, 300, 0)
+        assert cost == pytest.approx(
+            200 * 1e-6 + 500 * 1e-7 + 300 * 1.25e-6 + 500 * 2e-6
+        )
+
+    def test_one_hour_cache_writes_use_their_own_rate(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        self._patch_cache_model_cost(monkeypatch)
+        agent = Pi(logs_dir=tmp_path, model_name="anthropic/claude-haiku-4-5")
+        # pi reports cacheWrite1h as a subset of cacheWrite: 100 of the 300
+        # writes are 1-hour writes, so only 200 are billed at the 5-minute rate.
+        cost = agent._compute_cost_from_pricing(1000, 500, 500, 300, 100)
+        assert cost == pytest.approx(
+            200 * 1e-6 + 500 * 1e-7 + 200 * 1.25e-6 + 100 * 2e-6 + 500 * 2e-6
+        )
+
+    def test_all_cache_writes_at_one_hour_are_not_double_counted(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        self._patch_cache_model_cost(monkeypatch)
+        agent = Pi(logs_dir=tmp_path, model_name="anthropic/claude-haiku-4-5")
+        cost = agent._compute_cost_from_pricing(300, 0, 0, 300, 300)
+        assert cost == pytest.approx(300 * 2e-6)
+
+    def test_cache_writes_fall_back_to_input_rate(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        self._patch_model_cost(monkeypatch)
+        agent = Pi(logs_dir=tmp_path, model_name="anthropic/claude-haiku-4-5")
+        # No cache rates in the price table: everything prompt-side is input.
+        cost = agent._compute_cost_from_pricing(1000, 0, 500, 300, 100)
+        assert cost == pytest.approx(1000 * 1e-6)
+
+    def test_fallback_prices_cache_writes_from_trajectory(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        self._patch_cache_model_cost(monkeypatch)
+        agent = Pi(logs_dir=tmp_path, model_name="anthropic/claude-haiku-4-5")
+        write_stdout(
+            agent.logs_dir / "pi.txt",
+            [
+                {"type": "session", "id": "s1"},
+                {
+                    "type": "turn_end",
+                    "message": assistant_message(
+                        input=200,
+                        output=500,
+                        cache_read=500,
+                        cache_write=300,
+                        cache_write_1h=100,
+                        cost=0.0,
+                    ),
+                    "toolResults": [],
+                },
+            ],
+        )
+        agent._instruction = "Fix the bug"
+        context = AgentContext()
+        agent.populate_context_post_run(context)
+        assert context.cost_usd == pytest.approx(
+            200 * 1e-6 + 500 * 1e-7 + 200 * 1.25e-6 + 100 * 2e-6 + 500 * 2e-6
+        )
+
     def test_litellm_fallback_prices_known_model(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ):
