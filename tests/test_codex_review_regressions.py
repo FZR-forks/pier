@@ -40,11 +40,13 @@ def _token_count(
     input_tokens: int,
     output_tokens: int,
     cached_input_tokens: int = 0,
+    cache_write_input_tokens: int = 0,
 ) -> dict[str, object]:
     usage = {
         "input_tokens": input_tokens,
         "output_tokens": output_tokens,
         "cached_input_tokens": cached_input_tokens,
+        "cache_write_input_tokens": cache_write_input_tokens,
     }
     return {
         "type": "event_msg",
@@ -348,3 +350,116 @@ def test_step_count_ignores_non_dict_trajectory_documents(tmp_path: Path) -> Non
         path = tmp_path / "trajectory.json"
         path.write_text(payload)
         assert _agent_step_count_from_trajectory_path(path) is None, payload
+
+
+def test_cache_writes_are_preserved_without_inflating_prompt_tokens(
+    tmp_path: Path,
+) -> None:
+    """Codex's `input_tokens` already includes cache writes.
+
+    Recording `cache_write_input_tokens` must therefore only add observability:
+    prompt/cached totals stay exactly as Codex reported them.
+    """
+    events = _thread_events(ROOT, None, model=ROOT_MODEL)
+    events.append(
+        _token_count(100, 20, cached_input_tokens=30, cache_write_input_tokens=40)
+    )
+    _write_rollout(tmp_path, "root.jsonl", events)
+
+    trajectory = _convert(tmp_path)
+
+    step_metrics = [step.metrics for step in trajectory.steps if step.metrics]
+    assert step_metrics
+    assert any(
+        (metrics.extra or {}).get("cache_write_input_tokens") == 40
+        for metrics in step_metrics
+    )
+    for metrics in step_metrics:
+        assert metrics.prompt_tokens == 100
+        assert metrics.cached_tokens == 30
+
+    assert trajectory.final_metrics is not None
+    metrics = trajectory.final_metrics
+    assert metrics.total_prompt_tokens == 100
+    assert metrics.total_completion_tokens == 20
+    assert metrics.total_cached_tokens == 30
+    assert (metrics.extra or {})["total_cache_write_input_tokens"] == 40
+
+
+def test_tree_cache_writes_sum_across_subagents(tmp_path: Path) -> None:
+    root_events = _thread_events(ROOT, None, model=ROOT_MODEL)
+    root_events.append(_token_count(100, 10, cache_write_input_tokens=40))
+    _write_rollout(tmp_path, "root.jsonl", root_events)
+
+    child_events = _thread_events(CHILD, None, model=ROOT_MODEL, parent_thread_id=ROOT)
+    child_events.append(_token_count(50, 5, cache_write_input_tokens=7))
+    _write_rollout(tmp_path, "child.jsonl", child_events)
+
+    trajectory = _convert(tmp_path)
+    assert trajectory.final_metrics is not None
+    extra = trajectory.final_metrics.extra or {}
+    assert extra["total_cache_write_input_tokens"] == 47
+    assert extra["self_only"]["total_cache_write_input_tokens"] == 40
+    assert trajectory.final_metrics.total_prompt_tokens == 150
+
+
+def test_cache_writes_are_priced_at_the_cache_creation_rate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import litellm
+
+    model = "cache-write-priced-codex-model"
+    monkeypatch.setitem(
+        litellm.model_cost,
+        model,
+        {
+            "input_cost_per_token": 1e-6,
+            "output_cost_per_token": 2e-6,
+            "cache_read_input_token_cost": 1e-7,
+            "cache_creation_input_token_cost": 5e-6,
+        },
+    )
+    events = _thread_events(ROOT, None, model=model)
+    events.append(
+        _token_count(100, 10, cached_input_tokens=30, cache_write_input_tokens=40)
+    )
+    _write_rollout(tmp_path, "root.jsonl", events)
+
+    trajectory = Codex(
+        logs_dir=tmp_path, model_name=model
+    )._convert_events_to_trajectory(tmp_path / "sessions")
+    assert trajectory is not None
+    assert trajectory.final_metrics is not None
+    expected = 30 * 1e-6 + 30 * 1e-7 + 40 * 5e-6 + 10 * 2e-6
+    assert trajectory.final_metrics.total_cost_usd == pytest.approx(expected)
+
+
+def test_cost_is_unchanged_when_the_model_has_no_cache_write_price(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """OpenAI does not bill cache writes, so they stay at the plain input rate."""
+    import litellm
+
+    model = "no-cache-write-price-codex-model"
+    monkeypatch.setitem(
+        litellm.model_cost,
+        model,
+        {
+            "input_cost_per_token": 1e-6,
+            "output_cost_per_token": 2e-6,
+            "cache_read_input_token_cost": 1e-7,
+        },
+    )
+    events = _thread_events(ROOT, None, model=model)
+    events.append(
+        _token_count(100, 10, cached_input_tokens=30, cache_write_input_tokens=40)
+    )
+    _write_rollout(tmp_path, "root.jsonl", events)
+
+    trajectory = Codex(
+        logs_dir=tmp_path, model_name=model
+    )._convert_events_to_trajectory(tmp_path / "sessions")
+    assert trajectory is not None
+    assert trajectory.final_metrics is not None
+    expected = 70 * 1e-6 + 30 * 1e-7 + 10 * 2e-6
+    assert trajectory.final_metrics.total_cost_usd == pytest.approx(expected)

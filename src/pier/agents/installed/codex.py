@@ -295,17 +295,25 @@ class Codex(BaseInstalledAgent):
         prompt_tokens = last_usage.get("input_tokens")
         completion_tokens = last_usage.get("output_tokens")
         cached_tokens = last_usage.get("cached_input_tokens")
+        # Codex reports cache writes separately, but its `input_tokens` already
+        # includes them, so they are kept for observability only and must never
+        # be added to `prompt_tokens` again.
+        cache_write_tokens = last_usage.get("cache_write_input_tokens")
         reasoning_tokens = last_usage.get("reasoning_output_tokens")
         total_tokens = last_usage.get("total_tokens")
+
+        extra: dict[str, Any] = {
+            "reasoning_output_tokens": reasoning_tokens,
+            "total_tokens": total_tokens,
+        }
+        if cache_write_tokens is not None:
+            extra["cache_write_input_tokens"] = cache_write_tokens
 
         return {
             "prompt_tokens": prompt_tokens if prompt_tokens else None,
             "completion_tokens": completion_tokens or None,
             "cached_tokens": cached_tokens or None,
-            "extra": {
-                "reasoning_output_tokens": reasoning_tokens,
-                "total_tokens": total_tokens,
-            },
+            "extra": extra,
         }
 
     @staticmethod
@@ -392,6 +400,7 @@ class Codex(BaseInstalledAgent):
             "prompt_tokens": "input_tokens",
             "completion_tokens": "output_tokens",
             "cached_tokens": "cached_input_tokens",
+            "cache_write_tokens": "cache_write_input_tokens",
             "reasoning_tokens": "reasoning_output_tokens",
             "total_tokens": "total_tokens",
         }
@@ -665,6 +674,7 @@ class Codex(BaseInstalledAgent):
         prompt_tokens: int | None,
         completion_tokens: int | None,
         cached_tokens: int | None,
+        cache_write_tokens: int | None = None,
         model_name: str | None = None,
     ) -> float | None:
         """Compute total cost in USD from token counts via LiteLLM pricing.
@@ -703,14 +713,23 @@ class Codex(BaseInstalledAgent):
         cache_read_rate = pricing.get("cache_read_input_token_cost", input_rate)
         if cache_read_rate is None:
             cache_read_rate = input_rate
+        cache_write_rate = pricing.get("cache_creation_input_token_cost", input_rate)
+        if cache_write_rate is None:
+            cache_write_rate = input_rate
 
-        uncached_input = max(0, (prompt_tokens or 0) - (cached_tokens or 0))
+        # Codex's `input_tokens` already includes both cache reads and cache
+        # writes, so each is priced at its own rate and only the remainder is
+        # billed as fresh input. Models with no separate cache-creation price
+        # fall back to the plain input rate, leaving their total unchanged.
         cached = cached_tokens or 0
+        cache_writes = cache_write_tokens or 0
+        uncached_input = max(0, (prompt_tokens or 0) - cached - cache_writes)
         output = completion_tokens or 0
 
         return (
             uncached_input * input_rate
             + cached * cache_read_rate
+            + cache_writes * cache_write_rate
             + output * output_rate
         )
 
@@ -1465,9 +1484,13 @@ class Codex(BaseInstalledAgent):
                 prompt_tokens=usage["prompt_tokens"],
                 completion_tokens=usage["completion_tokens"],
                 cached_tokens=usage["cached_tokens"],
+                cache_write_tokens=usage["cache_write_tokens"],
                 model_name=default_model_name,
             )
             final_extra["reasoning_output_tokens"] = usage["reasoning_tokens"] or None
+            final_extra["total_cache_write_input_tokens"] = (
+                usage["cache_write_tokens"] or None
+            )
             final_extra["total_tokens"] = usage["total_tokens"] or None
 
             total_metrics = FinalMetrics(
@@ -1621,6 +1644,9 @@ class Codex(BaseInstalledAgent):
                         "prompt_tokens": payload.get("input_tokens") or 0,
                         "completion_tokens": payload.get("output_tokens") or 0,
                         "cached_tokens": payload.get("cached_input_tokens") or 0,
+                        "cache_write_tokens": (
+                            payload.get("cache_write_input_tokens") or 0
+                        ),
                         "reasoning_tokens": payload.get("reasoning_output_tokens") or 0,
                         "total_tokens": 0,
                     }
@@ -1665,6 +1691,7 @@ class Codex(BaseInstalledAgent):
         total_cost: float | None = None
         peak_context: int | None = None
         summarizations: int | None = None
+        cache_writes: int | None = None
 
         cost_complete = True
         for node in nodes:
@@ -1704,6 +1731,9 @@ class Codex(BaseInstalledAgent):
             node_summarizations = extra.get("summarization_count")
             if isinstance(node_summarizations, int):
                 summarizations = (summarizations or 0) + node_summarizations
+            node_cache_writes = extra.get("total_cache_write_input_tokens")
+            if isinstance(node_cache_writes, int):
+                cache_writes = (cache_writes or 0) + node_cache_writes
 
         tree_extra: dict[str, Any] = dict(
             (self_metrics.extra or {}) if self_metrics else {}
@@ -1714,6 +1744,9 @@ class Codex(BaseInstalledAgent):
                 "total_prompt_tokens": self_metrics.total_prompt_tokens,
                 "total_completion_tokens": self_metrics.total_completion_tokens,
                 "total_cached_tokens": self_metrics.total_cached_tokens,
+                "total_cache_write_input_tokens": (self_metrics.extra or {}).get(
+                    "total_cache_write_input_tokens"
+                ),
                 "total_cost_usd": self_metrics.total_cost_usd,
                 "total_steps": self_metrics.total_steps,
             }
@@ -1724,6 +1757,11 @@ class Codex(BaseInstalledAgent):
             tree_extra["peak_context_tokens"] = peak_context
         if summarizations is not None:
             tree_extra["summarization_count"] = summarizations
+        # tree_extra is seeded from the root's own extra, so the inherited
+        # root-only cache-write count has to be replaced by the tree total.
+        tree_extra.pop("total_cache_write_input_tokens", None)
+        if cache_writes is not None:
+            tree_extra["total_cache_write_input_tokens"] = cache_writes
 
         # An incomplete tree must not publish aggregates that would silently omit
         # (or double count) a thread's usage; keep the root-only view instead.
