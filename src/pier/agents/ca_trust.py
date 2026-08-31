@@ -321,7 +321,19 @@ def with_extra_ca_certs(spec: AgentInstallSpec) -> AgentInstallSpec:
         return spec
 
     step = ca_trust_install_step(pem)
-    update: dict[str, Any] = {"steps": [*spec.steps, step]}
+    steps = [*spec.steps, step]
+
+    # dockerfile_install_commands() emits a USER instruction per step and never
+    # restores, so the last step decides the derived image's default user. The CA
+    # step needs root, which would silently turn an agent-user image into a
+    # root-user one -- and Docker derives HOME from the image user, so even
+    # `exec -u agent` would then see HOME=/root and miss tools installed under the
+    # agent's home. Restore whatever the spec ended with.
+    final_user = spec.steps[-1].user
+    if final_user != "root":
+        steps.append(InstallStep(user=final_user, run="true"))
+
+    update: dict[str, Any] = {"steps": steps}
     if spec.cache_key:
         digest = hashlib.sha256(step.run.encode("utf-8")).hexdigest()[:16]
         update["cache_key"] = f"{spec.cache_key}-ca-{digest}"

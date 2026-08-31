@@ -26,6 +26,7 @@ from pier.agents.ca_trust import (
 )
 from pier.agents.factory import AgentFactory
 from pier.agents.installed.base import BaseInstalledAgent
+from pier.environments.agent_setup import dockerfile_install_commands
 from pier.environments.base import ExecResult
 from pier.environments.factory import EnvironmentFactory
 from pier.models.agent.install import AgentInstallSpec, InstallStep
@@ -122,13 +123,20 @@ class FakeInstalledAgent(BaseInstalledAgent):
 
 
 class RecordingEnvironment:
-    def __init__(self) -> None:
+    def __init__(self, persistent_env: dict[str, str] | None = None) -> None:
+        self._persistent_env = dict(persistent_env or {})
         self.exec_calls: list[dict[str, Any]] = []
+
+    @property
+    def persistent_env(self) -> dict[str, str]:
+        return dict(self._persistent_env)
 
     def agent_process_env(self, env: dict[str, str] | None) -> dict[str, str] | None:
         return env
 
     async def exec(self, **kwargs: Any) -> ExecResult:
+        if self._persistent_env:
+            kwargs["env"] = {**self._persistent_env, **(kwargs["env"] or {})}
         self.exec_calls.append(kwargs)
         return ExecResult(return_code=0)
 
@@ -175,15 +183,24 @@ def test_every_registered_installed_agent_adds_ca_step(
 
     assert unconfigured_spec is not None
     assert configured_spec is not None
-    assert configured_spec.steps[:-1] == unconfigured_spec.steps
-    assert len(configured_spec.steps) == len(unconfigured_spec.steps) + 1
+    assert (
+        configured_spec.steps[: len(unconfigured_spec.steps)] == unconfigured_spec.steps
+    )
 
     ca_steps = [step for step in configured_spec.steps if EXTRA_CA_PATH in step.run]
     assert len(ca_steps) == 1
-    assert configured_spec.steps[-1] is ca_steps[0]
+    ca_index = len(unconfigured_spec.steps)
+    assert configured_spec.steps[ca_index] == ca_steps[0]
     assert ca_steps[0].user == "root"
     assert f"> {EXTRA_CA_PATH}" in ca_steps[0].run
     assert f": > {CA_BUNDLE_PATH}" in ca_steps[0].run
+    if unconfigured_spec.steps[-1].user == "root":
+        assert len(configured_spec.steps) == len(unconfigured_spec.steps) + 1
+        assert configured_spec.steps[-1] == ca_steps[0]
+    else:
+        assert len(configured_spec.steps) == len(unconfigured_spec.steps) + 2
+        assert configured_spec.steps[-1].user == unconfigured_spec.steps[-1].user
+        assert configured_spec.steps[-1].run == "true"
     assert configured_spec.fingerprint() != unconfigured_spec.fingerprint()
 
 
@@ -534,11 +551,38 @@ def test_with_extra_ca_certs_appends_root_step_without_mutating_spec(
     assert augmented is not spec
     assert spec.model_dump() == original
     assert spec.steps == original_steps
-    assert augmented.steps[:-1] == original_steps
-    assert len(augmented.steps) == len(original_steps) + 1
-    assert augmented.steps[-1].user == "root"
-    assert augmented.steps[-1].run == ca_trust_install_script(pem)
+    assert augmented.steps[: len(original_steps)] == original_steps
+    ca_step = augmented.steps[len(original_steps)]
+    assert ca_step.user == "root"
+    assert ca_step.run == ca_trust_install_script(pem)
+    assert len(augmented.steps) == len(original_steps) + 2
+    assert augmented.steps[-1].user == original_steps[-1].user
+    assert augmented.steps[-1].run == "true"
     assert augmented.fingerprint() != spec.fingerprint()
+
+
+def test_with_extra_ca_certs_does_not_restore_root_user(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    certificates: tuple[str, str],
+) -> None:
+    path = tmp_path / "extra.pem"
+    path.write_text(certificates[0], encoding="utf-8")
+    monkeypatch.setenv(EXTRA_CA_CERTS_ENV, str(path))
+    spec = AgentInstallSpec(
+        agent_name="fake",
+        steps=[
+            InstallStep(user="agent", run="install agent"),
+            InstallStep(user="root", run="finish as root"),
+        ],
+    )
+
+    augmented = with_extra_ca_certs(spec)
+
+    assert len(augmented.steps) == len(spec.steps) + 1
+    assert augmented.steps[:-1] == spec.steps
+    assert augmented.steps[-1].user == "root"
+    assert augmented.steps[-1].run == ca_trust_install_script(certificates[0])
 
 
 def test_different_ca_files_change_install_fingerprint(
@@ -666,8 +710,10 @@ def test_base_installed_resolved_install_spec_delegates_to_base(
     resolved = agent.resolved_install_spec()
 
     assert calls == [agent]
-    assert resolved.steps[-1].user == "root"
-    assert EXTRA_CA_PATH in resolved.steps[-1].run
+    assert resolved.steps[-2].user == "root"
+    assert EXTRA_CA_PATH in resolved.steps[-2].run
+    assert resolved.steps[-1].user == "agent"
+    assert resolved.steps[-1].run == "true"
 
 
 def test_resolved_install_spec_handles_none_and_applies_ca(
@@ -684,8 +730,10 @@ def test_resolved_install_spec_handles_none_and_applies_ca(
     resolved = FakeInstalledAgent(tmp_path, spec).resolved_install_spec()
 
     assert resolved is not None
-    assert resolved.steps[:-1] == spec.steps
-    assert resolved.steps[-1].user == "root"
+    assert resolved.steps[: len(spec.steps)] == spec.steps
+    assert resolved.steps[-2].user == "root"
+    assert resolved.steps[-1].user == "agent"
+    assert resolved.steps[-1].run == "true"
 
 
 @pytest.mark.asyncio
@@ -700,11 +748,27 @@ async def test_install_uses_resolved_spec_and_runs_ca_step_last(
 
     await agent.install(environment)
 
-    assert len(environment.exec_calls) == 2
+    assert len(environment.exec_calls) == 3
     assert environment.exec_calls[0]["command"] == "set -o pipefail; install agent"
-    assert environment.exec_calls[-1]["user"] == "root"
-    assert environment.exec_calls[-1]["command"].startswith("set -o pipefail; set -eu")
-    assert CA_BUNDLE_PATH in environment.exec_calls[-1]["command"]
+    assert environment.exec_calls[-2]["user"] == "root"
+    assert environment.exec_calls[-2]["command"].startswith("set -o pipefail; set -eu")
+    assert CA_BUNDLE_PATH in environment.exec_calls[-2]["command"]
+    assert environment.exec_calls[-1]["user"] is None
+    assert environment.exec_calls[-1]["command"] == "set -o pipefail; true"
+
+
+def test_dockerfile_install_restores_original_final_user(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, certificates: tuple[str, str]
+) -> None:
+    ca_path = tmp_path / "extra.pem"
+    ca_path.write_text(certificates[0], encoding="utf-8")
+    monkeypatch.setenv(EXTRA_CA_CERTS_ENV, str(ca_path))
+    resolved = with_extra_ca_certs(install_spec())
+
+    commands = dockerfile_install_commands(resolved, user="agent")
+    user_lines = [command for command in commands if command.startswith("USER ")]
+
+    assert user_lines[-1] == "USER agent"
 
 
 def test_trial_environment_wiring_uses_resolved_install_spec(
@@ -777,6 +841,73 @@ async def test_exec_extra_env_overrides_ca_defaults(
     expected = ca_trust_env()
     expected["SSL_CERT_FILE"] = "agent-choice.pem"
     assert environment.exec_calls[-1]["env"] == expected
+
+
+@pytest.mark.parametrize(
+    "task_key, task_value",
+    [
+        ("REQUESTS_CA_BUNDLE", "/task/custom.pem"),
+        ("NODE_EXTRA_CA_CERTS", "/task/extra.pem"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_task_ca_values_override_pier_defaults(
+    task_key: str,
+    task_value: str,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    certificates: tuple[str, str],
+) -> None:
+    ca_path = tmp_path / "extra.pem"
+    ca_path.write_text(certificates[0], encoding="utf-8")
+    monkeypatch.setenv(EXTRA_CA_CERTS_ENV, str(ca_path))
+    agent = FakeInstalledAgent(tmp_path, install_spec())
+    environment = RecordingEnvironment({task_key: task_value})
+
+    await agent._exec(environment, "echo task ca")
+
+    received = environment.exec_calls[-1]["env"]
+    assert received[task_key] == task_value
+    assert set(received) == set(EXPECTED_CA_ENV)
+    assert all(
+        received[key] == value
+        for key, value in EXPECTED_CA_ENV.items()
+        if key != task_key
+    )
+
+
+@pytest.mark.asyncio
+async def test_task_ca_conflict_logs_the_conflicting_key(
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    certificates: tuple[str, str],
+) -> None:
+    ca_path = tmp_path / "extra.pem"
+    ca_path.write_text(certificates[0], encoding="utf-8")
+    monkeypatch.setenv(EXTRA_CA_CERTS_ENV, str(ca_path))
+    agent = FakeInstalledAgent(tmp_path, install_spec())
+    environment = RecordingEnvironment({"REQUESTS_CA_BUNDLE": "/task/custom.pem"})
+    caplog.set_level(logging.WARNING)
+
+    await agent._exec(environment, "echo task ca")
+
+    assert any("REQUESTS_CA_BUNDLE" in record.getMessage() for record in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_exec_injects_all_ca_defaults_without_task_conflicts(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, certificates: tuple[str, str]
+) -> None:
+    ca_path = tmp_path / "extra.pem"
+    ca_path.write_text(certificates[0], encoding="utf-8")
+    monkeypatch.setenv(EXTRA_CA_CERTS_ENV, str(ca_path))
+    agent = FakeInstalledAgent(tmp_path, install_spec())
+    environment = RecordingEnvironment()
+
+    await agent._exec(environment, "echo all ca")
+
+    assert environment.exec_calls[-1]["env"] == EXPECTED_CA_ENV
 
 
 @pytest.mark.asyncio

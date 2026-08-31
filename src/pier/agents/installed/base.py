@@ -9,7 +9,7 @@ if TYPE_CHECKING:
     from pier.models.agent.context import AgentContext
 
 from pier.agents.base import BaseAgent
-from pier.agents.ca_trust import ca_trust_env
+from pier.agents.ca_trust import EXTRA_CA_CERTS_ENV, ca_trust_env
 from pier.environments.base import BaseEnvironment
 from pier.models.agent.install import AgentInstallSpec
 from pier.utils.env import parse_bool_env_value
@@ -305,6 +305,32 @@ class BaseInstalledAgent(BaseAgent, ABC):
             return text[:max_len] + " ... [truncated]"
         return text
 
+    def _without_task_configured_ca(
+        self, ca_env: dict[str, str], environment: BaseEnvironment
+    ) -> dict[str, str]:
+        """Drop CA defaults the task already set in ``[environment.env]``.
+
+        ``BaseEnvironment._merge_env`` lets per-exec values win over the task's
+        persistent env, so injecting these unconditionally would silently replace
+        a CA bundle the task deliberately chose -- and for the replace-style
+        variables that removes roots it meant to trust. An explicit task setting
+        is more specific than Pier's default, so it wins; the collision is logged
+        because the internal CA then will not be trusted by that consumer.
+        """
+        task_env = environment.persistent_env
+        conflicts = sorted(key for key in ca_env if key in task_env)
+        if not conflicts:
+            return ca_env
+
+        self.logger.warning(
+            "Task [environment.env] already sets %s; keeping the task's values. "
+            "%s will not be added to those trust stores -- merge it into the "
+            "task's bundle if the agent must trust it.",
+            ", ".join(conflicts),
+            EXTRA_CA_CERTS_ENV,
+        )
+        return {key: value for key, value in ca_env.items() if key not in task_env}
+
     async def _exec(
         self,
         environment: BaseEnvironment,
@@ -325,6 +351,8 @@ class BaseInstalledAgent(BaseAgent, ABC):
         # CA trust sits underneath everything so an explicit ``agent.env`` entry
         # can still override it.
         ca_env = ca_trust_env() if inject_ca_env else {}
+        if ca_env:
+            ca_env = self._without_task_configured_ca(ca_env, environment)
         merged_env = env
         if ca_env or self._extra_env:
             merged_env = dict(ca_env)
