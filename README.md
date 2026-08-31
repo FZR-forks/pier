@@ -70,7 +70,18 @@ Because the replace-style variables substitute a runtime's trust store rather th
 
 The variables are injected as defaults; an explicit `agent.env` entry for the same key still wins.
 
-Scope of verification: the mechanism is proven end to end per *runtime family* -- a Rust/Codex handshake through `CODEX_CA_CERTIFICATE` and a Node handshake through `NODE_EXTRA_CA_CERTS`, both against a server signed by a private root -- and the tests assert that every registered agent receives the install step and the variables. That is not the same as an end-to-end private-HTTPS handshake through each agent's own binary, so when adopting a new harness, smoke-test that both private and public HTTPS succeed inside the sandbox.
+Both halves are needed because the runtime that makes the request differs per agent, and even per agent *version*:
+
+| Runtime | Reads the OS trust store? | Needs a variable |
+|---|---|---|
+| Rust (codex) | yes, via `rustls_native_certs` | `CODEX_CA_CERTIFICATE` also honoured |
+| Bun native binary (opencode, claude-code) | yes | `NODE_EXTRA_CA_CERTS` / `SSL_CERT_FILE` also honoured |
+| Node JS via npm (pi, gemini-cli) | **no** -- Node ships its own root list | `NODE_EXTRA_CA_CERTS` required |
+| Python (mini-swe-agent, antigravity-sdk) | via `SSL_CERT_FILE`; `requests`/`httpx` default to certifi | `SSL_CERT_FILE`, `REQUESTS_CA_BUNDLE` |
+
+Node is the reason the OS trust store alone is not sufficient: with a private root correctly installed via `update-ca-certificates`, `curl` succeeds while Node 22 fails with `UNABLE_TO_VERIFY_LEAF_SIGNATURE` (`tls.rootCertificates` is a separate, bundled list). Conversely a Bun-packaged agent works from the trust store with no variables at all -- which is why Pier does both rather than choosing.
+
+Verified end to end against a server signed by a private root: codex 0.151.0 (`CODEX_CA_CERTIFICATE`), opencode 1.18.25 (trust store alone, and each variable independently), and Node 22 (`NODE_EXTRA_CA_CERTS`). The tests additionally assert that every registered agent receives the install step and the variables. When adopting a new harness, smoke-test that both private and public HTTPS succeed inside the sandbox rather than assuming its packaging matches a sibling's.
 
 ## Agent runtime configuration
 
