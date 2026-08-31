@@ -20,11 +20,27 @@ from pier.agents.ca_trust import (
     split_pem_certificates,
     with_extra_ca_certs,
 )
+from pier.agents.factory import AgentFactory
 from pier.agents.installed.base import BaseInstalledAgent
 from pier.environments.base import ExecResult
 from pier.environments.factory import EnvironmentFactory
 from pier.models.agent.install import AgentInstallSpec, InstallStep
 from pier.trial.execution import TrialExecution
+
+
+INSTALLED_AGENT_CLASSES = tuple(
+    agent_class
+    for agent_class in AgentFactory._AGENTS
+    if issubclass(agent_class, BaseInstalledAgent)
+)
+EXPECTED_CA_ENV = {
+    "SSL_CERT_FILE": CA_BUNDLE_PATH,
+    "REQUESTS_CA_BUNDLE": CA_BUNDLE_PATH,
+    "CURL_CA_BUNDLE": CA_BUNDLE_PATH,
+    "GIT_SSL_CAINFO": CA_BUNDLE_PATH,
+    "NODE_EXTRA_CA_CERTS": EXTRA_CA_PATH,
+    "CODEX_CA_CERTIFICATE": EXTRA_CA_PATH,
+}
 
 
 @pytest.fixture
@@ -107,6 +123,107 @@ def install_spec() -> AgentInstallSpec:
         agent_name="fake",
         version="1.0",
         steps=[InstallStep(run="install agent", user="agent")],
+    )
+
+
+def make_registered_agent(
+    agent_class: type[BaseInstalledAgent], logs_dir: Path
+) -> BaseInstalledAgent:
+    return agent_class(logs_dir=logs_dir, model_name="test/model")
+
+
+@pytest.mark.parametrize(
+    "agent_class",
+    INSTALLED_AGENT_CLASSES,
+    ids=lambda agent_class: agent_class.__name__,
+)
+def test_every_registered_installed_agent_adds_ca_step(
+    agent_class: type[BaseInstalledAgent],
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    certificates: tuple[str, str],
+) -> None:
+    monkeypatch.delenv(EXTRA_CA_CERTS_ENV, raising=False)
+    unconfigured = make_registered_agent(agent_class, tmp_path / "plain")
+    unconfigured_spec = unconfigured.resolved_install_spec()
+
+    ca_path = tmp_path / "extra.pem"
+    ca_path.write_text(certificates[0], encoding="utf-8")
+    monkeypatch.setenv(EXTRA_CA_CERTS_ENV, str(ca_path))
+    configured = make_registered_agent(agent_class, tmp_path / "configured")
+    configured_spec = configured.resolved_install_spec()
+
+    assert unconfigured_spec is not None
+    assert configured_spec is not None
+    assert configured_spec.steps[:-1] == unconfigured_spec.steps
+    assert len(configured_spec.steps) == len(unconfigured_spec.steps) + 1
+
+    ca_steps = [step for step in configured_spec.steps if EXTRA_CA_PATH in step.run]
+    assert len(ca_steps) == 1
+    assert configured_spec.steps[-1] is ca_steps[0]
+    assert ca_steps[0].user == "root"
+    assert f"> {EXTRA_CA_PATH}" in ca_steps[0].run
+    assert f": > {CA_BUNDLE_PATH}" in ca_steps[0].run
+    assert configured_spec.fingerprint() != unconfigured_spec.fingerprint()
+
+
+@pytest.mark.parametrize(
+    "agent_class",
+    INSTALLED_AGENT_CLASSES,
+    ids=lambda agent_class: agent_class.__name__,
+)
+@pytest.mark.asyncio
+async def test_every_registered_installed_agent_exec_gets_ca_env(
+    agent_class: type[BaseInstalledAgent],
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    certificates: tuple[str, str],
+) -> None:
+    ca_path = tmp_path / "extra.pem"
+    ca_path.write_text(certificates[0], encoding="utf-8")
+    monkeypatch.setenv(EXTRA_CA_CERTS_ENV, str(ca_path))
+    agent = make_registered_agent(agent_class, tmp_path / "agent")
+    environment = RecordingEnvironment()
+
+    await agent._exec(environment, "echo probe")
+
+    assert environment.exec_calls[-1]["env"] == EXPECTED_CA_ENV
+
+
+@pytest.mark.parametrize(
+    "agent_class",
+    INSTALLED_AGENT_CLASSES,
+    ids=lambda agent_class: agent_class.__name__,
+)
+def test_registered_installed_agents_do_not_override_ca_hooks(
+    agent_class: type[BaseInstalledAgent],
+) -> None:
+    overrides = [
+        method_name
+        for method_name in ("_exec", "resolved_install_spec")
+        if method_name in agent_class.__dict__
+    ]
+
+    assert not overrides, (
+        f"{agent_class.__name__} overrides {overrides}; registered installed agents "
+        "must use BaseInstalledAgent's shared CA injection hooks."
+    )
+
+
+def test_installed_agent_modules_do_not_bypass_exec_ca_injection() -> None:
+    repo_root = Path(__file__).resolve().parents[1]
+    installed_dir = repo_root / "src/pier/agents/installed"
+    offenders = [
+        path.relative_to(repo_root).as_posix()
+        for path in installed_dir.rglob("*.py")
+        if path.name != "base.py"
+        and re.search(r"\.exec\(", path.read_text(encoding="utf-8"))
+    ]
+
+    assert not offenders, (
+        "Direct .exec(...) calls in installed-agent modules bypass BaseInstalledAgent "
+        "CA injection; route commands through exec_as_agent/exec_as_root instead. "
+        f"Offending files: {offenders}"
     )
 
 
