@@ -273,6 +273,15 @@ class BaseEnvironment(ABC):
         """
         return user if user is not None else self.default_user
 
+    @property
+    def persistent_env(self) -> dict[str, str]:
+        """Task-level ``[environment.env]`` values, as a read-only copy.
+
+        Exposed so callers layering their own defaults can tell what the task
+        already configured, rather than overriding it through :meth:`_merge_env`.
+        """
+        return dict(self._persistent_env)
+
     def _merge_env(self, env: dict[str, str] | None) -> dict[str, str] | None:
         """Merge persistent env vars with per-exec env vars.
 

@@ -9,6 +9,7 @@ if TYPE_CHECKING:
     from pier.models.agent.context import AgentContext
 
 from pier.agents.base import BaseAgent
+from pier.agents.ca_trust import EXTRA_CA_CERTS_ENV, ca_trust_env
 from pier.environments.base import BaseEnvironment
 from pier.models.agent.install import AgentInstallSpec
 from pier.utils.env import parse_bool_env_value
@@ -304,6 +305,32 @@ class BaseInstalledAgent(BaseAgent, ABC):
             return text[:max_len] + " ... [truncated]"
         return text
 
+    def _without_task_configured_ca(
+        self, ca_env: dict[str, str], environment: BaseEnvironment
+    ) -> dict[str, str]:
+        """Drop CA defaults the task already set in ``[environment.env]``.
+
+        ``BaseEnvironment._merge_env`` lets per-exec values win over the task's
+        persistent env, so injecting these unconditionally would silently replace
+        a CA bundle the task deliberately chose -- and for the replace-style
+        variables that removes roots it meant to trust. An explicit task setting
+        is more specific than Pier's default, so it wins; the collision is logged
+        because the internal CA then will not be trusted by that consumer.
+        """
+        task_env = environment.persistent_env
+        conflicts = sorted(key for key in ca_env if key in task_env)
+        if not conflicts:
+            return ca_env
+
+        self.logger.warning(
+            "Task [environment.env] already sets %s; keeping the task's values. "
+            "%s will not be added to those trust stores -- merge it into the "
+            "task's bundle if the agent must trust it.",
+            ", ".join(conflicts),
+            EXTRA_CA_CERTS_ENV,
+        )
+        return {key: value for key, value in ca_env.items() if key not in task_env}
+
     async def _exec(
         self,
         environment: BaseEnvironment,
@@ -312,14 +339,25 @@ class BaseInstalledAgent(BaseAgent, ABC):
         env: dict[str, str] | None = None,
         cwd: str | None = None,
         timeout_sec: int | None = None,
+        inject_ca_env: bool = True,
     ) -> Any:
         """Execute a command with logging, _extra_env merging, and error handling.
 
         Returns the ExecResult on success, raises RuntimeError on failure.
+
+        ``inject_ca_env=False`` is for commands that run *before* the CA trust
+        step has written its files; see :meth:`install`.
         """
+        # CA trust sits underneath everything so an explicit ``agent.env`` entry
+        # can still override it.
+        ca_env = ca_trust_env() if inject_ca_env else {}
+        if ca_env:
+            ca_env = self._without_task_configured_ca(ca_env, environment)
         merged_env = env
-        if self._extra_env:
-            merged_env = dict(env) if env else {}
+        if ca_env or self._extra_env:
+            merged_env = dict(ca_env)
+            if env:
+                merged_env.update(env)
             merged_env.update(self._extra_env)
 
         self.logger.debug(
@@ -368,10 +406,17 @@ class BaseInstalledAgent(BaseAgent, ABC):
         env: dict[str, str] | None = None,
         cwd: str | None = None,
         timeout_sec: int | None = None,
+        inject_ca_env: bool = True,
     ) -> Any:
         """Execute a command as root (for system packages, symlinks, etc.)."""
         return await self._exec(
-            environment, command, user="root", env=env, cwd=cwd, timeout_sec=timeout_sec
+            environment,
+            command,
+            user="root",
+            env=env,
+            cwd=cwd,
+            timeout_sec=timeout_sec,
+            inject_ca_env=inject_ca_env,
         )
 
     async def exec_as_agent(
@@ -381,10 +426,16 @@ class BaseInstalledAgent(BaseAgent, ABC):
         env: dict[str, str] | None = None,
         cwd: str | None = None,
         timeout_sec: int | None = None,
+        inject_ca_env: bool = True,
     ) -> Any:
         """Execute a command as the default agent user."""
         return await self._exec(
-            environment, command, env=env, cwd=cwd, timeout_sec=timeout_sec
+            environment,
+            command,
+            env=env,
+            cwd=cwd,
+            timeout_sec=timeout_sec,
+            inject_ca_env=inject_ca_env,
         )
 
     def render_instruction(self, instruction: str) -> str:
@@ -397,13 +448,37 @@ class BaseInstalledAgent(BaseAgent, ABC):
     def install_spec(self) -> AgentInstallSpec:
         """Declarative install steps executed at setup and inlined into Dockerfile builds."""
 
+    def resolved_install_spec(self) -> AgentInstallSpec:
+        """Narrows :meth:`BaseAgent.resolved_install_spec`: a spec is always present.
+
+        Delegates rather than reapplying the transform, so any future
+        framework-level install step added to the base class reaches installed
+        agents too.
+        """
+        spec = super().resolved_install_spec()
+        if spec is None:  # install_spec() is abstract here, so this cannot happen
+            raise RuntimeError(f"{self.name()} declared no install spec")
+        return spec
+
     async def install(self, environment: BaseEnvironment) -> None:
-        """Run each step from :meth:`install_spec` with matching privilege."""
-        for step in self.install_spec().steps:
+        """Run each step from :meth:`resolved_install_spec` with matching privilege.
+
+        The CA variables are deliberately withheld here. The CA trust step is the
+        last one in the spec, so the files those variables name do not exist while
+        the earlier steps run, and pointing e.g. ``CURL_CA_BUNDLE`` at a missing
+        path is a hard failure ("curl: (77) error setting certificate file") --
+        which would break the very downloads that install the agent. Those
+        downloads target public hosts and need the public roots, not this CA.
+        """
+        for step in self.resolved_install_spec().steps:
             if step.user == "root":
-                await self.exec_as_root(environment, command=step.run, env=step.env)
+                await self.exec_as_root(
+                    environment, command=step.run, env=step.env, inject_ca_env=False
+                )
             else:
-                await self.exec_as_agent(environment, command=step.run, env=step.env)
+                await self.exec_as_agent(
+                    environment, command=step.run, env=step.env, inject_ca_env=False
+                )
 
     async def setup(self, environment: BaseEnvironment) -> None:
         await environment.exec(command="mkdir -p /installed-agent", user="root")

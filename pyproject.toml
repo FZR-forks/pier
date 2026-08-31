@@ -61,6 +61,9 @@ known-first-party = ["pier"]
 
 [dependency-groups]
 dev = [
+    # Used by tests/test_ca_trust.py to assert the static RSA/EC fixtures really
+    # are RSA and EC. Declared rather than relied on transitively.
+    "cryptography>=42",
     "pytest>=9.0.3",
     "pytest-asyncio>=1.4.0",
     "ruff>=0.5",
