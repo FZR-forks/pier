@@ -56,6 +56,20 @@ uv run pier run -p datasets/swebenchpro --n-tasks 10 --sample-seed 0
 
 Trials land under `jobs/<timestamp_or_name>/<trial_id>/`. See `pier run --help`, `pier job --help`, `pier critique --help`, and `pier view --help` for everything else.
 
+## Private certificate authorities
+
+If your inference gateway is served with an internal CA, point `PIER_EXTRA_CA_CERTS` at a PEM bundle on the host:
+
+```bash
+PIER_EXTRA_CA_CERTS=/path/to/internal-roots.pem pier run -p path/to/task --agent codex
+```
+
+Pier appends a root install step to every installed agent that registers those certificates with the sandbox's OS trust store, and exports the CA variables each runtime reads: `SSL_CERT_FILE`, `REQUESTS_CA_BUNDLE`, `CURL_CA_BUNDLE` and `GIT_SSL_CAINFO` get a bundle of the distro roots plus yours (these replace the default store), while `NODE_EXTRA_CA_CERTS` and `CODEX_CA_CERTIFICATE` get your certificates alone (these add to it). Codex needs `CODEX_CA_CERTIFICATE` specifically -- the npm package is only a launcher shim around a static Rust binary, so `NODE_EXTRA_CA_CERTS` does nothing for it.
+
+Public roots are preserved, so agent installs that reach npm or GitHub keep working. The step runs after the agent's own install steps, which is where `ca-certificates` comes from on images that don't ship it (bare `debian:12` has no trust store at all); if no public roots are found it falls back to certifi and warns in the build log. The certificates are baked into the image at build time and counted in the install fingerprint, so rotating the CA invalidates cached sandbox images. Works on both `docker` and `modal`, and under `allow_internet = false` -- the egress proxy tunnels HTTPS with `CONNECT` and never re-signs the origin certificate, so the agent validates the gateway's real cert in every network mode.
+
+The variables are injected as defaults; an explicit `agent.env` entry for the same key still wins.
+
 ## Agent runtime configuration
 
 Use `agent.model_name` for trial metadata, `agent.env` for runtime env vars, and agent-specific `kwargs` for tool config. Pier's network allowlist also reads URLs out of those configs (Codex `config_toml`, OpenCode `opencode_config`, mini-swe `config_yaml`), so any base URL you set is allowlisted without code changes.

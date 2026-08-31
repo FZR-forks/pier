@@ -9,6 +9,7 @@ if TYPE_CHECKING:
     from pier.models.agent.context import AgentContext
 
 from pier.agents.base import BaseAgent
+from pier.agents.ca_trust import ca_trust_env, with_extra_ca_certs
 from pier.environments.base import BaseEnvironment
 from pier.models.agent.install import AgentInstallSpec
 from pier.utils.env import parse_bool_env_value
@@ -317,9 +318,14 @@ class BaseInstalledAgent(BaseAgent, ABC):
 
         Returns the ExecResult on success, raises RuntimeError on failure.
         """
+        # CA trust sits underneath everything so an explicit ``agent.env`` entry
+        # can still override it.
+        ca_env = ca_trust_env()
         merged_env = env
-        if self._extra_env:
-            merged_env = dict(env) if env else {}
+        if ca_env or self._extra_env:
+            merged_env = dict(ca_env)
+            if env:
+                merged_env.update(env)
             merged_env.update(self._extra_env)
 
         self.logger.debug(
@@ -397,9 +403,13 @@ class BaseInstalledAgent(BaseAgent, ABC):
     def install_spec(self) -> AgentInstallSpec:
         """Declarative install steps executed at setup and inlined into Dockerfile builds."""
 
+    def resolved_install_spec(self) -> AgentInstallSpec:
+        """Narrows :meth:`BaseAgent.resolved_install_spec`: a spec is always present."""
+        return with_extra_ca_certs(self.install_spec())
+
     async def install(self, environment: BaseEnvironment) -> None:
-        """Run each step from :meth:`install_spec` with matching privilege."""
-        for step in self.install_spec().steps:
+        """Run each step from :meth:`resolved_install_spec` with matching privilege."""
+        for step in self.resolved_install_spec().steps:
             if step.user == "root":
                 await self.exec_as_root(environment, command=step.run, env=step.env)
             else:

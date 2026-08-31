@@ -2,6 +2,7 @@ import logging
 from abc import ABC, abstractmethod
 from pathlib import Path
 
+from pier.agents.ca_trust import with_extra_ca_certs
 from pier.environments.base import BaseEnvironment
 from pier.models.agent.context import AgentContext
 from pier.models.agent.install import AgentInstallSpec
@@ -81,6 +82,19 @@ class BaseAgent(ABC):
     def install_spec(self) -> AgentInstallSpec | None:
         """Return build-time install commands for this resolved agent, if any."""
         return None
+
+    def resolved_install_spec(self) -> AgentInstallSpec | None:
+        """:meth:`install_spec` with framework-level install steps applied.
+
+        Callers that build or run the sandbox should use this rather than
+        :meth:`install_spec` so that steps Pier itself contributes -- currently
+        just custom CA trust -- are included and counted in the spec's
+        fingerprint.
+        """
+        spec = self.install_spec()
+        if spec is None:
+            return None
+        return with_extra_ca_certs(spec)
 
     def network_allowlist(self) -> NetworkAllowlist:
         """Return network domains this agent may need at runtime."""

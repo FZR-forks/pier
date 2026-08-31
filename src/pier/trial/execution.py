@@ -198,7 +198,7 @@ class TrialExecution:
             trial_paths=trial_paths,
             task_env_config=task.config.environment,
             logger=logger,
-            agent_install_spec=agent.install_spec(),
+            agent_install_spec=agent.resolved_install_spec(),
             network_allowlist=agent.network_allowlist(),
             default_user=task.config.agent.user,
         )
