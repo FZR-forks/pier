@@ -387,6 +387,7 @@ def test_cache_writes_are_preserved_without_inflating_prompt_tokens(
 
 
 def test_tree_cache_writes_sum_across_subagents(tmp_path: Path) -> None:
+    """A delegating run publishes the tree total, not just the root's share."""
     root_events = _thread_events(ROOT, None, model=ROOT_MODEL)
     root_events.append(_token_count(100, 10, cache_write_input_tokens=40))
     _write_rollout(tmp_path, "root.jsonl", root_events)
@@ -406,6 +407,7 @@ def test_tree_cache_writes_sum_across_subagents(tmp_path: Path) -> None:
 def test_cache_writes_are_priced_at_the_cache_creation_rate(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """Cache writes bill at cache-creation price, not the plain input rate."""
     import litellm
 
     model = "cache-write-priced-codex-model"
@@ -437,7 +439,12 @@ def test_cache_writes_are_priced_at_the_cache_creation_rate(
 def test_cost_is_unchanged_when_the_model_has_no_cache_write_price(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """OpenAI does not bill cache writes, so they stay at the plain input rate."""
+    """A model with no cache-creation price bills writes at the input rate.
+
+    Splitting cache writes out of the fresh-input remainder must not change the
+    total for such a model, so pricing tables that say nothing about cache
+    creation keep their previous cost.
+    """
     import litellm
 
     model = "no-cache-write-price-codex-model"
@@ -463,3 +470,109 @@ def test_cost_is_unchanged_when_the_model_has_no_cache_write_price(
     assert trajectory.final_metrics is not None
     expected = 70 * 1e-6 + 30 * 1e-7 + 10 * 2e-6
     assert trajectory.final_metrics.total_cost_usd == pytest.approx(expected)
+
+
+def test_incomplete_tree_withholds_the_cache_write_total(tmp_path: Path) -> None:
+    """An unmeasured child must not let the root's count pose as the tree total.
+
+    The surrounding aggregate deliberately withholds prompt/completion/cached
+    and cost totals for an incomplete tree; the cache-write total follows the
+    same rule, and the root's own figure stays under ``extra.self_only``.
+    """
+    root_events = _thread_events(ROOT, None, model=ROOT_MODEL)
+    root_events.append(_token_count(100, 10, cache_write_input_tokens=40))
+    _write_rollout(tmp_path, "root.jsonl", root_events)
+    _write_rollout(
+        tmp_path,
+        "child.jsonl",
+        _thread_events(CHILD, None, model=CHILD_MODEL, parent_thread_id=ROOT),
+    )
+
+    trajectory = _convert(tmp_path)
+    assert trajectory.final_metrics is not None
+    extra = trajectory.final_metrics.extra or {}
+    assert extra["tree_metrics_complete"] is False
+    assert "total_cache_write_input_tokens" not in extra
+    assert extra["self_only"]["total_cache_write_input_tokens"] == 40
+
+
+def test_tree_total_is_withheld_when_a_thread_reports_no_cache_writes(
+    tmp_path: Path,
+) -> None:
+    """A thread that never reports cache writes has an unknown, not zero, count.
+
+    Older Codex builds omit the field, so summing around such a thread would
+    silently understate the tree.
+    """
+    root_events = _thread_events(ROOT, None, model=ROOT_MODEL)
+    root_events.append(_token_count(100, 10, cache_write_input_tokens=40))
+    _write_rollout(tmp_path, "root.jsonl", root_events)
+
+    child_events = _thread_events(CHILD, None, model=ROOT_MODEL, parent_thread_id=ROOT)
+    child_usage = {"input_tokens": 50, "output_tokens": 5}
+    child_events.append(
+        {
+            "type": "event_msg",
+            "payload": {
+                "type": "token_count",
+                "info": {
+                    "last_token_usage": dict(child_usage),
+                    "total_token_usage": dict(child_usage),
+                },
+            },
+        }
+    )
+    _write_rollout(tmp_path, "child.jsonl", child_events)
+
+    trajectory = _convert(tmp_path)
+    assert trajectory.final_metrics is not None
+    extra = trajectory.final_metrics.extra or {}
+    # The tree itself is measurable; only the cache-write total is unknown.
+    assert extra["tree_metrics_complete"] is True
+    assert trajectory.final_metrics.total_prompt_tokens == 150
+    assert "total_cache_write_input_tokens" not in extra
+    assert extra["self_only"]["total_cache_write_input_tokens"] == 40
+
+
+def test_a_reported_zero_cache_write_count_is_preserved(tmp_path: Path) -> None:
+    """Zero is a measurement; it must not be flattened away like a missing field."""
+    events = _thread_events(ROOT, None, model=ROOT_MODEL)
+    events.append(_token_count(100, 10, cache_write_input_tokens=0))
+    _write_rollout(tmp_path, "root.jsonl", events)
+
+    trajectory = _convert(tmp_path)
+    assert trajectory.final_metrics is not None
+    assert (trajectory.final_metrics.extra or {})["total_cache_write_input_tokens"] == 0
+    step_extras = [
+        step.metrics.extra or {} for step in trajectory.steps if step.metrics
+    ]
+    assert any(extra.get("cache_write_input_tokens") == 0 for extra in step_extras)
+
+
+def test_unreported_cache_writes_stay_absent_from_metrics(tmp_path: Path) -> None:
+    """A Codex build that omits the field must not report a fabricated zero."""
+    events = _thread_events(ROOT, None, model=ROOT_MODEL)
+    usage = {"input_tokens": 100, "output_tokens": 10}
+    events.append(
+        {
+            "type": "event_msg",
+            "payload": {
+                "type": "token_count",
+                "info": {
+                    "last_token_usage": dict(usage),
+                    "total_token_usage": dict(usage),
+                },
+            },
+        }
+    )
+    _write_rollout(tmp_path, "root.jsonl", events)
+
+    trajectory = _convert(tmp_path)
+    assert trajectory.final_metrics is not None
+    assert trajectory.final_metrics.total_prompt_tokens == 100
+    assert "total_cache_write_input_tokens" not in (
+        trajectory.final_metrics.extra or {}
+    )
+    for step in trajectory.steps:
+        if step.metrics:
+            assert "cache_write_input_tokens" not in (step.metrics.extra or {})

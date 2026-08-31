@@ -320,7 +320,7 @@ class Codex(BaseInstalledAgent):
     def _final_cumulative_usage(
         raw_events: list[dict[str, Any]],
         initial_total_usage: dict[str, Any] | None = None,
-    ) -> tuple[dict[str, int] | None, bool]:
+    ) -> tuple[dict[str, int | None] | None, bool]:
         """Read a thread's final cumulative Codex usage snapshot.
 
         This deliberately follows Harbor's Codex adapter: final token totals come
@@ -404,21 +404,32 @@ class Codex(BaseInstalledAgent):
             "reasoning_tokens": "reasoning_output_tokens",
             "total_tokens": "total_tokens",
         }
-        usage: dict[str, int] = {}
+        # Cache writes are the one optional field here: older Codex builds omit
+        # them entirely. Absence therefore means "unknown", which has to stay
+        # distinguishable from a reported zero, so it is carried as None rather
+        # than being flattened to 0 like the always-present counters.
+        optional = {"cache_write_tokens"}
+        usage: dict[str, int | None] = {}
         for target, source in field_map.items():
             value = final_total_usage.get(source)
+            inherited = (
+                initial_total_usage.get(source)
+                if initial_total_usage is not None
+                else None
+            )
+            if target in optional and value is None and inherited is None:
+                usage[target] = None
+                continue
             if value is None:
                 value = 0
             if not isinstance(value, int):
                 return None, False
 
             baseline = 0
-            if initial_total_usage is not None:
-                inherited = initial_total_usage.get(source)
-                if inherited is not None:
-                    if not isinstance(inherited, int):
-                        return None, False
-                    baseline = inherited
+            if inherited is not None:
+                if not isinstance(inherited, int):
+                    return None, False
+                baseline = inherited
 
             delta = value - baseline
             if delta < 0:
@@ -1488,9 +1499,10 @@ class Codex(BaseInstalledAgent):
                 model_name=default_model_name,
             )
             final_extra["reasoning_output_tokens"] = usage["reasoning_tokens"] or None
-            final_extra["total_cache_write_input_tokens"] = (
-                usage["cache_write_tokens"] or None
-            )
+            if usage["cache_write_tokens"] is not None:
+                final_extra["total_cache_write_input_tokens"] = usage[
+                    "cache_write_tokens"
+                ]
             final_extra["total_tokens"] = usage["total_tokens"] or None
 
             total_metrics = FinalMetrics(
@@ -1608,7 +1620,7 @@ class Codex(BaseInstalledAgent):
             if refs:
                 results[0]["subagent_trajectory_ref"] = refs
 
-    def _root_usage_from_stdout(self) -> dict[str, int] | None:
+    def _root_usage_from_stdout(self) -> dict[str, int | None] | None:
         """Recover the root thread's usage from `codex exec --json` stdout.
 
         Backport of the Codex half of harbor-framework/harbor#970: when a rollout
@@ -1624,7 +1636,7 @@ class Codex(BaseInstalledAgent):
         if not stdout_path.exists():
             return None
 
-        usage: dict[str, int] | None = None
+        usage: dict[str, int | None] | None = None
         try:
             with open(stdout_path, "r") as handle:
                 for line in handle:
@@ -1644,9 +1656,7 @@ class Codex(BaseInstalledAgent):
                         "prompt_tokens": payload.get("input_tokens") or 0,
                         "completion_tokens": payload.get("output_tokens") or 0,
                         "cached_tokens": payload.get("cached_input_tokens") or 0,
-                        "cache_write_tokens": (
-                            payload.get("cache_write_input_tokens") or 0
-                        ),
+                        "cache_write_tokens": payload.get("cache_write_input_tokens"),
                         "reasoning_tokens": payload.get("reasoning_output_tokens") or 0,
                         "total_tokens": 0,
                     }
@@ -1694,6 +1704,7 @@ class Codex(BaseInstalledAgent):
         cache_writes: int | None = None
 
         cost_complete = True
+        cache_writes_complete = True
         for node in nodes:
             metrics = node.final_metrics
             if metrics is None:
@@ -1734,6 +1745,11 @@ class Codex(BaseInstalledAgent):
             node_cache_writes = extra.get("total_cache_write_input_tokens")
             if isinstance(node_cache_writes, int):
                 cache_writes = (cache_writes or 0) + node_cache_writes
+            else:
+                # A thread that never reported cache writes has an unknown
+                # count, not a zero one; summing around it would understate the
+                # tree.
+                cache_writes_complete = False
 
         tree_extra: dict[str, Any] = dict(
             (self_metrics.extra or {}) if self_metrics else {}
@@ -1758,9 +1774,13 @@ class Codex(BaseInstalledAgent):
         if summarizations is not None:
             tree_extra["summarization_count"] = summarizations
         # tree_extra is seeded from the root's own extra, so the inherited
-        # root-only cache-write count has to be replaced by the tree total.
+        # root-only cache-write count has to be dropped: republishing it here
+        # would present one thread's figure as the whole tree's. Like the token
+        # and cost aggregates below, the total is only published once every
+        # thread has been accounted for; until then the root's own count stays
+        # available under extra.self_only.
         tree_extra.pop("total_cache_write_input_tokens", None)
-        if cache_writes is not None:
+        if complete and cache_writes_complete and cache_writes is not None:
             tree_extra["total_cache_write_input_tokens"] = cache_writes
 
         # An incomplete tree must not publish aggregates that would silently omit
