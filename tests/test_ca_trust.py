@@ -1,6 +1,8 @@
 import base64
+import hashlib
 import logging
 import re
+import shutil
 import subprocess
 from pathlib import Path
 from types import SimpleNamespace
@@ -45,37 +47,72 @@ EXPECTED_CA_ENV = {
 
 @pytest.fixture
 def certificates(tmp_path: Path) -> tuple[str, str]:
-    paths = (
-        Path("/tmp/pukirootca2022rsa.crt"),
-        Path("/tmp/pukirootca2022ec.crt"),
+    if shutil.which("openssl") is None:
+        pytest.fail("openssl is required to generate the hermetic certificate fixtures")
+
+    rsa_path = tmp_path / "rsa.crt"
+    ec_path = tmp_path / "ec.crt"
+    subprocess.run(
+        [
+            "openssl",
+            "req",
+            "-x509",
+            "-newkey",
+            "rsa:2048",
+            "-nodes",
+            "-keyout",
+            str(tmp_path / "rsa.key"),
+            "-out",
+            str(rsa_path),
+            "-days",
+            "1",
+            "-subj",
+            "/CN=rsa",
+        ],
+        check=True,
+        capture_output=True,
     )
-    if not all(path.is_file() for path in paths):
-        paths = (tmp_path / "rsa.crt", tmp_path / "ec.crt")
-        for name, path in zip(("rsa", "ec"), paths, strict=True):
-            key_path = tmp_path / f"{name}.key"
-            subprocess.run(
-                [
-                    "openssl",
-                    "req",
-                    "-x509",
-                    "-newkey",
-                    "rsa:2048",
-                    "-nodes",
-                    "-keyout",
-                    str(key_path),
-                    "-out",
-                    str(path),
-                    "-days",
-                    "1",
-                    "-subj",
-                    f"/CN={name}",
-                ],
-                check=True,
-                capture_output=True,
-            )
+    subprocess.run(
+        [
+            "openssl",
+            "req",
+            "-x509",
+            "-newkey",
+            "ec",
+            "-pkeyopt",
+            "ec_paramgen_curve:prime256v1",
+            "-nodes",
+            "-keyout",
+            str(tmp_path / "ec.key"),
+            "-out",
+            str(ec_path),
+            "-days",
+            "1",
+            "-subj",
+            "/CN=ec",
+        ],
+        check=True,
+        capture_output=True,
+    )
+
+    rsa_details = subprocess.run(
+        ["openssl", "x509", "-in", str(rsa_path), "-noout", "-text"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+    ec_details = subprocess.run(
+        ["openssl", "x509", "-in", str(ec_path), "-noout", "-text"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+    assert "Public Key Algorithm: rsaEncryption" in rsa_details
+    assert "Public Key Algorithm: id-ecPublicKey" in ec_details
 
     blocks = tuple(
-        split_pem_certificates(path.read_text(encoding="utf-8"))[0] for path in paths
+        split_pem_certificates(path.read_text(encoding="utf-8"))[0]
+        for path in (rsa_path, ec_path)
     )
     assert len(blocks) == 2
     assert blocks[0] != blocks[1]
@@ -274,6 +311,8 @@ def test_ca_trust_env_separates_replace_and_additive_variables(
 
 
 def test_split_pem_certificates_ignores_non_certificate_blocks(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
     certificates: tuple[str, str],
 ) -> None:
     first, second = certificates
@@ -295,6 +334,11 @@ def test_split_pem_certificates_ignores_non_certificate_blocks(
     assert split_pem_certificates(first + second) == [first, second]
     assert split_pem_certificates(bundle) == [first, second]
     assert split_pem_certificates("") == []
+
+    path = tmp_path / "bundle.pem"
+    path.write_text(bundle, encoding="utf-8")
+    monkeypatch.setenv(EXTRA_CA_CERTS_ENV, str(path))
+    assert read_extra_ca_certs() == bundle
 
 
 def test_read_extra_ca_certs_expands_home(
@@ -325,6 +369,10 @@ def test_invalid_extra_ca_certs_raise_with_env_and_path(
     message = str(exc_info.value)
     assert EXTRA_CA_CERTS_ENV in message
     assert str(path) in message
+    # A file with no certificate delimiters at all is the one case that should
+    # still get the generic message; the truncation and TRUSTED-CERTIFICATE
+    # paths have their own, more specific errors.
+    assert "contains no '-----BEGIN CERTIFICATE-----' block" in message
 
 
 def test_missing_extra_ca_certs_raise_with_env_and_path(
@@ -339,6 +387,90 @@ def test_missing_extra_ca_certs_raise_with_env_and_path(
     message = str(exc_info.value)
     assert EXTRA_CA_CERTS_ENV in message
     assert str(path) in message
+
+
+def test_valid_then_truncated_certificate_is_rejected(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    certificates: tuple[str, str],
+) -> None:
+    path = tmp_path / "truncated-bundle.pem"
+    path.write_text(
+        certificates[0] + "-----BEGIN CERTIFICATE-----\ntruncated body\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv(EXTRA_CA_CERTS_ENV, str(path))
+
+    with pytest.raises(ExtraCaCertsError) as exc_info:
+        read_extra_ca_certs()
+
+    message = str(exc_info.value)
+    assert EXTRA_CA_CERTS_ENV in message
+    assert str(path) in message
+    assert "has 2" in message
+    assert "only 1 closed" in message
+
+
+def test_single_unterminated_certificate_is_rejected(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    path = tmp_path / "unterminated.pem"
+    path.write_text("-----BEGIN CERTIFICATE-----\ntruncated body\n", encoding="utf-8")
+    monkeypatch.setenv(EXTRA_CA_CERTS_ENV, str(path))
+
+    with pytest.raises(ExtraCaCertsError) as exc_info:
+        read_extra_ca_certs()
+
+    message = str(exc_info.value)
+    assert EXTRA_CA_CERTS_ENV in message
+    assert str(path) in message
+    # The file visibly holds a BEGIN marker, so "contains no BEGIN CERTIFICATE
+    # block" would send the reader looking in the wrong place.
+    assert "has 1 '-----BEGIN CERTIFICATE-----' block(s) but only 0 closed" in message
+
+
+def test_trusted_certificate_only_is_rejected_as_trusted_certificate(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    path = tmp_path / "trusted-only.pem"
+    path.write_text(
+        "-----BEGIN TRUSTED CERTIFICATE-----\ntrusted body\n"
+        "-----END TRUSTED CERTIFICATE-----\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv(EXTRA_CA_CERTS_ENV, str(path))
+
+    with pytest.raises(ExtraCaCertsError) as exc_info:
+        read_extra_ca_certs()
+
+    message = str(exc_info.value)
+    assert EXTRA_CA_CERTS_ENV in message
+    assert str(path) in message
+    # Naming the actual problem beats the generic "no plain certificate" error.
+    assert "-----BEGIN TRUSTED CERTIFICATE-----" in message
+    assert "convert it first" in message
+
+
+def test_trusted_certificate_after_plain_certificate_is_rejected(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    certificates: tuple[str, str],
+) -> None:
+    path = tmp_path / "mixed-trusted.pem"
+    path.write_text(
+        certificates[0] + "-----BEGIN TRUSTED CERTIFICATE-----\ntrusted body\n"
+        "-----END TRUSTED CERTIFICATE-----\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv(EXTRA_CA_CERTS_ENV, str(path))
+
+    with pytest.raises(ExtraCaCertsError, match="TRUSTED CERTIFICATE") as exc_info:
+        read_extra_ca_certs()
+
+    message = str(exc_info.value)
+    assert EXTRA_CA_CERTS_ENV in message
+    assert str(path) in message
+    assert "openssl x509 -in in.pem -out out.pem" in message
 
 
 def test_corrupt_certificate_body_is_rejected(
@@ -450,6 +582,38 @@ def test_different_ca_files_change_install_fingerprint(
     assert first.fingerprint() != spec.fingerprint()
     assert second.fingerprint() != spec.fingerprint()
     assert first.fingerprint() != second.fingerprint()
+
+
+def test_cache_key_is_extended_by_ca_digest_without_populating_new_keys(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    certificates: tuple[str, str],
+) -> None:
+    first_path = tmp_path / "first.pem"
+    second_path = tmp_path / "second.pem"
+    first_path.write_text(certificates[0], encoding="utf-8")
+    second_path.write_text(certificates[1], encoding="utf-8")
+    fixed = AgentInstallSpec(
+        agent_name="fake",
+        cache_key="fixed-key",
+        steps=[InstallStep(run="install agent")],
+    )
+    no_key = install_spec()
+
+    monkeypatch.setenv(EXTRA_CA_CERTS_ENV, str(first_path))
+    first = with_extra_ca_certs(fixed)
+    first_digest = hashlib.sha256(certificates[0].encode("utf-8")).hexdigest()[:16]
+    assert first.cache_key == f"fixed-key-ca-{first_digest}"
+    assert first.fingerprint() != fixed.fingerprint()
+    assert fixed.cache_key == "fixed-key"
+
+    monkeypatch.setenv(EXTRA_CA_CERTS_ENV, str(second_path))
+    second = with_extra_ca_certs(fixed)
+    assert second.cache_key != first.cache_key
+
+    unchanged = with_extra_ca_certs(no_key)
+    assert no_key.cache_key is None
+    assert unchanged.cache_key is None
 
 
 def test_install_script_payloads_round_trip_and_write_expected_files(

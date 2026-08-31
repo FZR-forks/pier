@@ -13,9 +13,13 @@ Two files are written into the sandbox:
     default trust store (``NODE_EXTRA_CA_CERTS``, ``CODEX_CA_CERTIFICATE``).
 
 ``/usr/local/share/pier/ca-bundle.pem``
-    The distro roots plus the extra certificates. This is for consumers that
+    The union of every public trust source found in the image -- the distro
+    roots and certifi -- plus the extra certificates. This is for consumers that
     *replace* their trust store with the file they are given
-    (``SSL_CERT_FILE``, ``REQUESTS_CA_BUNDLE``, ``CURL_CA_BUNDLE``).
+    (``SSL_CERT_FILE``, ``REQUESTS_CA_BUNDLE``, ``CURL_CA_BUNDLE``). It is a
+    union rather than the first source found because a Python runtime that
+    normally trusts a newer certifi must not lose roots merely because the image
+    also ships a distro bundle.
 
 Pier's filtered-egress proxy tunnels HTTPS with ``CONNECT`` and never re-signs
 the origin certificate, so the agent validates the gateway's real certificate
@@ -25,9 +29,11 @@ regardless of network mode and needs this either way.
 from __future__ import annotations
 
 import base64
+import hashlib
 import os
 import ssl
 from pathlib import Path
+from typing import Any
 
 from pier.models.agent.install import AgentInstallSpec, InstallStep
 
@@ -77,6 +83,10 @@ def read_extra_ca_certs() -> str | None:
         ) from exc
 
     certificates = split_pem_certificates(pem)
+    # Order matters: a lone unterminated block leaves ``certificates`` empty, and
+    # reporting "contains no BEGIN CERTIFICATE block" for a file that visibly has
+    # one sends the reader looking in the wrong place.
+    _reject_incomplete_blocks(pem, certificates, path)
     if not certificates:
         raise ExtraCaCertsError(
             f"{EXTRA_CA_CERTS_ENV} points at {path}, which contains no "
@@ -85,6 +95,37 @@ def read_extra_ca_certs() -> str | None:
         )
     _reject_unparseable_certificates(certificates, path)
     return pem
+
+
+def _reject_incomplete_blocks(pem: str, certificates: list[str], path: Path) -> None:
+    """Fail on certificate blocks that open but never close.
+
+    :func:`split_pem_certificates` drops an unterminated block, so a bundle of
+    "good certificate followed by a truncated one" would otherwise be silently
+    accepted as just the good one -- installing less trust than the operator
+    asked for, with no error. Counting the opening delimiters catches that.
+
+    ``TRUSTED CERTIFICATE`` is rejected rather than relabelled: it carries
+    OpenSSL trust settings after the certificate, so it is not interchangeable
+    with a plain ``CERTIFICATE`` block.
+    """
+    lines = [line.strip() for line in pem.splitlines()]
+    started = lines.count(_BEGIN_CERTIFICATE)
+    if started != len(certificates):
+        raise ExtraCaCertsError(
+            f"{EXTRA_CA_CERTS_ENV} points at {path}, which has {started} "
+            f"'{_BEGIN_CERTIFICATE}' block(s) but only {len(certificates)} "
+            f"closed by '{_END_CERTIFICATE}'. A truncated certificate would be "
+            "silently skipped, so the bundle is rejected."
+        )
+
+    if any(line == "-----BEGIN TRUSTED CERTIFICATE-----" for line in lines):
+        raise ExtraCaCertsError(
+            f"{EXTRA_CA_CERTS_ENV} points at {path}, which contains a "
+            "'-----BEGIN TRUSTED CERTIFICATE-----' block. That form carries "
+            "OpenSSL trust settings and is not a plain certificate; convert it "
+            "first, e.g. 'openssl x509 -in in.pem -out out.pem'."
+        )
 
 
 def _reject_unparseable_certificates(certificates: list[str], path: Path) -> None:
@@ -113,9 +154,13 @@ def split_pem_certificates(pem: str) -> list[str]:
     """Split a PEM bundle into its individual certificate blocks.
 
     Anything outside a ``CERTIFICATE`` block is dropped, so bundles that also
-    carry CRLs, private keys, or OpenSSL's ``TRUSTED CERTIFICATE`` sections are
-    accepted. Debian's ``update-ca-certificates`` reads only the first
-    certificate of a ``.crt`` file, which is why each block gets its own file.
+    carry CRLs or private keys are handled. Debian's ``update-ca-certificates``
+    reads only the first certificate of a ``.crt`` file, which is why each block
+    gets its own file.
+
+    This is a plain splitter: an unterminated block is dropped and
+    ``TRUSTED CERTIFICATE`` is not recognised. :func:`read_extra_ca_certs`
+    rejects both rather than letting them pass silently.
     """
     certificates: list[str] = []
     current: list[str] | None = None
@@ -151,9 +196,11 @@ def ca_trust_install_script(pem: str) -> str:
 mkdir -p {CA_DIR}
 printf '%s' '{_b64("".join(certificates))}' | base64 -d > {EXTRA_CA_PATH}
 
-# Register with the OS trust store so opaque native binaries pick the CA up
-# too. Best effort by design: the environment variables Pier exports are what
-# the agent runtimes actually read, and they only need the files above.
+# Register with the OS trust store so opaque native binaries pick the CA up too.
+# If a distro updater is present it must succeed: a half-updated store can leave
+# a rotated-out root still trusted by curl/git/Python via the system bundle while
+# Node and Codex only trust the new one, and silently inconsistent trust is worse
+# for a benchmark harness than a failed build.
 if command -v update-ca-certificates >/dev/null 2>&1; then
   anchor_dir=/usr/local/share/ca-certificates
   mkdir -p "$anchor_dir"
@@ -161,10 +208,11 @@ if command -v update-ca-certificates >/dev/null 2>&1; then
   # dropped root behind in a reused image.
   rm -f "$anchor_dir"/pier-extra-ca-*.crt
 {anchor_writes}
-  update-ca-certificates \
-    || echo "pier: warning: update-ca-certificates failed; the OS trust store" \
-      "may not contain PIER_EXTRA_CA_CERTS. The exported CA variables still" \
-      "point at the files above." >&2
+  if ! update-ca-certificates; then
+    echo "pier: error: update-ca-certificates failed; refusing to continue with" \
+      "a partially updated trust store." >&2
+    exit 1
+  fi
 elif command -v update-ca-trust >/dev/null 2>&1; then
   anchor_dir=/etc/pki/ca-trust/source/anchors
   mkdir -p "$anchor_dir"
@@ -172,14 +220,19 @@ elif command -v update-ca-trust >/dev/null 2>&1; then
   # dropped root behind in a reused image.
   rm -f "$anchor_dir"/pier-extra-ca-*.crt
 {anchor_writes}
-  update-ca-trust extract \
-    || echo "pier: warning: update-ca-trust failed; the OS trust store may not" \
-      "contain PIER_EXTRA_CA_CERTS. The exported CA variables still point at" \
-      "the files above." >&2
+  if ! update-ca-trust extract; then
+    echo "pier: error: update-ca-trust failed; refusing to continue with a" \
+      "partially updated trust store." >&2
+    exit 1
+  fi
 fi
 
-# Assemble the replace-style bundle: distro roots first, then the extras. If the
-# trust-store update above worked the extras appear twice, which is harmless.
+# Assemble the replace-style bundle. These variables *replace* a runtime's trust
+# store rather than adding to it, so the bundle has to be a union of every public
+# source the runtime might otherwise have used -- the distro roots AND certifi,
+# not whichever one we find first. A Python agent normally trusting a newer
+# certifi must not lose roots just because the image also ships a distro bundle.
+# Duplicates across the sources are harmless.
 : > {CA_BUNDLE_PATH}
 for bundle in {probe}; do
   if [ -s "$bundle" ]; then
@@ -188,11 +241,7 @@ for bundle in {probe}; do
   fi
 done
 
-# An image with no distro roots would otherwise leave SSL_CERT_FILE and
-# REQUESTS_CA_BUNDLE pointing at a bundle holding only the extras, which would
-# strip certifi's roots out from under the Python agents. Fall back to certifi so
-# the bundle never has *less* public trust than the runtime started with.
-if [ ! -s {CA_BUNDLE_PATH} ] && command -v python3 >/dev/null 2>&1; then
+if command -v python3 >/dev/null 2>&1; then
   python3 -c 'import certifi, sys; sys.stdout.write(open(certifi.where()).read())' \
     >> {CA_BUNDLE_PATH} 2>/dev/null || true
 fi
@@ -224,12 +273,20 @@ def with_extra_ca_certs(spec: AgentInstallSpec) -> AgentInstallSpec:
     downloads target public hosts and need the public roots, not this CA.
 
     The returned spec has a different :meth:`AgentInstallSpec.fingerprint`, so
-    changing the CA correctly invalidates cached sandbox images.
+    changing the CA correctly invalidates cached sandbox images. An explicit
+    ``cache_key`` short-circuits that fingerprint, so it is extended with a
+    digest of the CA material -- otherwise an agent opting into a fixed cache key
+    would keep serving an image built against the previous CA.
     """
     pem = read_extra_ca_certs()
     if pem is None:
         return spec
-    return spec.model_copy(update={"steps": [*spec.steps, ca_trust_install_step(pem)]})
+
+    update: dict[str, Any] = {"steps": [*spec.steps, ca_trust_install_step(pem)]}
+    if spec.cache_key:
+        digest = hashlib.sha256(pem.encode("utf-8")).hexdigest()[:16]
+        update["cache_key"] = f"{spec.cache_key}-ca-{digest}"
+    return spec.model_copy(update=update)
 
 
 def ca_trust_env() -> dict[str, str]:
