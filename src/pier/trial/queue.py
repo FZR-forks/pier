@@ -1,6 +1,7 @@
 import asyncio
 import shutil
 from collections.abc import Coroutine
+from pathlib import Path
 from typing import Any
 
 from pier.models.job.config import RetryConfig
@@ -96,6 +97,27 @@ class TrialQueue:
         )
         return min(delay, self._retry_config.max_wait_sec)
 
+    @staticmethod
+    def _archive_retry_attempt(trial_dir: Path, attempt: int) -> Path:
+        """Move a failed retryable attempt below a job-level metadata directory.
+
+        The extra nesting level keeps the top-level ``.retry-attempts`` directory
+        from matching Pier's trial-directory discovery heuristics. The leading dot
+        is cosmetic rather than the safety mechanism. Existing archive names are
+        preserved by adding a numeric suffix.
+        """
+        archive_root = trial_dir.parent / ".retry-attempts" / trial_dir.name
+        archive_root.mkdir(parents=True, exist_ok=True)
+
+        archive_dir = archive_root / f"attempt-{attempt + 1}"
+        suffix = 2
+        while archive_dir.exists():
+            archive_dir = archive_root / f"attempt-{attempt + 1}-{suffix}"
+            suffix += 1
+
+        shutil.move(str(trial_dir), str(archive_dir))
+        return archive_dir
+
     def _setup_hooks(self, trial) -> None:
         """Wire queue-level hooks to the trial."""
         for event, hooks in self._hooks.items():
@@ -130,15 +152,37 @@ class TrialQueue:
                 )
                 return result
 
-            shutil.rmtree(trial.trial_dir, ignore_errors=True)
+            archive_dir: Path | None = None
+            try:
+                archive_dir = self._archive_retry_attempt(trial.trial_dir, attempt)
+            except OSError as exc:
+                self._logger.warning(
+                    "Could not archive failed attempt for trial %s: %s. "
+                    "Deleting it before retry.",
+                    trial_config.trial_name,
+                    exc,
+                )
+                shutil.rmtree(trial.trial_dir, ignore_errors=True)
 
             delay = self._calculate_backoff_delay(attempt)
 
-            self._logger.debug(
-                f"Trial {trial_config.trial_name} failed with exception "
-                f"{result.exception_info.exception_type}. Retrying in "
-                f"{delay:.2f} seconds..."
-            )
+            if archive_dir is not None:
+                self._logger.debug(
+                    "Trial %s failed with exception %s. Archived failed attempt at %s. "
+                    "Retrying in %.2f seconds...",
+                    trial_config.trial_name,
+                    result.exception_info.exception_type,
+                    archive_dir,
+                    delay,
+                )
+            else:
+                self._logger.debug(
+                    "Trial %s failed with exception %s. Failed attempt could not be "
+                    "archived. Retrying in %.2f seconds...",
+                    trial_config.trial_name,
+                    result.exception_info.exception_type,
+                    delay,
+                )
 
             await asyncio.sleep(delay)
 
