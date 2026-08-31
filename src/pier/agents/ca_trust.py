@@ -13,13 +13,21 @@ Two files are written into the sandbox:
     default trust store (``NODE_EXTRA_CA_CERTS``, ``CODEX_CA_CERTIFICATE``).
 
 ``/usr/local/share/pier/ca-bundle.pem``
-    The union of every public trust source found in the image -- the distro
-    roots and certifi -- plus the extra certificates. This is for consumers that
-    *replace* their trust store with the file they are given
-    (``SSL_CERT_FILE``, ``REQUESTS_CA_BUNDLE``, ``CURL_CA_BUNDLE``). It is a
-    union rather than the first source found because a Python runtime that
-    normally trusts a newer certifi must not lose roots merely because the image
-    also ships a distro bundle.
+    The union of the public trust sources found in the image -- every readable
+    distro bundle, plus certifi for each interpreter in :data:`CERTIFI_PYTHONS`
+    -- followed by the extra certificates. This is for consumers that *replace*
+    their trust store with the file they are given (``SSL_CERT_FILE``,
+    ``REQUESTS_CA_BUNDLE``, ``CURL_CA_BUNDLE``). It is a union rather than the
+    first source found because a Python runtime that normally trusts a newer
+    certifi must not lose roots merely because the image also ships a distro
+    bundle.
+
+    The interpreter list is a bounded guess, so this is not a general guarantee:
+    a Python runtime living somewhere unprobed, holding certifi roots no probed
+    interpreter has, could still see its trust narrowed by
+    ``REQUESTS_CA_BUNDLE``. Closing that properly means either runtime-aware
+    trust construction or appending to each discovered certifi in place instead
+    of replacing trust through environment variables.
 
 Pier's filtered-egress proxy tunnels HTTPS with ``CONNECT`` and never re-signs
 the origin certificate, so the agent validates the gateway's real certificate
@@ -54,12 +62,19 @@ SYSTEM_CA_BUNDLES = (
 # the system python3 -- antigravity gets its own venv and mini-swe a ``uv tool``
 # environment -- and each can carry its own certifi. Unmatched globs stay literal
 # and are filtered out by the executable check in the generated script.
+#
+# The uv paths are globbed across home directories rather than taken from $HOME:
+# this step runs as root, but mini-swe installs under the *agent* user, and
+# ``[agent].user`` need not be root. Probing only $HOME would silently cover just
+# the root case. This is still a bounded guess at where an interpreter lives --
+# see the module docstring for the limits of that.
 CERTIFI_PYTHONS = (
     "python3",
     "python",
     "/installed-agent/venv/bin/python",
     "/installed-agent/venv/bin/python3",
     "/root/.local/share/uv/tools/*/bin/python3",
+    "/home/*/.local/share/uv/tools/*/bin/python3",
     '"$HOME"/.local/share/uv/tools/*/bin/python3',
 )
 
