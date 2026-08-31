@@ -806,23 +806,24 @@ class TestCostFallback:
     def test_zero_cache_write_rate_is_not_treated_as_missing(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ):
-        # DeepSeek's real LiteLLM entry: cache writes are free. A 0.0 rate must
-        # survive the fallback rather than reverting to the input rate.
+        # A price table may state a cache-write rate of exactly 0.0 because the
+        # provider does not charge for writes. That is a real rate, not a missing
+        # one, so it must survive the fallback instead of reverting to input.
         monkeypatch.setattr(
             litellm,
             "model_cost",
             {
-                "deepseek-v4-flash": {
-                    "input_cost_per_token": 4.4e-7,
-                    "output_cost_per_token": 1.32e-6,
-                    "cache_read_input_token_cost": 1.4e-8,
+                "free-cache-write-model": {
+                    "input_cost_per_token": 4e-7,
+                    "output_cost_per_token": 1e-6,
+                    "cache_read_input_token_cost": 1e-8,
                     "cache_creation_input_token_cost": 0.0,
                 }
             },
         )
-        agent = Pi(logs_dir=tmp_path, model_name="openai/deepseek-v4-flash")
-        cost = agent._compute_cost_from_pricing(3616, 30, 2000, 1000, 400)
-        assert cost == pytest.approx(616 * 4.4e-7 + 2000 * 1.4e-8 + 30 * 1.32e-6)
+        agent = Pi(logs_dir=tmp_path, model_name="openai/free-cache-write-model")
+        cost = agent._compute_cost_from_pricing(3600, 30, 2000, 1000, 400)
+        assert cost == pytest.approx(600 * 4e-7 + 2000 * 1e-8 + 30 * 1e-6)
 
     def test_fallback_prices_cache_writes_from_trajectory(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
