@@ -680,8 +680,17 @@ class Pi(BaseInstalledAgent):
         prompt_tokens: int | None,
         completion_tokens: int | None,
         cached_tokens: int | None,
+        cache_write_tokens: int | None = None,
+        cache_write_1h_tokens: int | None = None,
     ) -> float | None:
-        """Fall back to LiteLLM's bundled price table when pi reports no cost."""
+        """Fall back to LiteLLM's bundled price table when pi reports no cost.
+
+        Cache writes are priced separately from ordinary input because providers
+        such as Anthropic bill them at their own rate, with a higher rate again
+        for 1-hour writes. ``cache_write_1h_tokens`` is the 1-hour subset of
+        ``cache_write_tokens`` (that is how pi reports it), so it is not added on
+        top.
+        """
         if not self.model_name:
             return None
 
@@ -708,13 +717,35 @@ class Pi(BaseInstalledAgent):
 
         input_rate = pricing.get("input_cost_per_token") or 0.0
         output_rate = pricing.get("output_cost_per_token") or 0.0
-        cache_read_rate = pricing.get("cache_read_input_token_cost") or input_rate
+        # Each cache rate falls back to the next-coarser one only when LiteLLM has
+        # no entry at all. A rate of exactly 0.0 is meaningful -- DeepSeek, for
+        # one, does not charge for cache writes -- so it must survive the fallback.
+        cache_read_rate = pricing.get("cache_read_input_token_cost", input_rate)
+        if cache_read_rate is None:
+            cache_read_rate = input_rate
+        cache_write_rate = pricing.get("cache_creation_input_token_cost", input_rate)
+        if cache_write_rate is None:
+            cache_write_rate = input_rate
+        cache_write_1h_rate = pricing.get(
+            "cache_creation_input_token_cost_above_1hr", cache_write_rate
+        )
+        if cache_write_1h_rate is None:
+            cache_write_1h_rate = cache_write_rate
 
-        uncached = max(0, (prompt_tokens or 0) - (cached_tokens or 0))
         cached = cached_tokens or 0
+        cache_write = cache_write_tokens or 0
+        cache_write_1h = min(cache_write, cache_write_1h_tokens or 0)
+        cache_write_5m = cache_write - cache_write_1h
+        uncached = max(0, (prompt_tokens or 0) - cached - cache_write)
         output = completion_tokens or 0
 
-        return uncached * input_rate + cached * cache_read_rate + output * output_rate
+        return (
+            uncached * input_rate
+            + cached * cache_read_rate
+            + cache_write_5m * cache_write_rate
+            + cache_write_1h * cache_write_1h_rate
+            + output * output_rate
+        )
 
     def _convert_events_to_trajectory(
         self, events: list[dict[str, Any]]
@@ -774,7 +805,11 @@ class Pi(BaseInstalledAgent):
             # A zero result means no usage to price, which is absent rather than free.
             total_cost = (
                 self._compute_cost_from_pricing(
-                    totals["prompt"], totals["completion"], totals["cached"]
+                    totals["prompt"],
+                    totals["completion"],
+                    totals["cached"],
+                    totals["cache_write"],
+                    totals["cache_write_1h"],
                 )
                 or None
             )
