@@ -50,6 +50,19 @@ SYSTEM_CA_BUNDLES = (
     "/etc/ssl/cert.pem",  # assorted musl images
 )
 
+# Interpreters probed for a certifi bundle. Pier's Python agents do not run under
+# the system python3 -- antigravity gets its own venv and mini-swe a ``uv tool``
+# environment -- and each can carry its own certifi. Unmatched globs stay literal
+# and are filtered out by the executable check in the generated script.
+CERTIFI_PYTHONS = (
+    "python3",
+    "python",
+    "/installed-agent/venv/bin/python",
+    "/installed-agent/venv/bin/python3",
+    "/root/.local/share/uv/tools/*/bin/python3",
+    '"$HOME"/.local/share/uv/tools/*/bin/python3',
+)
+
 _BEGIN_CERTIFICATE = "-----BEGIN CERTIFICATE-----"
 _END_CERTIFICATE = "-----END CERTIFICATE-----"
 
@@ -191,6 +204,11 @@ def ca_trust_install_script(pem: str) -> str:
         for index, certificate in enumerate(certificates, start=1)
     )
     probe = " ".join(f'"{bundle}"' for bundle in SYSTEM_CA_BUNDLES)
+    # Globs must stay unquoted so the shell can expand them.
+    python_probe = " ".join(
+        candidate if "*" in candidate else f'"{candidate}"'
+        for candidate in CERTIFI_PYTHONS
+    )
 
     return f"""set -eu
 mkdir -p {CA_DIR}
@@ -228,23 +246,27 @@ elif command -v update-ca-trust >/dev/null 2>&1; then
 fi
 
 # Assemble the replace-style bundle. These variables *replace* a runtime's trust
-# store rather than adding to it, so the bundle has to be a union of every public
-# source the runtime might otherwise have used -- the distro roots AND certifi,
-# not whichever one we find first. A Python agent normally trusting a newer
-# certifi must not lose roots just because the image also ships a distro bundle.
-# Duplicates across the sources are harmless.
+# store rather than adding to it, so the bundle must union every public source a
+# runtime might otherwise have used, not whichever one is found first. Duplicates
+# across sources are harmless -- OpenSSL ignores repeats -- so no path is skipped.
 : > {CA_BUNDLE_PATH}
 for bundle in {probe}; do
   if [ -s "$bundle" ]; then
     cat "$bundle" >> {CA_BUNDLE_PATH}
-    break
   fi
 done
 
-if command -v python3 >/dev/null 2>&1; then
-  python3 -c 'import certifi, sys; sys.stdout.write(open(certifi.where()).read())' \
-    >> {CA_BUNDLE_PATH} 2>/dev/null || true
-fi
+# certifi, per interpreter. The Python that will make the request is often not
+# the system python3: pier installs antigravity into its own venv and mini-swe
+# through `uv tool`, each of which can carry its own certifi. Probing only
+# python3 could drop roots those runtimes already trusted. This step runs last in
+# the spec, so those interpreters already exist by now.
+for py in {python_probe}; do
+  if [ -x "$py" ] || command -v "$py" >/dev/null 2>&1; then
+    "$py" -c 'import certifi, sys; sys.stdout.write(open(certifi.where()).read())' \
+      >> {CA_BUNDLE_PATH} 2>/dev/null || true
+  fi
+done
 
 # Nothing public to merge: the image has no trust store and no certifi. The
 # extras below still work for the gateway, but anything reading the bundle loses
@@ -274,17 +296,19 @@ def with_extra_ca_certs(spec: AgentInstallSpec) -> AgentInstallSpec:
 
     The returned spec has a different :meth:`AgentInstallSpec.fingerprint`, so
     changing the CA correctly invalidates cached sandbox images. An explicit
-    ``cache_key`` short-circuits that fingerprint, so it is extended with a
-    digest of the CA material -- otherwise an agent opting into a fixed cache key
-    would keep serving an image built against the previous CA.
+    ``cache_key`` short-circuits that fingerprint, so it is extended with a digest
+    of the generated step -- not merely of the PEM -- otherwise a change to
+    :func:`ca_trust_install_script` would reuse an image built by the previous
+    version of the install logic against the same certificates.
     """
     pem = read_extra_ca_certs()
     if pem is None:
         return spec
 
-    update: dict[str, Any] = {"steps": [*spec.steps, ca_trust_install_step(pem)]}
+    step = ca_trust_install_step(pem)
+    update: dict[str, Any] = {"steps": [*spec.steps, step]}
     if spec.cache_key:
-        digest = hashlib.sha256(pem.encode("utf-8")).hexdigest()[:16]
+        digest = hashlib.sha256(step.run.encode("utf-8")).hexdigest()[:16]
         update["cache_key"] = f"{spec.cache_key}-ca-{digest}"
     return spec.model_copy(update=update)
 

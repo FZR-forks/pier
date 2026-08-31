@@ -2,19 +2,21 @@ import base64
 import hashlib
 import logging
 import re
-import shutil
-import subprocess
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
 import pytest
+from cryptography import x509
+from cryptography.hazmat.primitives.asymmetric import ec, rsa
 
 from pier.agents.base import BaseAgent
 from pier.agents.ca_trust import (
     CA_BUNDLE_PATH,
+    CERTIFI_PYTHONS,
     EXTRA_CA_CERTS_ENV,
     EXTRA_CA_PATH,
+    SYSTEM_CA_BUNDLES,
     ExtraCaCertsError,
     ca_trust_env,
     ca_trust_install_script,
@@ -45,74 +47,50 @@ EXPECTED_CA_ENV = {
 }
 
 
+RSA_CERTIFICATE = """-----BEGIN CERTIFICATE-----
+MIIDEzCCAfugAwIBAgIUC6jlOjnFqrdqNzrasZ11JeJ9pvQwDQYJKoZIhvcNAQEL
+BQAwGDEWMBQGA1UEAwwNUGllci1UZXN0LVJTQTAgFw0yNjA4MzExMjE0MzBaGA8y
+MTI2MDgwNzEyMTQzMFowGDEWMBQGA1UEAwwNUGllci1UZXN0LVJTQTCCASIwDQYJ
+KoZIhvcNAQEBBQADggEPADCCAQoCggEBANVlCZS55esuK0B+qDXCTAfgmKtUFrtu
+C+xq6zaUTh4qX6R0dpyoKW1yfj2LwgOnArTRevefO5/td/Tnr8piFqy808hf4y5E
++OLbpXCkpntpFF6IRZMhIIe0a2qcJ34Nxg3u+6wJtHSdHif9ZCZ4WM8+JySH144S
+cwMt5rY28NF1Vxp1889vX8GK7sBfi/LTUFoJ60R2C+8WivaD+bzTuXjDy4+bemOj
+RFNuVQoV9X1D83RiXfQrwNvdhRw+QlgebmZQnpvt/gVDfe/RyyKQy0t987CuF+sG
+HrEQqMf8wY6Kwt0+a/azUdT9aFruSQFQlEBjDH9U7R+c9PfUKktafN0CAwEAAaNT
+MFEwHQYDVR0OBBYEFBJWr5wLDCjxlYFLQWA3flz4JdQ4MB8GA1UdIwQYMBaAFBJW
+r5wLDCjxlYFLQWA3flz4JdQ4MA8GA1UdEwEB/wQFMAMBAf8wDQYJKoZIhvcNAQEL
+BQADggEBADS/96f2sRHxTKH/1spz2FNbhH+eRzoHb0B3bcpM7SZx3nmA3dLn0wwJ
+l9WqVQRHJULE8PKr8eVCcpootI1YrDgyuKMHZV7N95kNaDiGbPYNFPTnObzfpW9q
+7MtogdVX3JsopQO3WXIXo5Alsj/u2kUOxQE0VDosMhlniYTuu29tWgybO9BTUmwe
+x5Ls7xA27DTN0lLwly3uBxa3kvJitQiV7bc/0qV7b6Jr3p50EwC/V5VJwZGoH5mL
+l0K8lDAXrXyXosCOqRnIO78pZLGvHBPgDxKvym/luSUR9YxsxyHCWALxZgirjdw3
+LV2nJsX9QsV8Gq9UnNUgDlWa+ISmiSw=
+-----END CERTIFICATE-----
+"""
+EC_CERTIFICATE = """-----BEGIN CERTIFICATE-----
+MIIBhTCCASugAwIBAgIUe1ktbzVL6SlEYsCOCUSC2cdvk9kwCgYIKoZIzj0EAwIw
+FzEVMBMGA1UEAwwMUGllci1UZXN0LUVDMCAXDTI2MDgzMTEyMTQzMFoYDzIxMjYw
+ODA3MTIxNDMwWjAXMRUwEwYDVQQDDAxQaWVyLVRlc3QtRUMwWTATBgcqhkjOPQIB
+BggqhkjOPQMBBwNCAATHHgz7eNJ67+pyKuj0LkhO6yGVSC8ojW/UPhOQKxmnEE8a
+5Z1dKVNKah8sJHXiQ6/zGQadYlZSMt/lUo9YRtXyo1MwUTAdBgNVHQ4EFgQUmLyE
+2AaH7LfE+SrsXOcCiXZ2ntcwHwYDVR0jBBgwFoAUmLyE2AaH7LfE+SrsXOcCiXZ2
+ntcwDwYDVR0TAQH/BAUwAwEB/zAKBggqhkjOPQQDAgNIADBFAiB3CgXJc3J0GPPz
+UXm8mlpJ7PD9BSSpmoiFVit+cAST4AIhAP9cqDHvmerwyjMJEXH0peFfzqGOlr9v
+IM1olitdZ2gF
+-----END CERTIFICATE-----
+"""
+
+
 @pytest.fixture
-def certificates(tmp_path: Path) -> tuple[str, str]:
-    if shutil.which("openssl") is None:
-        pytest.fail("openssl is required to generate the hermetic certificate fixtures")
-
-    rsa_path = tmp_path / "rsa.crt"
-    ec_path = tmp_path / "ec.crt"
-    subprocess.run(
-        [
-            "openssl",
-            "req",
-            "-x509",
-            "-newkey",
-            "rsa:2048",
-            "-nodes",
-            "-keyout",
-            str(tmp_path / "rsa.key"),
-            "-out",
-            str(rsa_path),
-            "-days",
-            "1",
-            "-subj",
-            "/CN=rsa",
-        ],
-        check=True,
-        capture_output=True,
-    )
-    subprocess.run(
-        [
-            "openssl",
-            "req",
-            "-x509",
-            "-newkey",
-            "ec",
-            "-pkeyopt",
-            "ec_paramgen_curve:prime256v1",
-            "-nodes",
-            "-keyout",
-            str(tmp_path / "ec.key"),
-            "-out",
-            str(ec_path),
-            "-days",
-            "1",
-            "-subj",
-            "/CN=ec",
-        ],
-        check=True,
-        capture_output=True,
-    )
-
-    rsa_details = subprocess.run(
-        ["openssl", "x509", "-in", str(rsa_path), "-noout", "-text"],
-        check=True,
-        capture_output=True,
-        text=True,
-    ).stdout
-    ec_details = subprocess.run(
-        ["openssl", "x509", "-in", str(ec_path), "-noout", "-text"],
-        check=True,
-        capture_output=True,
-        text=True,
-    ).stdout
-    assert "Public Key Algorithm: rsaEncryption" in rsa_details
-    assert "Public Key Algorithm: id-ecPublicKey" in ec_details
+def certificates() -> tuple[str, str]:
+    rsa_certificate = x509.load_pem_x509_certificate(RSA_CERTIFICATE.encode("ascii"))
+    ec_certificate = x509.load_pem_x509_certificate(EC_CERTIFICATE.encode("ascii"))
+    assert isinstance(rsa_certificate.public_key(), rsa.RSAPublicKey)
+    assert isinstance(ec_certificate.public_key(), ec.EllipticCurvePublicKey)
+    assert ec_certificate.public_key().curve.name == "secp256r1"
 
     blocks = tuple(
-        split_pem_certificates(path.read_text(encoding="utf-8"))[0]
-        for path in (rsa_path, ec_path)
+        split_pem_certificates(pem)[0] for pem in (RSA_CERTIFICATE, EC_CERTIFICATE)
     )
     assert len(blocks) == 2
     assert blocks[0] != blocks[1]
@@ -602,7 +580,11 @@ def test_cache_key_is_extended_by_ca_digest_without_populating_new_keys(
 
     monkeypatch.setenv(EXTRA_CA_CERTS_ENV, str(first_path))
     first = with_extra_ca_certs(fixed)
-    first_digest = hashlib.sha256(certificates[0].encode("utf-8")).hexdigest()[:16]
+    # The digest covers the generated install step, not just the PEM, so a change
+    # to ca_trust_install_script() also invalidates a fixed cache key.
+    first_digest = hashlib.sha256(
+        ca_trust_install_script(certificates[0]).encode("utf-8")
+    ).hexdigest()[:16]
     assert first.cache_key == f"fixed-key-ca-{first_digest}"
     assert first.fingerprint() != fixed.fingerprint()
     assert fixed.cache_key == "fixed-key"
@@ -633,6 +615,59 @@ def test_install_script_payloads_round_trip_and_write_expected_files(
 
     anchor_paths = re.findall(r"\$anchor_dir/(pier-extra-ca-\d+\.crt)", script)
     assert {f"pier-extra-ca-{index}.crt" for index in range(1, 3)} == set(anchor_paths)
+
+
+def test_install_script_probes_every_system_bundle_without_short_circuit(
+    certificates: tuple[str, str],
+) -> None:
+    script = ca_trust_install_script("".join(certificates))
+    start = script.index("for bundle in ")
+    end = script.index("\n\n# certifi", start)
+    system_loop = script[start:end]
+
+    # These are container paths, so execute-shape coverage is more reliable than
+    # running the script on the host. The union contract requires no short circuit.
+    assert all(f'"{bundle}"' in system_loop for bundle in SYSTEM_CA_BUNDLES)
+    assert "break" not in system_loop
+
+
+def test_install_script_probes_certifi_with_load_bearing_quote_rules(
+    certificates: tuple[str, str],
+) -> None:
+    script = ca_trust_install_script("".join(certificates))
+    start = script.index("for py in ")
+    end = script.index("\n\n# Nothing public", start)
+    python_loop = script[start:end]
+
+    for candidate in CERTIFI_PYTHONS:
+        if "*" in candidate:
+            assert candidate in python_loop
+            assert f'"{candidate}"' not in python_loop
+        else:
+            assert f'"{candidate}"' in python_loop
+
+
+def test_base_installed_resolved_install_spec_delegates_to_base(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, certificates: tuple[str, str]
+) -> None:
+    ca_path = tmp_path / "extra.pem"
+    ca_path.write_text(certificates[0], encoding="utf-8")
+    monkeypatch.setenv(EXTRA_CA_CERTS_ENV, str(ca_path))
+    base_resolver = BaseAgent.resolved_install_spec
+    calls: list[BaseAgent] = []
+
+    def observed_resolver(agent: BaseAgent):
+        calls.append(agent)
+        return base_resolver(agent)
+
+    monkeypatch.setattr(BaseAgent, "resolved_install_spec", observed_resolver)
+    agent = FakeInstalledAgent(tmp_path, install_spec())
+
+    resolved = agent.resolved_install_spec()
+
+    assert calls == [agent]
+    assert resolved.steps[-1].user == "root"
+    assert EXTRA_CA_PATH in resolved.steps[-1].run
 
 
 def test_resolved_install_spec_handles_none_and_applies_ca(

@@ -9,7 +9,7 @@ if TYPE_CHECKING:
     from pier.models.agent.context import AgentContext
 
 from pier.agents.base import BaseAgent
-from pier.agents.ca_trust import ca_trust_env, with_extra_ca_certs
+from pier.agents.ca_trust import ca_trust_env
 from pier.environments.base import BaseEnvironment
 from pier.models.agent.install import AgentInstallSpec
 from pier.utils.env import parse_bool_env_value
@@ -421,8 +421,16 @@ class BaseInstalledAgent(BaseAgent, ABC):
         """Declarative install steps executed at setup and inlined into Dockerfile builds."""
 
     def resolved_install_spec(self) -> AgentInstallSpec:
-        """Narrows :meth:`BaseAgent.resolved_install_spec`: a spec is always present."""
-        return with_extra_ca_certs(self.install_spec())
+        """Narrows :meth:`BaseAgent.resolved_install_spec`: a spec is always present.
+
+        Delegates rather than reapplying the transform, so any future
+        framework-level install step added to the base class reaches installed
+        agents too.
+        """
+        spec = super().resolved_install_spec()
+        if spec is None:  # install_spec() is abstract here, so this cannot happen
+            raise RuntimeError(f"{self.name()} declared no install spec")
+        return spec
 
     async def install(self, environment: BaseEnvironment) -> None:
         """Run each step from :meth:`resolved_install_spec` with matching privilege.
