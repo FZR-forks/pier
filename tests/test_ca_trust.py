@@ -126,6 +126,11 @@ def install_spec() -> AgentInstallSpec:
     )
 
 
+def corrupt_certificate(certificate: str) -> str:
+    lines = certificate.splitlines()
+    return f"{lines[0]}\nTm90IGEgY2VydGlmaWNhdGU=\n{lines[-1]}\n"
+
+
 def make_registered_agent(
     agent_class: type[BaseInstalledAgent], logs_dir: Path
 ) -> BaseInstalledAgent:
@@ -336,6 +341,71 @@ def test_missing_extra_ca_certs_raise_with_env_and_path(
     assert str(path) in message
 
 
+def test_corrupt_certificate_body_is_rejected(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    certificates: tuple[str, str],
+) -> None:
+    path = tmp_path / "corrupt.pem"
+    path.write_text(corrupt_certificate(certificates[0]), encoding="utf-8")
+    monkeypatch.setenv(EXTRA_CA_CERTS_ENV, str(path))
+
+    with pytest.raises(ExtraCaCertsError) as exc_info:
+        read_extra_ca_certs()
+
+    message = str(exc_info.value)
+    assert EXTRA_CA_CERTS_ENV in message
+    assert str(path) in message
+    assert "certificate #1" in message
+
+
+def test_corrupt_certificate_reports_its_bundle_index(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    certificates: tuple[str, str],
+) -> None:
+    path = tmp_path / "corrupt-bundle.pem"
+    path.write_text(
+        certificates[0] + corrupt_certificate(certificates[1]), encoding="utf-8"
+    )
+    monkeypatch.setenv(EXTRA_CA_CERTS_ENV, str(path))
+
+    with pytest.raises(ExtraCaCertsError) as exc_info:
+        read_extra_ca_certs()
+
+    message = str(exc_info.value)
+    assert EXTRA_CA_CERTS_ENV in message
+    assert str(path) in message
+    assert "certificate #2" in message
+    assert "certificate #1" not in message
+
+
+def test_two_valid_certificates_still_read_successfully(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    certificates: tuple[str, str],
+) -> None:
+    pem = "".join(certificates)
+    path = tmp_path / "valid-bundle.pem"
+    path.write_text(pem, encoding="utf-8")
+    monkeypatch.setenv(EXTRA_CA_CERTS_ENV, str(path))
+
+    assert read_extra_ca_certs() == pem
+
+
+def test_with_extra_ca_certs_rejects_corrupt_bundle(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    certificates: tuple[str, str],
+) -> None:
+    path = tmp_path / "corrupt.pem"
+    path.write_text(corrupt_certificate(certificates[0]), encoding="utf-8")
+    monkeypatch.setenv(EXTRA_CA_CERTS_ENV, str(path))
+
+    with pytest.raises(ExtraCaCertsError, match="certificate #1"):
+        with_extra_ca_certs(install_spec())
+
+
 def test_with_extra_ca_certs_appends_root_step_without_mutating_spec(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -524,3 +594,103 @@ async def test_exec_preserves_env_without_ca_or_extra_env(
 
     assert environment.exec_calls[-2]["env"] is supplied
     assert environment.exec_calls[-1]["env"] is None
+
+
+@pytest.mark.parametrize(
+    "agent_class",
+    INSTALLED_AGENT_CLASSES,
+    ids=lambda agent_class: agent_class.__name__,
+)
+@pytest.mark.asyncio
+async def test_install_withholds_ca_env_for_every_registered_agent(
+    agent_class: type[BaseInstalledAgent],
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    certificates: tuple[str, str],
+) -> None:
+    ca_path = tmp_path / "extra.pem"
+    ca_path.write_text(certificates[0], encoding="utf-8")
+    monkeypatch.setenv(EXTRA_CA_CERTS_ENV, str(ca_path))
+    agent = make_registered_agent(agent_class, tmp_path / "agent")
+    spec = agent.resolved_install_spec()
+    environment = RecordingEnvironment()
+
+    assert len(spec.steps) > 1
+    await agent.install(environment)
+
+    assert len(environment.exec_calls) == len(spec.steps)
+    for call in environment.exec_calls:
+        assert set(call["env"] or {}).isdisjoint(EXPECTED_CA_ENV)
+
+
+@pytest.mark.asyncio
+async def test_install_preserves_step_and_agent_env_without_ca_defaults(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, certificates: tuple[str, str]
+) -> None:
+    ca_path = tmp_path / "extra.pem"
+    ca_path.write_text(certificates[0], encoding="utf-8")
+    monkeypatch.setenv(EXTRA_CA_CERTS_ENV, str(ca_path))
+    spec = AgentInstallSpec(
+        agent_name="fake",
+        steps=[
+            InstallStep(
+                user="agent",
+                run="first step",
+                env={"STEP_KEY": "step-value"},
+            ),
+            InstallStep(user="root", run="second step"),
+        ],
+    )
+    agent = FakeInstalledAgent(tmp_path, spec, extra_env={"AGENT_KEY": "agent-value"})
+    environment = RecordingEnvironment()
+
+    await agent.install(environment)
+
+    assert environment.exec_calls[0]["env"] == {
+        "STEP_KEY": "step-value",
+        "AGENT_KEY": "agent-value",
+    }
+    assert all(
+        call["env"]["AGENT_KEY"] == "agent-value" for call in environment.exec_calls
+    )
+    assert all(
+        set(call["env"]).isdisjoint(EXPECTED_CA_ENV) for call in environment.exec_calls
+    )
+
+
+@pytest.mark.asyncio
+async def test_normal_exec_restores_ca_env_after_install(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, certificates: tuple[str, str]
+) -> None:
+    ca_path = tmp_path / "extra.pem"
+    ca_path.write_text(certificates[0], encoding="utf-8")
+    monkeypatch.setenv(EXTRA_CA_CERTS_ENV, str(ca_path))
+    agent = FakeInstalledAgent(tmp_path, install_spec())
+    environment = RecordingEnvironment()
+
+    await agent.install(environment)
+    await agent._exec(environment, "echo after install")
+
+    assert environment.exec_calls[-1]["env"] == EXPECTED_CA_ENV
+
+
+@pytest.mark.parametrize("method_name", ["exec_as_root", "exec_as_agent"])
+@pytest.mark.asyncio
+async def test_exec_helpers_can_suppress_ca_env_or_use_default(
+    method_name: str,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    certificates: tuple[str, str],
+) -> None:
+    ca_path = tmp_path / "extra.pem"
+    ca_path.write_text(certificates[0], encoding="utf-8")
+    monkeypatch.setenv(EXTRA_CA_CERTS_ENV, str(ca_path))
+    agent = FakeInstalledAgent(tmp_path, install_spec())
+    environment = RecordingEnvironment()
+    exec_helper = getattr(agent, method_name)
+
+    await exec_helper(environment, "echo without ca", inject_ca_env=False)
+    assert environment.exec_calls[-1]["env"] is None
+
+    await exec_helper(environment, "echo with ca")
+    assert environment.exec_calls[-1]["env"] == EXPECTED_CA_ENV

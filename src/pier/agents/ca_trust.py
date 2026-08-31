@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import base64
 import os
+import ssl
 from pathlib import Path
 
 from pier.models.agent.install import AgentInstallSpec, InstallStep
@@ -75,13 +76,37 @@ def read_extra_ca_certs() -> str | None:
             f"{EXTRA_CA_CERTS_ENV} points at {path}, which could not be read: {exc}"
         ) from exc
 
-    if not split_pem_certificates(pem):
+    certificates = split_pem_certificates(pem)
+    if not certificates:
         raise ExtraCaCertsError(
             f"{EXTRA_CA_CERTS_ENV} points at {path}, which contains no "
             f"'{_BEGIN_CERTIFICATE}' block. It must be a PEM file holding one or "
             "more certificates."
         )
+    _reject_unparseable_certificates(certificates, path)
     return pem
+
+
+def _reject_unparseable_certificates(certificates: list[str], path: Path) -> None:
+    """Fail on PEM blocks that OpenSSL cannot parse as certificates.
+
+    Matching delimiters are not enough: a block with a corrupt body would be
+    embedded in the install step, silently skipped by ``update-ca-certificates``
+    (which is best effort), and then appended to the merged bundle -- where it can
+    break parsing of the whole file and take *all* TLS down with it. Validating
+    here, on the host, turns that into an error before the trial starts. The check
+    runs through the same OpenSSL parser that will read the bundle in the sandbox.
+    """
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    for index, certificate in enumerate(certificates, start=1):
+        try:
+            context.load_verify_locations(cadata=certificate)
+        except (ssl.SSLError, ValueError) as exc:
+            raise ExtraCaCertsError(
+                f"{EXTRA_CA_CERTS_ENV} points at {path}, whose certificate "
+                f"#{index} could not be parsed: {exc}. Every "
+                f"'{_BEGIN_CERTIFICATE}' block must hold a valid certificate."
+            ) from exc
 
 
 def split_pem_certificates(pem: str) -> list[str]:
@@ -108,6 +133,7 @@ def split_pem_certificates(pem: str) -> list[str]:
 
 
 def _b64(text: str) -> str:
+    """Encode ``text`` for embedding in a single-quoted shell string."""
     return base64.b64encode(text.encode("utf-8")).decode("ascii")
 
 
@@ -131,13 +157,25 @@ printf '%s' '{_b64("".join(certificates))}' | base64 -d > {EXTRA_CA_PATH}
 if command -v update-ca-certificates >/dev/null 2>&1; then
   anchor_dir=/usr/local/share/ca-certificates
   mkdir -p "$anchor_dir"
+  # Clear anchors from an earlier run so a shrinking bundle does not leave a
+  # dropped root behind in a reused image.
+  rm -f "$anchor_dir"/pier-extra-ca-*.crt
 {anchor_writes}
-  update-ca-certificates || true
+  update-ca-certificates \
+    || echo "pier: warning: update-ca-certificates failed; the OS trust store" \
+      "may not contain PIER_EXTRA_CA_CERTS. The exported CA variables still" \
+      "point at the files above." >&2
 elif command -v update-ca-trust >/dev/null 2>&1; then
   anchor_dir=/etc/pki/ca-trust/source/anchors
   mkdir -p "$anchor_dir"
+  # Clear anchors from an earlier run so a shrinking bundle does not leave a
+  # dropped root behind in a reused image.
+  rm -f "$anchor_dir"/pier-extra-ca-*.crt
 {anchor_writes}
-  update-ca-trust extract || true
+  update-ca-trust extract \
+    || echo "pier: warning: update-ca-trust failed; the OS trust store may not" \
+      "contain PIER_EXTRA_CA_CERTS. The exported CA variables still point at" \
+      "the files above." >&2
 fi
 
 # Assemble the replace-style bundle: distro roots first, then the extras. If the
@@ -174,6 +212,7 @@ chmod 0644 {EXTRA_CA_PATH} {CA_BUNDLE_PATH}
 
 
 def ca_trust_install_step(pem: str) -> InstallStep:
+    """Wrap :func:`ca_trust_install_script` as a root install step."""
     return InstallStep(user="root", run=ca_trust_install_script(pem))
 
 

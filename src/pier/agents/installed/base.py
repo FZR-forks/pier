@@ -313,14 +313,18 @@ class BaseInstalledAgent(BaseAgent, ABC):
         env: dict[str, str] | None = None,
         cwd: str | None = None,
         timeout_sec: int | None = None,
+        inject_ca_env: bool = True,
     ) -> Any:
         """Execute a command with logging, _extra_env merging, and error handling.
 
         Returns the ExecResult on success, raises RuntimeError on failure.
+
+        ``inject_ca_env=False`` is for commands that run *before* the CA trust
+        step has written its files; see :meth:`install`.
         """
         # CA trust sits underneath everything so an explicit ``agent.env`` entry
         # can still override it.
-        ca_env = ca_trust_env()
+        ca_env = ca_trust_env() if inject_ca_env else {}
         merged_env = env
         if ca_env or self._extra_env:
             merged_env = dict(ca_env)
@@ -374,10 +378,17 @@ class BaseInstalledAgent(BaseAgent, ABC):
         env: dict[str, str] | None = None,
         cwd: str | None = None,
         timeout_sec: int | None = None,
+        inject_ca_env: bool = True,
     ) -> Any:
         """Execute a command as root (for system packages, symlinks, etc.)."""
         return await self._exec(
-            environment, command, user="root", env=env, cwd=cwd, timeout_sec=timeout_sec
+            environment,
+            command,
+            user="root",
+            env=env,
+            cwd=cwd,
+            timeout_sec=timeout_sec,
+            inject_ca_env=inject_ca_env,
         )
 
     async def exec_as_agent(
@@ -387,10 +398,16 @@ class BaseInstalledAgent(BaseAgent, ABC):
         env: dict[str, str] | None = None,
         cwd: str | None = None,
         timeout_sec: int | None = None,
+        inject_ca_env: bool = True,
     ) -> Any:
         """Execute a command as the default agent user."""
         return await self._exec(
-            environment, command, env=env, cwd=cwd, timeout_sec=timeout_sec
+            environment,
+            command,
+            env=env,
+            cwd=cwd,
+            timeout_sec=timeout_sec,
+            inject_ca_env=inject_ca_env,
         )
 
     def render_instruction(self, instruction: str) -> str:
@@ -408,12 +425,24 @@ class BaseInstalledAgent(BaseAgent, ABC):
         return with_extra_ca_certs(self.install_spec())
 
     async def install(self, environment: BaseEnvironment) -> None:
-        """Run each step from :meth:`resolved_install_spec` with matching privilege."""
+        """Run each step from :meth:`resolved_install_spec` with matching privilege.
+
+        The CA variables are deliberately withheld here. The CA trust step is the
+        last one in the spec, so the files those variables name do not exist while
+        the earlier steps run, and pointing e.g. ``CURL_CA_BUNDLE`` at a missing
+        path is a hard failure ("curl: (77) error setting certificate file") --
+        which would break the very downloads that install the agent. Those
+        downloads target public hosts and need the public roots, not this CA.
+        """
         for step in self.resolved_install_spec().steps:
             if step.user == "root":
-                await self.exec_as_root(environment, command=step.run, env=step.env)
+                await self.exec_as_root(
+                    environment, command=step.run, env=step.env, inject_ca_env=False
+                )
             else:
-                await self.exec_as_agent(environment, command=step.run, env=step.env)
+                await self.exec_as_agent(
+                    environment, command=step.run, env=step.env, inject_ca_env=False
+                )
 
     async def setup(self, environment: BaseEnvironment) -> None:
         await environment.exec(command="mkdir -p /installed-agent", user="root")
