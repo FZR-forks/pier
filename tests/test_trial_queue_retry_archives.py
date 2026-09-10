@@ -15,9 +15,7 @@ def test_archive_retry_attempt_preserves_contents_and_avoids_collisions(tmp_path
 
     first_archive = TrialQueue._archive_retry_attempt(trial_dir, attempt=0)
 
-    assert first_archive == (
-        job_dir / ".retry-attempts" / "task__abc123" / "attempt-1"
-    )
+    assert first_archive == (job_dir / ".retry-attempts" / "task__abc123" / "attempt-1")
     assert (first_archive / "trial.log").read_text(encoding="utf-8") == "first failure"
     assert not trial_dir.exists()
 
@@ -29,7 +27,9 @@ def test_archive_retry_attempt_preserves_contents_and_avoids_collisions(tmp_path
     assert second_archive == (
         job_dir / ".retry-attempts" / "task__abc123" / "attempt-1-2"
     )
-    assert (second_archive / "trial.log").read_text(encoding="utf-8") == "second failure"
+    assert (second_archive / "trial.log").read_text(
+        encoding="utf-8"
+    ) == "second failure"
     assert (first_archive / "trial.log").read_text(encoding="utf-8") == "first failure"
 
 
