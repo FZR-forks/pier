@@ -19,7 +19,7 @@ Pier is a fork. We wanted a smaller, more opinionated base to build on. On top o
 
 - **Task format:** Harbor-compatible.
 - **Environments:** `docker`, `modal`. Per-agent install specs and network allowlists are honored on both, so installed agents work under `allow_internet = false`.
-- **Agents:** `nop`, `oracle`, `antigravity-sdk`, `claude-code`, `codex`, `cursor-cli`, `gemini-cli`, `opencode`, `mini-swe-agent`, `pi`. All emit augmented ATIF v1.7.
+- **Agents:** `nop`, `oracle`, `antigravity-sdk`, `claude-code`, `codex`, `cursor-cli`, `gemini-cli`, `opencode`, `opencode-v2`, `mini-swe-agent`, `pi`. All emit augmented ATIF v1.7.
 - **Datasets:** local Harbor-format task directories via `-p` / `--path`.
 - **CLI:** `pier run`, `pier job`, `pier view`, `pier critique run`, `pier check` / `pier analyze` (vendored from Harbor)
 
@@ -160,6 +160,14 @@ through your env file.
 ```
 
 **OpenCode** uses `opencode_config` to add unknown providers or override known ones. To redirect Google to Respan, override just `options.baseURL`; to add a fully custom provider, use `opencode_config.provider.<name>` with the npm package, options, and models.
+
+**OpenCode V2** is an independent server-backed adapter selected with
+`--agent opencode-v2`. Its `model_name` is `provider/model` with an optional
+variant suffix (`provider/model#variant`). Configure the V2 native provider
+and model schema through `opencode_v2_config`; model-level `body` is used for
+transport-specific fields such as an output-token cap. V2 runs with an
+isolated config/state directory and collects root and delegated child sessions
+into augmented ATIF, so do not reuse V1's `opencode_config` syntax.
 
 **Pi** resolves `--model` against its own built-in catalog, so a gateway or proxy needs a provider entry in `models.json`. Setting the provider's base-URL env var (`OPENAI_BASE_URL`, `ANTHROPIC_BASE_URL`) generates one automatically, which routes pi's built-in models through the endpoint while keeping their shipped cost and capability metadata. Use `pi_config` to declare a slug that is not in the catalog; supply its `cost` (per million tokens) so pi can price it, otherwise Pier falls back to the LiteLLM price table and leaves `cost_usd` unset for a private slug. `pi_config` is deep-merged over the generated config, and any `baseUrl` in it is added to the network allowlist.
 
