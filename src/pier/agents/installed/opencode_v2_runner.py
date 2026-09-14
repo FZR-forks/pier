@@ -8,8 +8,8 @@ trajectory tree afterwards:
 - ``opencode serve --stdio`` prints the ready server as one JSON line
   (``{"url": ...}`` on stdout) and exits when stdin closes, so the runner keeps
   stdin open for the whole run.
-- The server answers Basic auth as ``opencode`` plus the fresh password the
-  adapter supplies through ``OPENCODE_PASSWORD``.
+- The server answers Basic auth as ``opencode`` plus a fresh password generated
+  inside this runner and shared only with its server and CLI subprocesses.
 - The CLI connects with ``run --server <url>`` instead of booting its own
   background service, so every session belongs to *this* server and the runner
   can page it, interrupt it, and watch it die.
@@ -22,6 +22,7 @@ import base64
 import hashlib
 import json
 import os
+import secrets
 import select
 import shutil
 import signal
@@ -448,6 +449,10 @@ class OpenCodeV2Server:
                 except subprocess.TimeoutExpired:
                     pass
                 time.sleep(0.05)
+        if group_exists():
+            raise RuntimeError(
+                f"OpenCode server process group {process_group} survived SIGKILL"
+            )
         self.process = None
 
     def inspect_session(self, session: dict) -> dict:
@@ -944,11 +949,10 @@ def main() -> None:
     binary = resolve_binary(args.binary)
 
     home = os.environ.get("HOME") or str(Path.home())
-    password = os.environ.get("OPENCODE_PASSWORD") or os.environ.get(
-        "OPENCODE_SERVER_PASSWORD"
-    )
-    if not password:
-        raise RuntimeError("OPENCODE_PASSWORD is required")
+    # Generate the authentication secret inside the trial runner. It is shared
+    # only with the owned server and CLI subprocesses and never crosses Pier's
+    # debug-logged exec environment.
+    password = secrets.token_urlsafe(32)
 
     # Private XDG dirs under the run's home. The generated config file is
     # pointed at with OPENCODE_CONFIG (an absolute path inside the sandbox) and

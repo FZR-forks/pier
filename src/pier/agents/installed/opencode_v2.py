@@ -21,7 +21,6 @@ session, nested by their real ``parentID``.
 import copy
 import json
 import re
-import secrets
 import shlex
 from datetime import datetime, timezone
 from pathlib import Path
@@ -136,6 +135,17 @@ class OpenCodeV2(BaseInstalledAgent):
         restrict_model: bool = False,
         **kwargs,
     ):
+        extra_env = kwargs.get("extra_env") or {}
+        reserved_passwords = {
+            key
+            for key in ("OPENCODE_PASSWORD", "OPENCODE_SERVER_PASSWORD")
+            if key in extra_env
+        }
+        if reserved_passwords:
+            raise ValueError(
+                "OpenCode V2 server passwords are runner-owned and cannot be "
+                "supplied through agent env: " + ", ".join(sorted(reserved_passwords))
+            )
         if not isinstance(restrict_model, bool):
             raise ValueError("restrict_model must be a boolean")
         if opencode_v2_config is not None and not isinstance(opencode_v2_config, dict):
@@ -441,6 +451,12 @@ class OpenCodeV2(BaseInstalledAgent):
         config = self._build_runtime_config(include_mcp=False)
         urls = [self._get_env("OPENAI_BASE_URL") or ""]
         urls.extend(collect_url_values(config.get("providers") or {}))
+        # Resolve provider base URLs expressed as native `{env:NAME}`
+        # templates. The config keeps the placeholder for OpenCode, while the
+        # network policy needs the concrete hostname before the trial starts.
+        for name in _env_template_values(config):
+            if value := self._get_env(name):
+                urls.append(value)
         return allowlist_from_urls(
             urls,
             default_domains=self._DEFAULT_PROVIDER_DOMAINS.get(provider, []),
@@ -584,9 +600,11 @@ class OpenCodeV2(BaseInstalledAgent):
         env["OPENCODE_DISABLE_MODELS_FETCH"] = "1"
         env["OPENCODE_DISABLE_AUTOUPDATE"] = "1"
         env["PWD"] = remote_workdir_text
-        password = secrets.token_urlsafe(32)
-        env["OPENCODE_PASSWORD"] = password
-        env["OPENCODE_SERVER_PASSWORD"] = password
+        # The copied runner generates its fresh server password internally so
+        # Pier never passes it through BaseInstalledAgent._exec, whose debug
+        # metadata intentionally records process environments.
+        env.pop("OPENCODE_PASSWORD", None)
+        env.pop("OPENCODE_SERVER_PASSWORD", None)
         for key in ("NO_PROXY", "no_proxy"):
             current = env.get(key, "")
             entries = [item.strip() for item in current.split(",") if item.strip()]

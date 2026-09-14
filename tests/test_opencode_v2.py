@@ -349,6 +349,21 @@ def test_allowlist_picks_up_config_urls(tmp_path: Path):
     assert "gw.example.com" in agent.network_allowlist().domains
 
 
+def test_allowlist_resolves_config_env_template(tmp_path: Path):
+    agent = make_agent(
+        tmp_path,
+        extra_env={
+            "LITELLM_OPENAI_BASE_URL": "https://templated-gateway.example.com/v1"
+        },
+        opencode_v2_config={
+            "providers": {
+                "litellm": {"settings": {"baseURL": "{env:LITELLM_OPENAI_BASE_URL}"}}
+            }
+        },
+    )
+    assert "templated-gateway.example.com" in agent.network_allowlist().domains
+
+
 # ---------------------------------------------------------------------------
 # Environment restrictions and AGENTS.md
 # ---------------------------------------------------------------------------
@@ -383,6 +398,25 @@ def test_run_writes_config_to_private_home(tmp_path: Path):
     assert "/tmp/opencode-v2-home-" in command
     assert "opencode.json" in command
     assert "mkdir -p" in command
+
+
+def test_run_never_passes_server_password_through_logged_exec_env(tmp_path: Path):
+    environment = FakeEnvironment()
+    agent = make_agent(tmp_path)
+
+    import asyncio
+
+    asyncio.run(agent.run("do the thing", environment, AgentContext()))
+
+    assert environment.exec_calls
+    for call in environment.exec_calls:
+        assert "OPENCODE_PASSWORD" not in (call.get("env") or {})
+        assert "OPENCODE_SERVER_PASSWORD" not in (call.get("env") or {})
+
+
+def test_server_password_env_is_reserved(tmp_path: Path):
+    with pytest.raises(ValueError, match="runner-owned"):
+        make_agent(tmp_path, extra_env={"OPENCODE_PASSWORD": "must-not-be-logged"})
 
 
 def test_run_preserves_project_agents_md_discovery(tmp_path: Path):
@@ -1633,6 +1667,28 @@ def test_runner_kills_owned_descendant_after_server_leader_exits(tmp_path: Path)
     while Path(f"/proc/{child_pid}").exists() and time.monotonic() < deadline:
         time.sleep(0.05)
     assert not Path(f"/proc/{child_pid}").exists()
+
+
+def test_runner_reports_process_group_that_survives_sigkill(monkeypatch):
+    class FakeProcess:
+        pid = 424242
+        stdin = None
+
+        @staticmethod
+        def wait(timeout=None):
+            return 0
+
+    ticks = iter(range(0, 100, 4))
+    monkeypatch.setattr(runner_module.time, "monotonic", lambda: next(ticks))
+    monkeypatch.setattr(runner_module.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(runner_module.os, "killpg", lambda _pid, _signal: None)
+    server = runner_module.OpenCodeV2Server(
+        binary="opencode", cwd="/tmp", password="pw", env={}
+    )
+    server.process = FakeProcess()
+
+    with pytest.raises(RuntimeError, match="survived SIGKILL"):
+        server.stop()
 
 
 def test_collect_tree_timeout_interrupts_discovered_tree(monkeypatch):
