@@ -353,15 +353,22 @@ def test_allowlist_resolves_config_env_template(tmp_path: Path):
     agent = make_agent(
         tmp_path,
         extra_env={
-            "LITELLM_OPENAI_BASE_URL": "https://templated-gateway.example.com/v1"
+            "LITELLM_OPENAI_BASE_URL": "https://templated-gateway.example.com/v1",
+            "LITELLM_API_KEY": "sk.secret.value",
         },
         opencode_v2_config={
             "providers": {
-                "litellm": {"settings": {"baseURL": "{env:LITELLM_OPENAI_BASE_URL}"}}
+                "litellm": {
+                    "settings": {
+                        "baseURL": "{env:LITELLM_OPENAI_BASE_URL}",
+                        "apiKey": "{env:LITELLM_API_KEY}",
+                    }
+                }
             }
         },
     )
     assert "templated-gateway.example.com" in agent.network_allowlist().domains
+    assert "sk.secret.value" not in agent.network_allowlist().domains
 
 
 # ---------------------------------------------------------------------------

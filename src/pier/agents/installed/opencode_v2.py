@@ -454,8 +454,9 @@ class OpenCodeV2(BaseInstalledAgent):
         # Resolve provider base URLs expressed as native `{env:NAME}`
         # templates. The config keeps the placeholder for OpenCode, while the
         # network policy needs the concrete hostname before the trial starts.
-        for name in _env_template_values(config):
-            if value := self._get_env(name):
+        for configured_url in list(urls):
+            match = re.fullmatch(r"\{env:([^{}]+)\}", configured_url)
+            if match and (value := self._get_env(match.group(1))):
                 urls.append(value)
         return allowlist_from_urls(
             urls,
