@@ -59,9 +59,7 @@ from pier.utils.trajectory_metrics import (
 )
 from pier.utils.trajectory_utils import format_trajectory_json
 
-_OUTPUT_FILENAME = "opencode-v2.txt"
 _RUNNER_FILENAME = "opencode_v2_runner.py"
-_RUNNER_PATH = "/installed-agent/opencode_v2_runner.py"
 
 # Terminal finishes that still carry authoritative usage when the message
 # completed: a truncated (`length`) or content-filtered reply, or a provider
@@ -119,14 +117,13 @@ def _env_template_values(config: dict[str, Any]) -> dict[str, str]:
     values: dict[str, str] = {}
 
     def walk(node: Any) -> None:
-        if isinstance(node, dict):
-            for key, value in node.items():
-                if isinstance(value, str):
-                    if value.startswith("{env:") and value.endswith("}"):
-                        name = value[5:-1]
-                        values[name] = value
-                else:
-                    walk(value)
+        if isinstance(node, str):
+            if node.startswith("{env:") and node.endswith("}"):
+                name = node[5:-1]
+                values[name] = node
+        elif isinstance(node, dict):
+            for value in node.values():
+                walk(value)
         elif isinstance(node, list):
             for item in node:
                 walk(item)
@@ -140,12 +137,6 @@ class OpenCodeV2(BaseInstalledAgent):
 
     SUPPORTS_ATIF: bool = True
 
-    # The official V2 install channel: the npm scope is `@opencode`, the
-    # per-target packages carry the native binary (`@opencode/cli-<target>`),
-    # and the public `@opencode-ai/cli` package only ever shipped 1.x.
-    _NPM_PACKAGE = "@opencode/cli"
-    _REMOTE_HOME = Path("/tmp/opencode-v2-home")
-    _REMOTE_CONFIG = _REMOTE_HOME / "config" / "opencode" / "opencode.json"
     _REMOTE_WORKDIR = Path("/tmp/opencode-v2-work")
     _REMOTE_BINARY = Path("/installed-agent/opencode-v2-bin")
     _RUNNER_PATH = "/installed-agent/opencode_v2_runner.py"
@@ -602,6 +593,11 @@ class OpenCodeV2(BaseInstalledAgent):
                     f"{kind} URL template {value!r} is unresolved while "
                     "constructing the network allowlist"
                 )
+            if "{env:" in value:
+                raise ValueError(
+                    f"{kind} URL template {value!r} is only partially templated; "
+                    "use a whole-value {env:NAME} reference"
+                )
             if kind == "provider":
                 self._validate_provider_url(value)
             resolved.append(value)
@@ -871,7 +867,8 @@ class OpenCodeV2(BaseInstalledAgent):
                 )
                 + ("--restrict-model " if self._restrict_model else "")
                 + "--title pier-benchmark "
-                f"> >(stdbuf -oL tee {self._OUTPUT_FILENAME.as_posix()}) 2>&1"
+                f"2>&1 </dev/null | stdbuf -oL tee "
+                f"{self._OUTPUT_FILENAME.as_posix()}"
             )
 
             instruction_path = self._INSTRUCTION_PATH
@@ -903,9 +900,9 @@ class OpenCodeV2(BaseInstalledAgent):
         if not self.skills_dir:
             return None
         return (
-            f"mkdir -p ~/.config/opencode/skills && "
+            'mkdir -p "$OPENCODE_CONFIG_DIR/skills" && '
             f"cp -r {shlex.quote(self.skills_dir)}/* "
-            f"~/.config/opencode/skills/ 2>/dev/null || true"
+            '"$OPENCODE_CONFIG_DIR/skills/" 2>/dev/null || true'
         )
 
     async def _collect_runner_artifacts(self, environment: BaseEnvironment) -> None:
@@ -1040,7 +1037,13 @@ class OpenCodeV2(BaseInstalledAgent):
         """One ATIF trajectory for one session's recorded messages."""
         session = inspection.get("session") or {}
         session_id = session.get("id") or "unknown"
-        messages = self._dedupe_messages(list(inspection.get("messages") or []))
+        raw_messages = inspection.get("messages")
+        messages = self._dedupe_messages(
+            raw_messages if isinstance(raw_messages, list) else []
+        )
+        malformed_messages = not isinstance(raw_messages, list) or any(
+            not isinstance(message, dict) for message in raw_messages
+        )
 
         steps: list[Step] = []
         totals = {
@@ -1052,7 +1055,7 @@ class OpenCodeV2(BaseInstalledAgent):
             "cost": 0.0,
         }
         summarization_count = 0
-        incomplete = False
+        incomplete = malformed_messages
         usage_seen = False
         cost_complete = True
         failed_attempts = 0
@@ -1071,12 +1074,16 @@ class OpenCodeV2(BaseInstalledAgent):
                     failed_attempts += 1
                 if self._restrict_model and self.model_name:
                     actual_model = self._assistant_model_name(message)
-                    if actual_model is None:
+                    model_status = self._model_identity_status(
+                        actual_model, self.model_name
+                    )
+                    if model_status == "unknown":
                         model_provenance_complete = False
                         model_mismatches.append(
-                            f"missing:{message.get('id', 'unknown')}"
+                            ("missing" if actual_model is None else "missing_variant")
+                            + f":{message.get('id', 'unknown')}"
                         )
-                    elif actual_model != self.model_name:
+                    elif model_status == "mismatch":
                         model_provenance_complete = False
                         model_mismatches.append(
                             f"{message.get('id', 'unknown')}:{actual_model}"
@@ -1089,12 +1096,16 @@ class OpenCodeV2(BaseInstalledAgent):
                     failed_attempts += 1
                 if self._restrict_model and self.model_name:
                     actual_model = self._compaction_model_name(message)
-                    if actual_model is None:
+                    model_status = self._model_identity_status(
+                        actual_model, self.model_name
+                    )
+                    if model_status == "unknown":
                         model_provenance_complete = False
                         model_mismatches.append(
-                            f"missing:{message.get('id', 'unknown')}"
+                            ("missing" if actual_model is None else "missing_variant")
+                            + f":{message.get('id', 'unknown')}"
                         )
-                    elif actual_model != self.model_name:
+                    elif model_status == "mismatch":
                         model_provenance_complete = False
                         model_mismatches.append(
                             f"{message.get('id', 'unknown')}:{actual_model}"
@@ -1506,7 +1517,7 @@ class OpenCodeV2(BaseInstalledAgent):
         return found
 
     @staticmethod
-    def _dedupe_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    def _dedupe_messages(messages: list[Any]) -> list[dict[str, Any]]:
         """Replace re-observed records by (sessionID, type, id) ledger key.
 
         The runner re-snapshots sessions until the server goes quiet, so a
@@ -1517,6 +1528,8 @@ class OpenCodeV2(BaseInstalledAgent):
         replaced: dict[tuple[Any, Any, Any], dict[str, Any]] = {}
         order: list[tuple[Any, Any, Any]] = []
         for index, message in enumerate(messages):
+            if not isinstance(message, dict):
+                continue
             if not message.get("id"):
                 key = ("__missing__", message.get("type"), index)
                 replaced[key] = message
@@ -1705,7 +1718,6 @@ class OpenCodeV2(BaseInstalledAgent):
             "total_prompt_tokens": 0,
             "total_completion_tokens": 0,
             "total_cached_tokens": 0,
-            "total_steps": 0,
         }
         total_cost: float | None = None
         peak_context: int | None = None
@@ -1741,7 +1753,6 @@ class OpenCodeV2(BaseInstalledAgent):
                 "total_prompt_tokens",
                 "total_completion_tokens",
                 "total_cached_tokens",
-                "total_steps",
             ):
                 totals[field] += getattr(metrics, field) or 0
             if metrics.total_cost_usd is not None:
@@ -1869,7 +1880,10 @@ class OpenCodeV2(BaseInstalledAgent):
             return []
         mismatches: list[str] = []
         for inspection in inspections:
-            messages = self._dedupe_messages(list(inspection.get("messages") or []))
+            raw_messages = inspection.get("messages")
+            messages = self._dedupe_messages(
+                raw_messages if isinstance(raw_messages, list) else []
+            )
             for message in messages:
                 if not isinstance(message, dict):
                     continue
@@ -1881,13 +1895,27 @@ class OpenCodeV2(BaseInstalledAgent):
                 else:
                     continue
                 record_id = message.get("id", "unknown")
-                if actual != self.model_name:
-                    mismatches.append(
-                        f"missing:{record_id}"
-                        if actual is None
-                        else f"{record_id}:{actual}"
-                    )
+                # Missing persisted provenance (including a missing variant)
+                # is unknown and remains visible through trajectory metadata.
+                # Only an observed conflict proves the restriction failed.
+                if self._model_identity_status(actual, self.model_name) == "mismatch":
+                    mismatches.append(f"{record_id}:{actual}")
         return list(dict.fromkeys(mismatches))
+
+    @staticmethod
+    def _model_identity_status(actual: str | None, expected: str) -> str:
+        """Return match, mismatch, or unknown for persisted provenance."""
+        if actual is None:
+            return "unknown"
+        expected_model, separator, expected_variant = expected.partition("#")
+        actual_model, actual_separator, actual_variant = actual.partition("#")
+        if actual_model != expected_model:
+            return "mismatch"
+        if not separator:
+            return "match"
+        if not actual_separator or not actual_variant:
+            return "unknown"
+        return "match" if actual_variant == expected_variant else "mismatch"
 
     @staticmethod
     def _raise_model_restriction_failure(mismatches: list[str]) -> None:

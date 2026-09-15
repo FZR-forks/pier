@@ -41,9 +41,10 @@ AUTH_USERNAME = "opencode"
 SESSION_PAGE_SIZE = 200
 MESSAGE_PAGE_SIZE = 200
 INSPECT_ATTEMPTS = 3
-DEFAULT_SETTLE_SECONDS = 3600.0
+DEFAULT_SETTLE_SECONDS = 120.0
 SESSION_WAIT_REQUEST_SECONDS = 30.0
 SETTLE_INTERVAL_SECONDS = 1.0
+SETTLE_MAX_INTERVAL_SECONDS = 5.0
 RAW_PAGE_LIMIT = 512
 RAW_PAGE_BYTES_LIMIT = 16 * 1024 * 1024
 CLI_CAPTURE_MAX_LINES = 256
@@ -246,8 +247,14 @@ class OpenCodeV2Server:
         self._stderr_thread.start()
         try:
             self.url = wait_for_server(self.process)
-        except Exception:
-            self.stop()
+        except Exception as error:
+            try:
+                self.stop()
+            except Exception as cleanup_error:
+                error.add_note(
+                    "OpenCode server cleanup after readiness failure also failed: "
+                    f"{type(cleanup_error).__name__}: {cleanup_error}"
+                )
             raise
         # Fail fast when the URL could never answer a benchmark request, and
         # do not leak the server if readiness itself fails.
@@ -259,8 +266,14 @@ class OpenCodeV2Server:
                 raise RuntimeError(
                     f"OpenCode server {self.url} failed its readiness check (HTTP {status})"
                 )
-        except Exception:
-            self.stop()
+        except Exception as error:
+            try:
+                self.stop()
+            except Exception as cleanup_error:
+                error.add_note(
+                    "OpenCode server cleanup after health failure also failed: "
+                    f"{type(cleanup_error).__name__}: {cleanup_error}"
+                )
             raise
         return self.url
 
@@ -290,10 +303,12 @@ class OpenCodeV2Server:
         )
         if status != 200 or not isinstance(payload, dict):
             raise RuntimeError(f"GET /api/session failed (HTTP {status}): {payload!r}")
-        return (
-            payload.get("data") or [],
-            (payload.get("cursor") or {}).get("next"),
-        )
+        data = payload.get("data")
+        if not isinstance(data, list) or any(
+            not isinstance(item, dict) for item in data
+        ):
+            raise RuntimeError("GET /api/session returned malformed session records")
+        return data, (payload.get("cursor") or {}).get("next")
 
     def page_messages(
         self, session_id: str, cursor: str | None = None
@@ -328,10 +343,14 @@ class OpenCodeV2Server:
                 f"GET /api/session/{session_id}/message failed "
                 f"(HTTP {status}): {payload!r}"
             )
-        return (
-            payload.get("data") or [],
-            (payload.get("cursor") or {}).get("next"),
-        )
+        data = payload.get("data")
+        if not isinstance(data, list) or any(
+            not isinstance(item, dict) for item in data
+        ):
+            raise RuntimeError(
+                f"GET /api/session/{session_id}/message returned malformed records"
+            )
+        return data, (payload.get("cursor") or {}).get("next")
 
     def collect_sessions(self, parent_id: str | None = None) -> list[dict]:
         """All sessions, following every cursor page.
@@ -423,12 +442,6 @@ class OpenCodeV2Server:
     def interrupt_all(self, session_ids) -> None:
         for session_id in sorted(session_ids):
             self.interrupt_session(session_id)
-
-    # -- terminal snapshots --------------------------------------------------
-
-    def terminal_snapshot(self, session_id: str) -> dict | None:
-        """Deprecated: V2 has no terminal-session endpoint."""
-        return None
 
     def inbox_items(self, session_id: str) -> list[dict] | None:
         if not self.url:
@@ -768,7 +781,7 @@ def inspect_session(
     *,
     active_ids: set[str] | None = None,
 ) -> dict:
-    """Collect one session's messages, running state, and terminal snapshot."""
+    """Collect one session's messages and native running/inbox state."""
     session_id = str(session.get("id"))
     if active_ids is None:
         active_ids = server.running_session_ids()
@@ -781,9 +794,6 @@ def inspect_session(
         if session_id in active_ids
         else None,
         "inbox": server.inbox_items(session_id),
-        # V2.0.3 has no terminal-session endpoint; inbox + active + wait are
-        # the native completion contract.
-        "terminal": None,
     }
 
 
@@ -813,9 +823,15 @@ def _events(stdout_lines: Iterable[str]) -> list[dict]:
     return result
 
 
-def _root_id(events: list[dict], sessions: list[dict], before: set[str]) -> str | None:
+def _root_id(
+    events: list[dict],
+    sessions: list[dict],
+    before: set[str],
+    candidate_ids: set[str] | None = None,
+) -> str | None:
     """Resolve the newly-created root without guessing from global history."""
     event_ids = {str(event["sessionID"]) for event in events if event.get("sessionID")}
+    event_ids.update(candidate_ids or ())
     candidates = [
         session
         for session in sessions
@@ -830,7 +846,9 @@ def _root_id(events: list[dict], sessions: list[dict], before: set[str]) -> str 
     event_roots = [
         session
         for session in sessions
-        if str(session.get("id")) in event_ids and not session.get("parentID")
+        if str(session.get("id")) not in before
+        and str(session.get("id")) in event_ids
+        and not session.get("parentID")
     ]
     if len(event_roots) == 1:
         return str(event_roots[0]["id"])
@@ -844,11 +862,6 @@ def _snapshot_signature(inspections: list[dict]) -> tuple:
                 str(item.get("session", {}).get("id")),
                 item.get("session", {}).get("status")
                 or item.get("session", {}).get("outcome"),
-                tuple(
-                    sorted(
-                        str(message.get("id")) for message in item.get("messages", [])
-                    )
-                ),
                 json.dumps(
                     item.get("messages", []), sort_keys=True, separators=(",", ":")
                 ),
@@ -856,7 +869,6 @@ def _snapshot_signature(inspections: list[dict]) -> tuple:
                 tuple(
                     sorted(str(inbox.get("id")) for inbox in (item.get("inbox") or []))
                 ),
-                json.dumps(item.get("terminal"), sort_keys=True, separators=(",", ":")),
             )
             for item in inspections
         )
@@ -941,6 +953,21 @@ def _collection_complete(
     return settled and not errors and bool(root_id) and server_exit_code is None
 
 
+def _raise_runner_failure(
+    pending_error: BaseException | None,
+    run_error: str | None,
+    _collection_errors: list[str],
+) -> None:
+    """Fail only the agent execution; collection gaps stay in the manifest."""
+    if pending_error is not None:
+        raise pending_error
+    if run_error:
+        raise SystemExit(run_error)
+    # Observational gaps withhold complete aggregates through runner-result.
+    # Keeping the argument explicit makes it hard to accidentally restore the
+    # former behavior where any collection diagnostic discarded a paid run.
+
+
 def _collect_tree(
     server: OpenCodeV2Server,
     root_id: str,
@@ -953,6 +980,7 @@ def _collect_tree(
     stable = False
     inspections: list[dict] = []
     last_blockers: list[str] = []
+    poll_interval = SETTLE_INTERVAL_SECONDS
     server.collection_deadline = deadline
     try:
         while time.monotonic() < deadline:
@@ -999,13 +1027,14 @@ def _collect_tree(
                 if not blockers and previous == signature:
                     stable = True
                     break
+                if previous != signature:
+                    poll_interval = SETTLE_INTERVAL_SECONDS
                 previous = signature
             except Exception as error:  # preserve partial records and retry discovery
                 blockers = [f"collection: {type(error).__name__}: {error}"]
             last_blockers = blockers
-            time.sleep(
-                min(SETTLE_INTERVAL_SECONDS, max(0.0, deadline - time.monotonic()))
-            )
+            time.sleep(min(poll_interval, max(0.0, deadline - time.monotonic())))
+            poll_interval = min(SETTLE_MAX_INTERVAL_SECONDS, poll_interval * 2)
     finally:
         server.collection_deadline = None
     if not stable:
@@ -1317,37 +1346,45 @@ def main() -> None:
         cli_stderr = "".join(stderr_lines)
         events = _events(stdout_lines)
         events.extend(early_root_events)
-        dump_jsonl(logs_dir / "opencode-v2-cli-events.jsonl", events)
-        sessions = server.collect_sessions()
-        root_id = _root_id(events, sessions, before_ids)
-        if root_id is None:
-            raise RuntimeError(
-                "could not resolve an unambiguous newly-created root session"
-            )
-        (logs_dir / "opencode-v2-root-candidates.json").write_text(
-            json.dumps(
-                {
-                    "source": "cli-event",
-                    "candidate_session_ids": sorted(early_root_candidates),
-                    "root_id": root_id,
-                    "validated": True,
-                },
-                indent=2,
-            )
-            + "\n"
-        )
-        inspections, settled = _collect_tree(
-            server,
-            root_id,
-            deadline=time.monotonic() + max(0.1, args.settle_timeout),
-            errors=collection_errors,
-        )
-        if not settled:
-            collection_errors.append(
-                "session tree did not reach two identical terminal snapshots"
-            )
         if cli_returncode not in (None, 0):
             run_error = f"OpenCode CLI exited with status {cli_returncode}"
+        try:
+            dump_jsonl(logs_dir / "opencode-v2-cli-events.jsonl", events)
+            sessions = server.collect_sessions()
+            root_id = _root_id(
+                events, sessions, before_ids, candidate_ids=early_root_candidates
+            )
+            if root_id is None:
+                collection_errors.append(
+                    "could not resolve an unambiguous newly-created root session"
+                )
+            else:
+                (logs_dir / "opencode-v2-root-candidates.json").write_text(
+                    json.dumps(
+                        {
+                            "source": "cli-event",
+                            "candidate_session_ids": sorted(early_root_candidates),
+                            "root_id": root_id,
+                            "validated": True,
+                        },
+                        indent=2,
+                    )
+                    + "\n"
+                )
+                inspections, settled = _collect_tree(
+                    server,
+                    root_id,
+                    deadline=time.monotonic() + max(0.1, args.settle_timeout),
+                    errors=collection_errors,
+                )
+                if not settled:
+                    collection_errors.append(
+                        "session tree did not reach two identical terminal snapshots"
+                    )
+        except Exception as error:
+            collection_errors.append(
+                f"post-run collection: {type(error).__name__}: {error}"
+            )
     except BaseException as error:  # noqa: BLE001 - preserve evidence before re-raising
         pending_error = error
         run_error = run_error or f"{type(error).__name__}: {error}"
@@ -1363,7 +1400,12 @@ def main() -> None:
                 server.interrupt_session(session_id)
                 interrupted.append(session_id)
             if root_id is None:
-                root_id = _root_id(events, discovered, before_ids)
+                root_id = _root_id(
+                    events,
+                    discovered,
+                    before_ids,
+                    candidate_ids=early_root_candidates,
+                )
             if root_id:
                 inspections, _ = _collect_tree(
                     server,
@@ -1457,10 +1499,7 @@ def main() -> None:
     }
     (logs_dir / "runner-result.json").write_text(json.dumps(result, indent=2))
 
-    if pending_error is not None:
-        raise pending_error
-    if run_error or collection_errors:
-        raise SystemExit(run_error or "; ".join(collection_errors))
+    _raise_runner_failure(pending_error, run_error, collection_errors)
 
 
 if __name__ == "__main__":

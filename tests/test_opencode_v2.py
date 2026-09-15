@@ -545,6 +545,20 @@ def test_allowlist_rejects_unresolved_url_template(tmp_path: Path):
         agent.network_allowlist()
 
 
+def test_allowlist_rejects_partially_templated_url(tmp_path: Path):
+    agent = make_agent(
+        tmp_path,
+        opencode_v2_config={
+            "providers": {
+                "litellm": {"settings": {"baseURL": "https://{env:GATEWAY_HOST}/v1"}}
+            }
+        },
+    )
+
+    with pytest.raises(ValueError, match="only partially templated"):
+        agent.network_allowlist()
+
+
 def test_provider_url_requires_https_except_loopback(tmp_path: Path):
     remote = make_agent(
         tmp_path,
@@ -665,6 +679,58 @@ def test_run_forwards_ambient_config_template_values(tmp_path: Path, monkeypatch
     )
 
 
+def test_run_forwards_and_redacts_config_template_in_list(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+):
+    secret = "mcp-secret-that-must-be-redacted"
+    monkeypatch.setenv("MCP_SECRET", secret)
+    environment = FakeEnvironment()
+    agent = make_agent(
+        tmp_path,
+        opencode_v2_config={
+            "mcp": {
+                "fixture": {
+                    "type": "local",
+                    "command": ["fixture-mcp", "--key", "{env:MCP_SECRET}"],
+                }
+            }
+        },
+    )
+    caplog.set_level(logging.DEBUG)
+
+    import asyncio
+
+    asyncio.run(agent.run("do the thing", environment, AgentContext()))
+
+    assert all(call["env"]["MCP_SECRET"] == secret for call in environment.exec_calls)
+    env_records = [record for record in caplog.records if hasattr(record, "env")]
+    assert env_records
+    assert all(secret not in repr(record.__dict__) for record in env_records)
+    assert any(record.env.get("MCP_SECRET") == "<redacted>" for record in env_records)
+
+
+def test_run_rejects_missing_config_template_in_list(tmp_path: Path):
+    environment = FakeEnvironment()
+    agent = make_agent(
+        tmp_path,
+        opencode_v2_config={
+            "mcp": {
+                "fixture": {
+                    "type": "local",
+                    "command": ["fixture-mcp", "{env:MISSING_MCP_SECRET}"],
+                }
+            }
+        },
+    )
+
+    import asyncio
+
+    with pytest.raises(ValueError, match="MISSING_MCP_SECRET is not set"):
+        asyncio.run(agent.run("do the thing", environment, AgentContext()))
+
+
 def test_config_template_values_are_redacted_only_from_debug_metadata(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -757,6 +823,25 @@ def test_run_preserves_project_agents_md_discovery(tmp_path: Path):
     runner_command = run_calls[0]["command"]
     assert str(agent._RUNNER_PATH) in runner_command
     assert "--restrict-model" not in runner_command
+    assert "2>&1 </dev/null | stdbuf -oL tee" in runner_command
+    assert "> >(stdbuf" not in runner_command
+
+
+def test_run_copies_skills_into_isolated_config_dir(tmp_path: Path):
+    environment = FakeEnvironment()
+    agent = make_agent(tmp_path, skills_dir="/mnt/task-skills")
+
+    import asyncio
+
+    asyncio.run(agent.run("do the thing", environment, AgentContext()))
+
+    setup_command = next(
+        call["command"]
+        for call in environment.exec_calls
+        if 'mkdir -p "$OPENCODE_CONFIG_DIR/skills"' in call["command"]
+    )
+    assert "/mnt/task-skills/*" in setup_command
+    assert "~/.config/opencode/skills" not in setup_command
 
 
 def test_run_passes_model_restriction_to_runner(tmp_path: Path):
@@ -1179,14 +1264,60 @@ def test_missing_model_provenance_is_unknown(tmp_path: Path):
     agent = make_agent(tmp_path, restrict_model=True)
     write_inspections(tmp_path, [inspection])
     context = AgentContext()
-    with pytest.raises(NonZeroAgentExitCodeError, match="model restriction failed"):
-        agent.populate_context_post_run(context)
+    agent.populate_context_post_run(context)
 
     trajectory = json.loads((tmp_path / "trajectory.json").read_text())
     assert trajectory["steps"][0].get("model_name") is None
     assert trajectory["final_metrics"]["extra"]["model_provenance_complete"] is False
     assert trajectory["final_metrics"]["total_prompt_tokens"] == 1
     assert context.n_input_tokens == 1
+
+
+def test_missing_variant_provenance_is_unknown_not_contamination(tmp_path: Path):
+    inspection = {
+        "session": {"id": "ses_novariant00000000000000001"},
+        "messages": [
+            {
+                "type": "assistant",
+                "id": "msg_novariant",
+                "model": {"id": "kimi-k3", "providerID": "litellm"},
+                "time": {"created": 1, "completed": 2},
+                "finish": "stop",
+                "tokens": {
+                    "input": 1,
+                    "output": 1,
+                    "reasoning": 0,
+                    "cache": {"read": 0, "write": 0},
+                },
+                "content": [{"type": "text", "text": "unknown variant"}],
+            }
+        ],
+    }
+    agent = make_agent(tmp_path, restrict_model=True)
+    write_inspections(tmp_path, [inspection])
+
+    agent.populate_context_post_run(AgentContext())
+
+    metrics = json.loads((tmp_path / "trajectory.json").read_text())["final_metrics"]
+    assert metrics["extra"]["model_provenance_complete"] is False
+    assert metrics["extra"]["model_mismatches"] == ["missing_variant:msg_novariant"]
+    assert metrics["total_prompt_tokens"] == 1
+
+
+def test_malformed_message_record_is_preserved_as_incomplete_gap(tmp_path: Path):
+    inspection = {
+        "session": {"id": "ses_badmessage00000000000000001"},
+        "messages": ["malformed"],
+    }
+    agent = make_agent(tmp_path, restrict_model=True)
+    write_inspections(tmp_path, [inspection])
+
+    agent.populate_context_post_run(AgentContext())
+
+    trajectory = json.loads((tmp_path / "trajectory.json").read_text())
+    assert trajectory["steps"][0]["extra"]["collection_gap"] is True
+    assert trajectory["final_metrics"]["extra"]["metrics_complete"] is False
+    assert "total_prompt_tokens" not in trajectory["final_metrics"]
 
 
 def test_missing_runner_manifest_withholds_aggregate(tmp_path: Path):
@@ -1999,6 +2130,33 @@ class FakeHTTP:
         self.calls: list[str] = []
 
 
+def test_server_start_preserves_readiness_error_when_cleanup_also_fails(monkeypatch):
+    class FakeProcess:
+        stderr: list[str] = []
+
+    monkeypatch.setattr(
+        runner_module.subprocess, "Popen", lambda *args, **kwargs: FakeProcess()
+    )
+
+    def fail_readiness(process):
+        raise RuntimeError("readiness evidence")
+
+    monkeypatch.setattr(runner_module, "wait_for_server", fail_readiness)
+    server = runner_module.OpenCodeV2Server(
+        binary="opencode", cwd="/tmp", password="pw", env={}
+    )
+
+    def fail_cleanup():
+        raise RuntimeError("cleanup evidence")
+
+    monkeypatch.setattr(server, "stop", fail_cleanup)
+
+    with pytest.raises(RuntimeError, match="readiness evidence") as raised:
+        server.start()
+
+    assert any("cleanup evidence" in note for note in raised.value.__notes__)
+
+
 def test_collect_sessions_follows_cursor_pages(tmp_path: Path, monkeypatch):
     pages = [
         ([{"id": "ses_1"}, {"id": "ses_2"}], "cursor-1"),
@@ -2100,6 +2258,21 @@ def test_collect_messages_rejects_repeated_cursor(monkeypatch):
     )
     with pytest.raises(RuntimeError, match="message pagination cursor repeated"):
         server.collect_messages("ses_1")
+
+
+def test_page_messages_rejects_malformed_records(monkeypatch):
+    monkeypatch.setattr(
+        runner_module,
+        "http_get_json",
+        lambda *args, **kwargs: (200, {"data": ["not-a-message"]}),
+    )
+    server = runner_module.OpenCodeV2Server(
+        binary="opencode", cwd="/tmp", password="pw", env={}
+    )
+    server.url = "http://127.0.0.1:1"
+
+    with pytest.raises(RuntimeError, match="returned malformed records"):
+        server.page_messages("ses_1")
 
 
 def test_raw_page_evidence_is_deduplicated_and_bounded(monkeypatch):
@@ -2286,7 +2459,6 @@ def test_collect_tree_timeout_interrupts_discovered_tree(monkeypatch):
                 "messages": [],
                 "active": None,
                 "inbox": [],
-                "terminal": None,
             }
 
     errors: list[str] = []
@@ -2305,6 +2477,58 @@ def test_collect_tree_timeout_interrupts_discovered_tree(monkeypatch):
     assert errors
 
 
+def test_collect_tree_uses_bounded_backoff_before_incomplete_result(monkeypatch):
+    now = 0.0
+    sleeps: list[float] = []
+
+    def monotonic():
+        return now
+
+    def sleep(seconds):
+        nonlocal now
+        sleeps.append(seconds)
+        now += seconds
+
+    class Server:
+        collection_deadline = None
+
+        def collect_descendants(self, root_id):
+            return [{"id": root_id}]
+
+        def wait_session(self, session_id):
+            return True
+
+        def running_session_ids(self):
+            return set()
+
+        def inbox_items(self, session_id):
+            return []
+
+        def inspect_session(self, session, active_ids=None):
+            return {
+                "session": session,
+                "messages": [],
+                "active": None,
+                "inbox": [],
+            }
+
+        def interrupt_all(self, session_ids):
+            return None
+
+    monkeypatch.setattr(runner_module.time, "monotonic", monotonic)
+    monkeypatch.setattr(runner_module.time, "sleep", sleep)
+    errors: list[str] = []
+
+    _, settled = runner_module._collect_tree(
+        Server(), "ses_root", deadline=10.0, errors=errors
+    )
+
+    assert settled is False
+    assert sleeps == [1.0, 2.0, 4.0, 3.0]
+    assert runner_module.DEFAULT_SETTLE_SECONDS <= 120
+    assert errors == ["sessions lack terminal idle outcome: ses_root"]
+
+
 def test_session_metadata_outcome_is_a_terminal_state_without_idle_message():
     inspections = [
         {
@@ -2321,6 +2545,42 @@ def test_collection_is_incomplete_when_owned_server_died():
     )
     assert not runner_module._collection_complete(
         settled=True, errors=[], root_id="ses_root", server_exit_code=1
+    )
+
+
+def test_collection_errors_do_not_fail_successful_agent_execution():
+    runner_module._raise_runner_failure(
+        None, None, ["session tree did not become terminal"]
+    )
+
+    with pytest.raises(SystemExit, match="CLI exited"):
+        runner_module._raise_runner_failure(
+            None, "OpenCode CLI exited with status 1", ["partial collection"]
+        )
+
+
+def test_root_id_uses_retained_cli_candidates_after_event_tail_eviction():
+    sessions = [
+        {"id": "ses_root"},
+        {"id": "ses_child", "parentID": "ses_root"},
+    ]
+    events = [{"sessionID": "ses_child"}]
+
+    assert runner_module._root_id(events, sessions, set()) is None
+    assert (
+        runner_module._root_id(
+            events, sessions, set(), candidate_ids={"ses_root", "ses_child"}
+        )
+        == "ses_root"
+    )
+    assert (
+        runner_module._root_id(
+            [],
+            [{"id": "ses_old"}, {"id": "ses_new"}],
+            {"ses_old"},
+            candidate_ids={"ses_old"},
+        )
+        is None
     )
 
 
@@ -2361,13 +2621,6 @@ def test_inspect_session_collects_background_terminal(tmp_path: Path, monkeypatc
     )
     monkeypatch.setattr(
         runner_module.OpenCodeV2Server,
-        "terminal_snapshot",
-        lambda self, session_id: (
-            {"lines": ["done"]} if session_id == "ses_bg" else None
-        ),
-    )
-    monkeypatch.setattr(
-        runner_module.OpenCodeV2Server,
         "inbox_items",
         lambda self, session_id: [],
     )
@@ -2378,8 +2631,7 @@ def test_inspect_session_collects_background_terminal(tmp_path: Path, monkeypatc
 
     inspection = runner_module.inspect_session(server, {"id": "ses_bg"})
     assert inspection["active"] == {"type": "running"}
-    # V2.0.3 has no terminal-session endpoint; the inspection records null.
-    assert inspection["terminal"] is None
+    assert "terminal" not in inspection
     assert inspection["messages"] == [{"id": "msg_1"}]
 
 
