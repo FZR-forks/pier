@@ -605,19 +605,30 @@ def _location_data(server: OpenCodeV2Server, endpoint: str) -> list[dict]:
     return [item for item in data if isinstance(item, dict)]
 
 
+def _model_selection(value: str, *, label: str) -> tuple[str, str, str]:
+    if "/" not in value:
+        raise RuntimeError(f"{label} must be provider/model[#variant]")
+    provider_id, model_ref = value.split("/", 1)
+    model_id, separator, variant = model_ref.partition("#")
+    if not provider_id or not model_id or (separator and not variant):
+        raise RuntimeError(f"{label} must be provider/model[#variant]")
+    return provider_id, model_id, variant if separator else ""
+
+
 def preflight_runtime(
     server: OpenCodeV2Server,
     *,
     model_spec: str | None,
     config_file: str | None,
+    restrict_model: bool,
     timeout: float = 15.0,
 ) -> dict[str, Any]:
     """Resolve and verify the selected model and all configured active agents."""
-    if not model_spec or "/" not in model_spec:
+    if not model_spec:
         raise RuntimeError("preflight requires provider/model[#variant]")
-    provider_id, model_ref = model_spec.split("/", 1)
-    model_id, separator, variant = model_ref.partition("#")
-    variant = variant if separator else ""
+    provider_id, model_id, variant = _model_selection(
+        model_spec, label="preflight model"
+    )
 
     config: dict[str, Any] = {}
     if config_file:
@@ -672,13 +683,30 @@ def preflight_runtime(
                 if agent is None:
                     raise RuntimeError(f"configured agent {agent_id!r} is absent")
                 actual = agent.get("model") or {}
+                expected_spec = model_spec
+                if not restrict_model:
+                    expected_spec = (
+                        expected.get("model") or config.get("model") or model_spec
+                    )
+                if not isinstance(expected_spec, str):
+                    raise RuntimeError(
+                        f"configured agent {agent_id!r} model must be a string"
+                    )
+                (
+                    expected_provider,
+                    expected_model_id,
+                    expected_variant,
+                ) = _model_selection(
+                    expected_spec, label=f"configured agent {agent_id!r} model"
+                )
                 if (
-                    actual.get("providerID") != provider_id
-                    or actual.get("id") != model_id
-                    or (variant and actual.get("variant") != variant)
+                    actual.get("providerID") != expected_provider
+                    or actual.get("id") != expected_model_id
+                    or (expected_variant and actual.get("variant") != expected_variant)
                 ):
                     raise RuntimeError(
-                        f"agent {agent_id!r} resolved unexpected model {actual!r}"
+                        f"agent {agent_id!r} resolved unexpected model {actual!r}; "
+                        f"expected {expected_spec!r}"
                     )
                 resolved_agents.append(agent)
 
@@ -990,6 +1018,7 @@ def main() -> None:
     parser.add_argument("--binary", default=None)
     parser.add_argument("--model", default=None, help="provider/model[#variant]")
     parser.add_argument("--variant", default=None)
+    parser.add_argument("--restrict-model", action="store_true")
     parser.add_argument("--title", default="pier-benchmark")
     parser.add_argument("--config-file", default=None)
     parser.add_argument("--agent", default=None, help="Primary agent name")
@@ -1077,6 +1106,7 @@ def main() -> None:
             server,
             model_spec=model_spec,
             config_file=args.config_file,
+            restrict_model=args.restrict_model,
         )
         (logs_dir / "opencode-v2-preflight.json").write_text(
             json.dumps(preflight, indent=2) + "\n"

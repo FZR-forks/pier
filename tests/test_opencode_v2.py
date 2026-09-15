@@ -3,7 +3,6 @@
 import copy
 import json
 import os
-import shlex
 import signal
 import subprocess
 import time
@@ -13,6 +12,7 @@ from typing import Any
 import pytest
 
 from pier.agents.factory import AgentFactory
+from pier.agents.installed.base import NonZeroAgentExitCodeError
 from pier.agents.installed import opencode_v2_runner as runner_module
 from pier.agents.installed.opencode_v2 import OpenCodeV2
 from pier.environments.base import ExecResult
@@ -51,6 +51,7 @@ class FakeEnvironment:
 
 def make_agent(logs_dir: Path, **kwargs: Any) -> OpenCodeV2:
     kwargs.setdefault("model_name", "litellm/kimi-k3#max")
+    kwargs.setdefault("version", "2.0.3")
     return OpenCodeV2(logs_dir=logs_dir, **kwargs)
 
 
@@ -98,6 +99,7 @@ def test_opencode_v2_is_registered():
         AgentName.OPENCODE_V2,
         logs_dir=Path("/tmp/opencode-v2-test-logs"),
         model_name="litellm/kimi-k3",
+        version="2.0.3",
     )
     assert agent.name() == "opencode-v2"
     assert AgentName("opencode-v2") is AgentName.OPENCODE_V2
@@ -223,7 +225,7 @@ def test_runtime_config_is_fresh_across_calls(tmp_path: Path):
 # ---------------------------------------------------------------------------
 
 
-def test_output_limit_generates_chat_completions_body_override(tmp_path: Path):
+def test_output_limit_metadata_does_not_synthesize_transport_body(tmp_path: Path):
     agent = make_agent(
         tmp_path,
         opencode_v2_config={
@@ -237,35 +239,73 @@ def test_output_limit_generates_chat_completions_body_override(tmp_path: Path):
         },
     )
     config = agent._build_runtime_config(include_mcp=False)
-    body = config["providers"]["litellm"]["models"]["kimi-k3"]["body"]
-    assert body == {"max_tokens": 131072}
+    model = config["providers"]["litellm"]["models"]["kimi-k3"]
+    assert model["limit"]["output"] == 131072
+    assert "body" not in model
 
 
-def test_output_limit_generates_responses_body_override(tmp_path: Path):
+def test_model_level_responses_package_preserves_explicit_body(tmp_path: Path):
     agent = make_agent(
         tmp_path,
         opencode_v2_config={
             "providers": {
                 "litellm": {
-                    "npm": "@opencode-ai/ai/providers/openai-compatible/responses",
-                    "models": {"kimi-k3": {"limit": {"output": 131072}}},
+                    "package": "aisdk:@ai-sdk/openai-compatible",
+                    "models": {
+                        "kimi-k3": {
+                            "package": (
+                                "@opencode-ai/ai/providers/openai-compatible/responses"
+                            ),
+                            "limit": {"output": 131072},
+                            "body": {"max_output_tokens": 8192},
+                        }
+                    },
                 }
             },
         },
     )
     config = agent._build_runtime_config(include_mcp=False)
     body = config["providers"]["litellm"]["models"]["kimi-k3"]["body"]
-    assert body == {"max_output_tokens": 131072}
+    assert body == {"max_output_tokens": 8192}
 
 
-def test_body_override_reapplied_when_restrict_model(tmp_path: Path):
+def test_model_level_responses_package_rejects_chat_output_field(tmp_path: Path):
+    agent = make_agent(
+        tmp_path,
+        opencode_v2_config={
+            "providers": {
+                "litellm": {
+                    "package": "aisdk:@ai-sdk/openai-compatible",
+                    "models": {
+                        "kimi-k3": {
+                            "package": (
+                                "@opencode-ai/ai/providers/openai-compatible/responses"
+                            ),
+                            "limit": {"output": 131072},
+                            "body": {"max_tokens": 8192},
+                        }
+                    },
+                }
+            }
+        },
+    )
+    with pytest.raises(ValueError, match="must be max_output_tokens"):
+        agent._build_runtime_config(include_mcp=False)
+
+
+def test_explicit_body_override_is_preserved_when_restrict_model(tmp_path: Path):
     agent = make_agent(
         tmp_path,
         restrict_model=True,
         opencode_v2_config={
             "providers": {
                 "litellm": {
-                    "models": {"kimi-k3": {"limit": {"output": 64000}}},
+                    "models": {
+                        "kimi-k3": {
+                            "limit": {"output": 64000},
+                            "body": {"max_tokens": 64000},
+                        }
+                    },
                 }
             },
         },
@@ -560,6 +600,24 @@ def test_run_preserves_project_agents_md_discovery(tmp_path: Path):
     assert run_calls
     runner_command = run_calls[0]["command"]
     assert str(agent._RUNNER_PATH) in runner_command
+    assert "--restrict-model" not in runner_command
+
+
+def test_run_passes_model_restriction_to_runner(tmp_path: Path):
+    environment = FakeEnvironment()
+    agent = make_agent(tmp_path, restrict_model=True)
+
+    import asyncio
+
+    asyncio.run(agent.run("do the thing", environment, AgentContext()))
+
+    runner_command = next(
+        call["command"]
+        for call in environment.exec_calls
+        if "opencode_v2_runner.py" in call["command"]
+        and "--logs-dir" in call["command"]
+    )
+    assert "--restrict-model" in runner_command
 
 
 # ---------------------------------------------------------------------------
@@ -962,13 +1020,17 @@ def test_missing_model_provenance_is_unknown(tmp_path: Path):
         "active": None,
         "terminal": None,
     }
-    agent = make_agent(tmp_path)
+    agent = make_agent(tmp_path, restrict_model=True)
     write_inspections(tmp_path, [inspection])
-    agent.populate_context_post_run(AgentContext())
+    context = AgentContext()
+    with pytest.raises(NonZeroAgentExitCodeError, match="model restriction failed"):
+        agent.populate_context_post_run(context)
 
     trajectory = json.loads((tmp_path / "trajectory.json").read_text())
     assert trajectory["steps"][0].get("model_name") is None
     assert trajectory["final_metrics"]["extra"]["model_provenance_complete"] is False
+    assert trajectory["final_metrics"]["total_prompt_tokens"] == 1
+    assert context.n_input_tokens == 1
 
 
 def test_missing_runner_manifest_withholds_aggregate(tmp_path: Path):
@@ -1497,8 +1559,91 @@ def test_model_contamination_is_recorded_not_silently_used(tmp_path: Path):
     agent.populate_context_post_run(AgentContext())
 
     trajectory = json.loads((tmp_path / "trajectory.json").read_text())
-    # The step records what actually ran, so a contaminated run is visible.
+    # Unrestricted mode preserves each agent's actual configured model.
     assert trajectory["steps"][0]["model_name"] == "litellm/other-model"
+    assert (
+        trajectory["final_metrics"].get("extra", {}).get("model_provenance_complete")
+        is not False
+    )
+
+    strict_dir = tmp_path / "strict"
+    strict_agent = make_agent(
+        strict_dir,
+        model_name="litellm/kimi-k3",
+        restrict_model=True,
+    )
+    write_inspections(strict_dir, [inspection])
+    context = AgentContext()
+    with pytest.raises(NonZeroAgentExitCodeError, match="msg_c1:litellm/other-model"):
+        strict_agent.populate_context_post_run(context)
+    strict_trajectory = json.loads((strict_dir / "trajectory.json").read_text())
+    assert strict_trajectory["final_metrics"]["total_prompt_tokens"] == 5
+    assert (
+        strict_trajectory["final_metrics"]["extra"]["model_provenance_complete"]
+        is False
+    )
+    assert context.n_input_tokens == 5
+
+
+def test_restricted_child_model_mismatch_hard_fails_whole_tree(tmp_path: Path):
+    inspections = load_fixture()
+    child = next(
+        item for item in inspections if item["session"].get("parentID") is not None
+    )
+    assistant = next(
+        message for message in child["messages"] if message["type"] == "assistant"
+    )
+    assistant["model"] = {"providerID": "litellm", "id": "other-model"}
+    agent = make_agent(
+        tmp_path,
+        model_name="litellm/kimi-k3",
+        restrict_model=True,
+    )
+    write_inspections(tmp_path, inspections)
+    with pytest.raises(NonZeroAgentExitCodeError, match="other-model"):
+        agent.populate_context_post_run(AgentContext())
+
+    trajectory = json.loads((tmp_path / "trajectory.json").read_text())
+    assert (
+        trajectory["final_metrics"]["extra"]["tree_model_provenance_complete"] is False
+    )
+    assert trajectory["final_metrics"]["total_prompt_tokens"] == 223
+
+
+def test_restricted_mismatch_hard_fails_when_root_is_ambiguous(tmp_path: Path):
+    inspection = {
+        "messages": [
+            {
+                "type": "assistant",
+                "id": "msg_wrong_root",
+                "model": {"providerID": "litellm", "id": "other-model"},
+                "finish": "stop",
+                "tokens": {
+                    "input": 1,
+                    "output": 1,
+                    "reasoning": 0,
+                    "cache": {"read": 0, "write": 0},
+                },
+                "content": [{"type": "text", "text": "wrong model"}],
+            }
+        ],
+        "active": None,
+        "terminal": None,
+    }
+    inspections = [
+        inspection | {"session": {"id": "ses_root_a"}},
+        copy.deepcopy(inspection) | {"session": {"id": "ses_root_b"}},
+    ]
+    agent = make_agent(
+        tmp_path,
+        model_name="litellm/kimi-k3",
+        restrict_model=True,
+    )
+    write_inspections(tmp_path, inspections)
+    with pytest.raises(NonZeroAgentExitCodeError, match="msg_wrong_root"):
+        agent.populate_context_post_run(AgentContext())
+    assert not (tmp_path / "trajectory.json").exists()
+    assert (tmp_path / "opencode-v2" / "opencode-v2-sessions.jsonl").exists()
 
 
 def test_restrict_model_pins_contaminating_agent_config(tmp_path: Path):
@@ -2050,25 +2195,157 @@ def test_preflight_evidence_redacts_env_urls_and_header_credentials():
     }
 
 
+def test_preflight_allows_configured_subagent_model_when_unrestricted(
+    tmp_path: Path, monkeypatch
+):
+    config_path = tmp_path / "opencode.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "model": "litellm/root#low",
+                "providers": {
+                    "litellm": {
+                        "models": {
+                            "root": {"body": {"max_tokens": 8192}},
+                            "child": {},
+                        }
+                    }
+                },
+                "agents": {
+                    "build": {"model": "litellm/root#low"},
+                    "general": {"model": "litellm/child#high"},
+                },
+            }
+        )
+    )
+    server = runner_module.OpenCodeV2Server(
+        binary="opencode", cwd="/tmp", password="pw", env={}
+    )
+
+    def locations(_server, endpoint):
+        if endpoint == "model":
+            return [
+                {
+                    "providerID": "litellm",
+                    "id": "root",
+                    "variants": [{"id": "low"}],
+                    "body": {"max_tokens": 8192},
+                }
+            ]
+        return [
+            {
+                "id": "build",
+                "model": {"providerID": "litellm", "id": "root", "variant": "low"},
+            },
+            {
+                "id": "general",
+                "model": {
+                    "providerID": "litellm",
+                    "id": "child",
+                    "variant": "high",
+                },
+            },
+        ]
+
+    monkeypatch.setattr(runner_module, "_location_data", locations)
+    result = runner_module.preflight_runtime(
+        server,
+        model_spec="litellm/root#low",
+        config_file=str(config_path),
+        restrict_model=False,
+        timeout=0.1,
+    )
+    assert {item["id"] for item in result["resolved_agents"]} == {
+        "build",
+        "general",
+    }
+
+
+def test_preflight_rejects_subagent_model_when_restricted(tmp_path: Path, monkeypatch):
+    config_path = tmp_path / "opencode.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "providers": {"litellm": {"models": {"root": {}}}},
+                "agents": {"general": {"model": "litellm/child#high"}},
+            }
+        )
+    )
+    server = runner_module.OpenCodeV2Server(
+        binary="opencode", cwd="/tmp", password="pw", env={}
+    )
+
+    def locations(_server, endpoint):
+        if endpoint == "model":
+            return [
+                {
+                    "providerID": "litellm",
+                    "id": "root",
+                    "variants": [{"id": "low"}],
+                }
+            ]
+        return [
+            {
+                "id": "general",
+                "model": {
+                    "providerID": "litellm",
+                    "id": "child",
+                    "variant": "high",
+                },
+            }
+        ]
+
+    monkeypatch.setattr(runner_module, "_location_data", locations)
+    with pytest.raises(RuntimeError, match="expected 'litellm/root#low'"):
+        runner_module.preflight_runtime(
+            server,
+            model_spec="litellm/root#low",
+            config_file=str(config_path),
+            restrict_model=True,
+            timeout=0.01,
+        )
+
+
 # ---------------------------------------------------------------------------
 # Installation
 # ---------------------------------------------------------------------------
 
 
-def test_install_spec_pins_v2_cli_version(tmp_path: Path):
-    agent = make_agent(tmp_path)
+def test_install_spec_uses_configured_version_checksum_and_target_architecture(
+    tmp_path: Path,
+):
+    agent = make_agent(
+        tmp_path,
+        opencode_v2_checksums={
+            "linux-x64": (
+                "4b8c2cad67297c715adff18a569c8808b22fe23c7197fd1775bc11cbfa04022d"
+            ),
+            "linux-arm64": (
+                "bc35547e678c68aaec1b2aa1623d1d77ec2585db6204574724826e40f20a7693"
+            ),
+        },
+    )
     spec = agent.install_spec()
     assert spec.agent_name == "opencode-v2"
     assert spec.version == "2.0.3"
     joined = "\n".join(step.run for step in spec.steps)
-    # The V2 install channel: scoped per-target npm packages.
-    assert "opencode%2fcli-linux-x64" in joined
-    assert "cli-linux-x64-2.0.3.tgz" in joined
+    assert 'machine="$(uname -m)"' in joined
+    assert "target=linux-x64" in joined
+    assert "target=linux-arm64" in joined
+    assert "@opencode%2fcli-${target}" in joined
+    assert "cli-${target}-${version}.tgz" in joined
     assert "sha256sum -c" in joined
     assert "4b8c2cad67297c715adff18a569c8808b22fe23c7197fd1775bc11cbfa04022d" in joined
-    assert "opencode-ai" not in joined  # V1 package never pinned
+    assert "bc35547e678c68aaec1b2aa1623d1d77ec2585db6204574724826e40f20a7693" in joined
+    assert "OpenCode version mismatch" in joined
     assert spec.steps[-1].user == "root"
     assert "install -d -m 755 /installed-agent" in spec.steps[-1].run
+    subprocess.run(
+        ["bash", "-n"],
+        input=spec.steps[-1].run,
+        text=True,
+        check=True,
+    )
 
 
 def test_install_spec_respects_explicit_version(tmp_path: Path):
@@ -2077,15 +2354,23 @@ def test_install_spec_respects_explicit_version(tmp_path: Path):
     assert "2.0.2" in joined
 
 
-def test_install_spec_shell_quotes_explicit_version_url(tmp_path: Path):
-    version = "2.0.3; touch /tmp/injected"
-    agent = make_agent(tmp_path, version=version)
-    command = agent.install_spec().steps[-1].run
-    expected = (
-        "https://registry.npmjs.org/@opencode%2fcli-linux-x64/-/"
-        f"cli-linux-x64-{version}.tgz"
+def test_install_spec_without_version_resolves_latest_for_generic_use(tmp_path: Path):
+    agent = OpenCodeV2(logs_dir=tmp_path, model_name="litellm/kimi-k3")
+    spec = agent.install_spec()
+    assert spec.version is None
+    assert '["dist-tags"]["latest"]' in spec.steps[-1].run
+    subprocess.run(
+        ["bash", "-n"],
+        input=spec.steps[-1].run,
+        text=True,
+        check=True,
     )
-    assert shlex.quote(expected) in command
+
+
+def test_install_spec_rejects_unsafe_version(tmp_path: Path):
+    agent = make_agent(tmp_path, version="2.0.3; touch /tmp/injected")
+    with pytest.raises(ValueError, match="unsupported characters"):
+        agent.install_spec()
 
 
 def test_version_command_uses_remote_binary(tmp_path: Path):

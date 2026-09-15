@@ -165,9 +165,14 @@ through your env file.
 `--agent opencode-v2`. Its `model_name` is `provider/model` with an optional
 variant suffix (`provider/model#variant`). Configure the V2 native provider
 and model schema through `opencode_v2_config`; model-level `body` is used for
-transport-specific fields such as an output-token cap. V2 runs with an
-isolated config/state directory and collects root and delegated child sessions
-into augmented ATIF, so do not reuse V1's `opencode_config` syntax.
+transport-specific fields such as an output-token cap. Pin the release with
+`kwargs.version`; optional target-specific SHA-256 values belong in
+`kwargs.opencode_v2_checksums` under `linux-x64` and/or `linux-arm64`. Setting
+`restrict_model: true` locks every root, child, and compaction request to
+`model_name`; unrestricted runs preserve and preflight each configured agent's
+own model. V2 runs with an isolated config/state directory and collects root
+and delegated child sessions into augmented ATIF, so do not reuse V1's
+`opencode_config` syntax.
 
 **Pi** resolves `--model` against its own built-in catalog, so a gateway or proxy needs a provider entry in `models.json`. Setting the provider's base-URL env var (`OPENAI_BASE_URL`, `ANTHROPIC_BASE_URL`) generates one automatically, which routes pi's built-in models through the endpoint while keeping their shipped cost and capability metadata. Use `pi_config` to declare a slug that is not in the catalog; supply its `cost` (per million tokens) so pi can price it, otherwise Pier falls back to the LiteLLM price table and leaves `cost_usd` unset for a private slug. `pi_config` is deep-merged over the generated config, and any `baseUrl` in it is added to the network allowlist.
 

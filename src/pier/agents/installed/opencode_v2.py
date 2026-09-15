@@ -30,6 +30,7 @@ from urllib.parse import urlparse
 
 from pier.agents.installed.base import (
     BaseInstalledAgent,
+    NonZeroAgentExitCodeError,
     with_prompt_template,
 )
 from pier.agents.installed.opencode import OpenCode
@@ -56,8 +57,6 @@ from pier.utils.trajectory_metrics import (
 )
 from pier.utils.trajectory_utils import format_trajectory_json
 
-_PINNED_CLI_VERSION = "2.0.3"
-_PINNED_CLI_SHA256 = "4b8c2cad67297c715adff18a569c8808b22fe23c7197fd1775bc11cbfa04022d"
 _OUTPUT_FILENAME = "opencode-v2.txt"
 _RUNNER_FILENAME = "opencode_v2_runner.py"
 _RUNNER_PATH = "/installed-agent/opencode_v2_runner.py"
@@ -138,12 +137,10 @@ class OpenCodeV2(BaseInstalledAgent):
 
     SUPPORTS_ATIF: bool = True
 
-    _CLI_PACKAGE_VERSION = _PINNED_CLI_VERSION
     # The official V2 install channel: the npm scope is `@opencode`, the
     # per-target packages carry the native binary (`@opencode/cli-<target>`),
     # and the public `@opencode-ai/cli` package only ever shipped 1.x.
     _NPM_PACKAGE = "@opencode/cli"
-    _NPM_TARGET = "linux-x64"
     _REMOTE_HOME = Path("/tmp/opencode-v2-home")
     _REMOTE_CONFIG = _REMOTE_HOME / "config" / "opencode" / "opencode.json"
     _REMOTE_WORKDIR = Path("/tmp/opencode-v2-work")
@@ -163,6 +160,7 @@ class OpenCodeV2(BaseInstalledAgent):
         self,
         *args,
         opencode_v2_config: dict[str, Any] | None = None,
+        opencode_v2_checksums: dict[str, str] | None = None,
         restrict_model: bool = False,
         **kwargs,
     ):
@@ -181,10 +179,27 @@ class OpenCodeV2(BaseInstalledAgent):
             raise ValueError("restrict_model must be a boolean")
         if opencode_v2_config is not None and not isinstance(opencode_v2_config, dict):
             raise ValueError("opencode_v2_config must be an object")
+        if opencode_v2_checksums is not None and not isinstance(
+            opencode_v2_checksums, dict
+        ):
+            raise ValueError("opencode_v2_checksums must be an object")
+        checksums = copy.deepcopy(opencode_v2_checksums or {})
+        for target, digest in checksums.items():
+            if not re.fullmatch(r"linux-(?:x64|arm64)", target):
+                raise ValueError(
+                    "opencode_v2_checksums keys must be linux-x64 or linux-arm64"
+                )
+            if not isinstance(digest, str) or not re.fullmatch(
+                r"[0-9a-fA-F]{64}", digest
+            ):
+                raise ValueError(
+                    f"opencode_v2_checksums.{target} must be a SHA-256 hex digest"
+                )
         super().__init__(*args, **kwargs)
         self._opencode_v2_config: dict[str, Any] = copy.deepcopy(
             opencode_v2_config or {}
         )
+        self._opencode_v2_checksums = checksums
         self._restrict_model = restrict_model
         self._instruction: str | None = None
 
@@ -194,6 +209,11 @@ class OpenCodeV2(BaseInstalledAgent):
 
     def get_version_command(self) -> str | None:
         return f"{self._REMOTE_BINARY.as_posix()} --version"
+
+    def parse_version(self, stdout: str) -> str:
+        value = stdout.strip()
+        match = re.fullmatch(r"(?:opencode\s+)?v?(.+)", value)
+        return match.group(1) if match else value
 
     # ------------------------------------------------------------------
     # Configuration
@@ -234,57 +254,97 @@ class OpenCodeV2(BaseInstalledAgent):
         caller-supplied ``opencode_v2_config`` must never leak between runs.
         """
         provider, model_id, _variant = self._model_parts()
-        provider_entry: dict[str, Any] = {"models": {model_id: {}}}
+        return {provider: {"models": {model_id: {}}}}
 
-        # ``limit.output`` is metadata used by OpenCode for context management;
-        # it is not necessarily forwarded to the provider. The V2 native
-        # configuration supports a model-level body overlay, which is applied
-        # after protocol lowering. This is the only reliable way to pin the
-        # output cap on the frozen Fireworks Chat Completions route.
-        output_limit = self._output_limit()
-        if output_limit is not None:
-            wire_key = self._max_tokens_wire_key(
-                self._configured_provider_npm(provider)
-            )
-            provider_entry["models"][model_id] = {
-                "body": {wire_key: output_limit},
-                "limit": {"output": output_limit},
-            }
-        return {provider: provider_entry}
-
-    def _configured_provider_npm(self, provider: str) -> str:
-        configured = (self._opencode_v2_config.get("providers") or {}).get(provider)
-        configured = configured if isinstance(configured, dict) else {}
-        return str(configured.get("npm") or configured.get("package") or "")
-
-    @staticmethod
-    def _max_tokens_wire_key(npm_package: str) -> str:
-        """The outgoing request body key for the output-token cap.
-
-        The Responses transport takes ``max_output_tokens``; OpenAI-compatible
-        Chat Completions routes use ``max_tokens``.
-        """
-        return (
-            "max_output_tokens" if npm_package.endswith("/responses") else "max_tokens"
-        )
-
-    def _output_limit(self) -> int | None:
-        """The model's ``limit.output`` from ``opencode_v2_config``, if any."""
+    def _validate_selected_model_config(self, config: dict[str, Any]) -> None:
+        """Validate, but never synthesize, transport-specific output fields."""
         provider, model_id, _ = self._model_parts()
-        config_provider = (self._opencode_v2_config.get("providers") or {}).get(
-            provider
-        ) or {}
-        config_models = config_provider.get("models") or {}
-        config_model = config_models.get(model_id) or {}
-        limit = config_model.get("limit") or {}
+        providers = config.get("providers")
+        if not isinstance(providers, dict):
+            raise ValueError("providers must be an object")
+        provider_entry = providers.get(provider)
+        if provider_entry is None:
+            provider_entry = {}
+        if not isinstance(provider_entry, dict):
+            raise ValueError(f"providers.{provider} must be an object")
+        models = provider_entry.get("models")
+        if models is None:
+            models = {}
+        if not isinstance(models, dict):
+            raise ValueError(f"providers.{provider}.models must be an object")
+        model_entry = models.get(model_id)
+        if model_entry is None:
+            model_entry = {}
+        if not isinstance(model_entry, dict):
+            raise ValueError(
+                f"providers.{provider}.models.{model_id} must be an object"
+            )
+        limit = model_entry.get("limit")
+        if limit is None:
+            limit = {}
+        if not isinstance(limit, dict):
+            raise ValueError(
+                f"providers.{provider}.models.{model_id}.limit must be an object"
+            )
         output = limit.get("output")
         if output is None:
-            return None
-        if isinstance(output, bool) or not isinstance(output, int) or output <= 0:
+            output_limit = None
+        elif isinstance(output, bool) or not isinstance(output, int) or output <= 0:
             raise ValueError(
                 f"providers.{provider}.models.{model_id}.limit.output must be a positive integer"
             )
-        return output
+        else:
+            output_limit = output
+
+        body = model_entry.get("body")
+        if body is None:
+            body = {}
+        if not isinstance(body, dict):
+            raise ValueError(
+                f"providers.{provider}.models.{model_id}.body must be an object"
+            )
+        output_keys = {
+            key
+            for key in ("max_tokens", "max_completion_tokens", "max_output_tokens")
+            if key in body
+        }
+        if len(output_keys) > 1:
+            raise ValueError(
+                "output limit has competing model body fields: "
+                + ", ".join(sorted(output_keys))
+            )
+        for key in output_keys:
+            value = body[key]
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, int)
+                or value <= 0
+                or (output_limit is not None and value > output_limit)
+            ):
+                suffix = (
+                    " no greater than limit.output" if output_limit is not None else ""
+                )
+                raise ValueError(
+                    f"providers.{provider}.models.{model_id}.body.{key} must be "
+                    f"a positive integer{suffix}"
+                )
+
+        package = str(
+            model_entry.get("npm")
+            or model_entry.get("package")
+            or provider_entry.get("npm")
+            or provider_entry.get("package")
+            or ""
+        )
+        if (
+            package.endswith("/responses")
+            and output_keys
+            and output_keys != {"max_output_tokens"}
+        ):
+            raise ValueError(
+                f"providers.{provider}.models.{model_id} uses a Responses package; "
+                "its explicit output field must be max_output_tokens"
+            )
 
     def _build_agents_config(self) -> dict[str, Any]:
         """Agent definitions that pin the benchmark model and variant.
@@ -383,46 +443,11 @@ class OpenCodeV2(BaseInstalledAgent):
                     mcp[server.name] = {"type": "remote", "url": server.url}
             config["mcp"] = mcp
 
-        # Caller config wins over generated defaults, except the selected
-        # output cap. Re-apply that cap at the *model* body level after merging
-        # so a caller cannot silently remove the benchmark's wire limit.
+        # Provider- and transport-specific model bodies belong to the caller's
+        # configuration. Pier preserves and validates them without deriving a
+        # wire field from generic ``limit.output`` metadata.
         config = self._deep_merge(config, copy.deepcopy(self._opencode_v2_config))
-        output_limit = self._output_limit()
-        if output_limit is not None:
-            provider, model_id, _ = self._model_parts()
-            provider_entry = (config["providers"] or {}).get(provider) or {}
-            wire_key = self._max_tokens_wire_key(
-                str(provider_entry.get("npm") or provider_entry.get("package") or "")
-            )
-            model_entry = provider_entry.setdefault("models", {}).setdefault(
-                model_id, {}
-            )
-            model_entry.setdefault("limit", {})["output"] = output_limit
-            body = model_entry.setdefault("body", {})
-            output_keys = {"max_tokens", "max_completion_tokens", "max_output_tokens"}
-            conflicting = sorted(
-                key for key in body if key in output_keys and key != wire_key
-            )
-            if conflicting:
-                raise ValueError(
-                    "output limit has conflicting model body fields: "
-                    + ", ".join(conflicting)
-                )
-            existing_body_limit = body.get(wire_key)
-            if existing_body_limit is not None:
-                if (
-                    isinstance(existing_body_limit, bool)
-                    or not isinstance(existing_body_limit, int)
-                    or existing_body_limit <= 0
-                    or existing_body_limit > output_limit
-                ):
-                    raise ValueError(
-                        f"providers.{provider}.models.{model_id}.body.{wire_key} "
-                        "must be a positive integer no greater than limit.output"
-                    )
-            else:
-                body[wire_key] = output_limit
-            config["providers"][provider] = provider_entry
+        self._validate_selected_model_config(config)
 
         self._pin_restricted_model(config)
         if self._restrict_model:
@@ -541,20 +566,36 @@ class OpenCodeV2(BaseInstalledAgent):
     # ------------------------------------------------------------------
 
     def install_spec(self) -> AgentInstallSpec:
-        version = self._version or _PINNED_CLI_VERSION
-        target = self._NPM_TARGET
-        # The V2 binary ships as a per-target npm package from the @opencode
-        # scope; the tarball contains package/bin/opencode.
-        tarball_url = (
-            f"https://registry.npmjs.org/"
-            f"{self._NPM_PACKAGE.replace('/', '%2f')}-{target}/-/"
-            f"{self._NPM_PACKAGE.split('/')[-1]}-{target}-{version}.tgz"
+        version = self._version
+        if version and not re.fullmatch(r"[0-9A-Za-z][0-9A-Za-z._+-]*", version):
+            raise ValueError("OpenCode V2 version contains unsupported characters")
+        if not version and self._opencode_v2_checksums:
+            raise ValueError(
+                "OpenCode V2 checksums require an explicit version in agent config"
+            )
+        version_command = f"version={shlex.quote(version)}; " if version else ""
+        if not version:
+            latest_version_script = (
+                'import json,sys; print(json.load(sys.stdin)["dist-tags"]["latest"])'
+            )
+            version_command = (
+                'metadata_url="https://registry.npmjs.org/'
+                f'@opencode%2fcli-${{target}}"; version="$(curl -fsSL '
+                f'"${{metadata_url}}" | python3 -c '
+                f'{shlex.quote(latest_version_script)})"; '
+            )
+        checksum_cases = "".join(
+            f"{target}) expected_sha={shlex.quote(digest.lower())} ;; "
+            for target, digest in sorted(self._opencode_v2_checksums.items())
         )
-        checksum_command = (
-            f"printf '%s  %s\\n' {_PINNED_CLI_SHA256} \"$archive\" | sha256sum -c -; "
-            if version == _PINNED_CLI_VERSION
-            else ""
-        )
+        checksum_command = ""
+        if checksum_cases:
+            checksum_command = (
+                f'case "$target" in {checksum_cases}*) '
+                'echo "No configured OpenCode V2 checksum for $target" >&2; exit 1 ;; '
+                "esac; "
+                'printf \'%s  %s\\n\' "$expected_sha" "$archive" | sha256sum -c -; '
+            )
         return AgentInstallSpec(
             agent_name=self.name(),
             version=version,
@@ -569,15 +610,30 @@ class OpenCodeV2(BaseInstalledAgent):
                     run=(
                         "set -euo pipefail; "
                         "install -d -m 755 /installed-agent; "
+                        'machine="$(uname -m)"; '
+                        'case "$machine" in '
+                        "x86_64|amd64) target=linux-x64 ;; "
+                        "aarch64|arm64) target=linux-arm64 ;; "
+                        '*) echo "Unsupported OpenCode V2 architecture: $machine" >&2; '
+                        "exit 1 ;; esac; "
+                        f"{version_command}"
                         'package_dir="$(mktemp -d /tmp/opencode-v2-pkg.XXXXXX)"; '
                         "trap 'rm -rf -- \"$package_dir\"' EXIT; "
                         'archive="$package_dir/cli.tgz"; '
-                        f'curl -fsSL -o "$archive" {shlex.quote(tarball_url)}; '
+                        'archive_url="https://registry.npmjs.org/'
+                        '@opencode%2fcli-${target}/-/cli-${target}-${version}.tgz"; '
+                        'curl -fsSL -o "$archive" "$archive_url"; '
                         f"{checksum_command}"
                         'tar -xzf "$archive" -C "$package_dir"; '
                         f'install -m 755 "$package_dir/package/bin/opencode" '
                         f"{self._REMOTE_BINARY.as_posix()}; "
-                        f"{self._REMOTE_BINARY.as_posix()} --version"
+                        f'installed_version="$({self._REMOTE_BINARY.as_posix()} '
+                        '--version)"; '
+                        'if [ "$installed_version" != "opencode v$version" ] '
+                        '&& [ "$installed_version" != "$version" ]; then '
+                        'echo "OpenCode version mismatch: expected $version, '
+                        'got $installed_version" >&2; exit 1; fi; '
+                        'printf "%s\\n" "$installed_version"'
                     ),
                 ),
             ],
@@ -586,6 +642,15 @@ class OpenCodeV2(BaseInstalledAgent):
 
     async def setup(self, environment: BaseEnvironment) -> None:
         await super().setup(environment)
+        if self._version:
+            result = await self.exec_as_agent(
+                environment, command=self.get_version_command() or ""
+            )
+            actual = self.parse_version(result.stdout)
+            if actual != self._version:
+                raise RuntimeError(
+                    f"OpenCode version mismatch: expected {self._version}, got {actual}"
+                )
         runner = Path(__file__).with_name(_RUNNER_FILENAME)
         await environment.upload_file(runner, self._RUNNER_PATH)
         await self.exec_as_root(
@@ -721,6 +786,7 @@ class OpenCodeV2(BaseInstalledAgent):
                     if (variant := self._resolved_variant())
                     else ""
                 )
+                + ("--restrict-model " if self._restrict_model else "")
                 + "--title pier-benchmark "
                 f"> >(stdbuf -oL tee {self._OUTPUT_FILENAME.as_posix()}) 2>&1"
             )
@@ -920,7 +986,7 @@ class OpenCodeV2(BaseInstalledAgent):
                 usage_seen = usage_seen or isinstance(message.get("tokens"), dict)
                 if message.get("finish") == "error":
                     failed_attempts += 1
-                if self.model_name:
+                if self._restrict_model and self.model_name:
                     actual_model = self._assistant_model_name(message)
                     if actual_model is None:
                         model_provenance_complete = False
@@ -938,7 +1004,7 @@ class OpenCodeV2(BaseInstalledAgent):
                 usage_seen = usage_seen or isinstance(message.get("tokens"), dict)
                 if str(message.get("status") or "") in {"failed", "error"}:
                     failed_attempts += 1
-                if self.model_name and not message.get("_usage_duplicate_of"):
+                if self._restrict_model and self.model_name:
                     actual_model = self._compaction_model_name(message)
                     if actual_model is None:
                         model_provenance_complete = False
@@ -1045,7 +1111,7 @@ class OpenCodeV2(BaseInstalledAgent):
             final_metrics.total_completion_tokens = None
             final_metrics.total_cached_tokens = None
             final_metrics.total_cost_usd = None
-        if self.model_name and not model_provenance_complete:
+        if self._restrict_model and self.model_name and not model_provenance_complete:
             final_metrics.extra = dict(final_metrics.extra or {})
             final_metrics.extra["model_provenance_complete"] = False
             final_metrics.extra["model_mismatches"] = model_mismatches
@@ -1064,7 +1130,7 @@ class OpenCodeV2(BaseInstalledAgent):
             trajectory_id=session_id,
             agent=Agent(
                 name=self.name(),
-                version=self.version() or _PINNED_CLI_VERSION,
+                version=self.version() or "unknown",
                 model_name=self.model_name,
             ),
             steps=steps,
@@ -1713,6 +1779,39 @@ class OpenCodeV2(BaseInstalledAgent):
 
     # -- entry point -------------------------------------------------------
 
+    def _model_restriction_mismatches(
+        self, inspections: list[dict[str, Any]]
+    ) -> list[str]:
+        if not self._restrict_model or not self.model_name:
+            return []
+        mismatches: list[str] = []
+        for inspection in inspections:
+            for message in inspection.get("messages") or []:
+                if not isinstance(message, dict):
+                    continue
+                message_type = message.get("type")
+                if message_type == "assistant":
+                    actual = self._assistant_model_name(message)
+                elif message_type == "compaction":
+                    actual = self._compaction_model_name(message)
+                else:
+                    continue
+                record_id = message.get("id", "unknown")
+                if actual != self.model_name:
+                    mismatches.append(
+                        f"missing:{record_id}"
+                        if actual is None
+                        else f"{record_id}:{actual}"
+                    )
+        return list(dict.fromkeys(mismatches))
+
+    @staticmethod
+    def _raise_model_restriction_failure(mismatches: list[str]) -> None:
+        if mismatches:
+            raise NonZeroAgentExitCodeError(
+                "OpenCode V2 model restriction failed: " + "; ".join(mismatches[:10])
+            )
+
     def populate_context_post_run(self, context: AgentContext) -> None:
         """Convert the runner's recorded sessions into ATIF trajectories."""
         inspections = self._read_jsonl(
@@ -1733,13 +1832,16 @@ class OpenCodeV2(BaseInstalledAgent):
             self.logger.debug("No OpenCode V2 session inspections found")
             return
 
+        restriction_mismatches = self._model_restriction_mismatches(inspections)
         try:
             trajectories = self._convert_inspections_to_trajectories(inspections)
         except Exception:
             self.logger.exception("Failed to convert OpenCode V2 sessions")
+            self._raise_model_restriction_failure(restriction_mismatches)
             return
 
         if not trajectories:
+            self._raise_model_restriction_failure(restriction_mismatches)
             return
 
         runner_result = self._read_json(
@@ -1752,6 +1854,7 @@ class OpenCodeV2(BaseInstalledAgent):
         )
         root = self._select_root(trajectories, recorded_root_id)
         if root is None:
+            self._raise_model_restriction_failure(restriction_mismatches)
             return
         discovered_ids = {
             str(item)
@@ -1798,3 +1901,4 @@ class OpenCodeV2(BaseInstalledAgent):
 
         if embedded.final_metrics:
             populate_context_from_final_metrics(context, embedded.final_metrics)
+        self._raise_model_restriction_failure(restriction_mismatches)
