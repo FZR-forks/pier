@@ -32,8 +32,9 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from collections import deque
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
 
 READY_TIMEOUT_SECONDS = 30
 AUTH_USERNAME = "opencode"
@@ -45,6 +46,9 @@ SESSION_WAIT_REQUEST_SECONDS = 30.0
 SETTLE_INTERVAL_SECONDS = 1.0
 RAW_PAGE_LIMIT = 512
 RAW_PAGE_BYTES_LIMIT = 16 * 1024 * 1024
+CLI_CAPTURE_MAX_LINES = 256
+CLI_CAPTURE_MAX_LINE_BYTES = 16 * 1024
+MAX_ROOT_CANDIDATES = 1024
 
 
 def auth_header(password: str) -> str:
@@ -511,8 +515,10 @@ class OpenCodeV2Server:
             )
         self.process = None
 
-    def inspect_session(self, session: dict) -> dict:
-        return inspect_session(self, session)
+    def inspect_session(
+        self, session: dict, active_ids: set[str] | None = None
+    ) -> dict:
+        return inspect_session(self, session, active_ids=active_ids)
 
     def collect_descendants(self, root_id: str) -> list[dict]:
         """Recursively enumerate a root and every direct child page."""
@@ -756,16 +762,23 @@ def preflight_runtime(
     raise RuntimeError(f"OpenCode runtime preflight failed: {last_error}")
 
 
-def inspect_session(server: OpenCodeV2Server, session: dict) -> dict:
+def inspect_session(
+    server: OpenCodeV2Server,
+    session: dict,
+    *,
+    active_ids: set[str] | None = None,
+) -> dict:
     """Collect one session's messages, running state, and terminal snapshot."""
     session_id = str(session.get("id"))
+    if active_ids is None:
+        active_ids = server.running_session_ids()
     return {
         "session": session,
         "messages": server.collect_messages(session_id),
         "active": {
             "type": "running",
         }
-        if session_id in server.running_session_ids()
+        if session_id in active_ids
         else None,
         "inbox": server.inbox_items(session_id),
         # V2.0.3 has no terminal-session endpoint; inbox + active + wait are
@@ -774,7 +787,14 @@ def inspect_session(server: OpenCodeV2Server, session: dict) -> dict:
     }
 
 
-def _events(stdout_lines: list[str]) -> list[dict]:
+def _bounded_cli_line(line: str) -> str:
+    encoded = line.encode("utf-8", errors="replace")
+    if len(encoded) <= CLI_CAPTURE_MAX_LINE_BYTES:
+        return line
+    return encoded[:CLI_CAPTURE_MAX_LINE_BYTES].decode("utf-8", errors="ignore")
+
+
+def _events(stdout_lines: Iterable[str]) -> list[dict]:
     result: list[dict] = []
     for line in stdout_lines:
         stripped = line.strip()
@@ -945,7 +965,11 @@ def _collect_tree(
                 for session_id in ids:
                     if not server.wait_session(session_id):
                         blockers.append(f"session.wait failed for {session_id}")
-                inspections = [server.inspect_session(session) for session in sessions]
+                active = server.running_session_ids()
+                inspections = [
+                    server.inspect_session(session, active_ids=active)
+                    for session in sessions
+                ]
                 if any(item.get("inbox") is None for item in inspections):
                     blockers.append("session inbox state unavailable")
                 pending_inbox = any(item.get("inbox") for item in inspections)
@@ -970,7 +994,6 @@ def _collect_tree(
                         + ", ".join(missing_terminal)
                     )
                 signature = _snapshot_signature(inspections)
-                active = server.running_session_ids()
                 if active:
                     blockers.append("active sessions: " + ", ".join(sorted(active)))
                 if not blockers and previous == signature:
@@ -1013,9 +1036,10 @@ def _collect_tree(
 
 
 def _preserve_private_state(env: dict[str, str], logs_dir: Path) -> list[str]:
-    """Copy private OpenCode state after a diagnostic failure without parsing it."""
+    """Copy safe private state after failure without parsing credential stores."""
     copied: list[str] = []
     target = logs_dir / "private-state"
+    excluded_names = {"auth.json", "credentials.json"}
     for label, env_key in (("state", "XDG_STATE_HOME"), ("data", "XDG_DATA_HOME")):
         source_text = env.get(env_key)
         if not source_text:
@@ -1024,9 +1048,11 @@ def _preserve_private_state(env: dict[str, str], logs_dir: Path) -> list[str]:
         if not source.is_dir():
             continue
         for item in source.rglob("*"):
-            if not item.is_file():
+            if item.is_symlink() or not item.is_file():
                 continue
             relative = item.relative_to(source)
+            if relative.name.casefold() in excluded_names:
+                continue
             # OpenCode's data tree can contain a full Git snapshot of the task.
             # It is not the session database and duplicating it into logs can
             # consume gigabytes. Preserve database/log/metadata state, while
@@ -1101,7 +1127,7 @@ def main() -> None:
         binary=binary, cwd=str(work_dir), password=password, env=env
     )
 
-    stdout_lines: list[str] = []
+    stdout_lines: deque[str] = deque(maxlen=CLI_CAPTURE_MAX_LINES)
     cli_stderr = ""
     cli_returncode: int | None = None
     server_stderr = ""
@@ -1120,6 +1146,7 @@ def main() -> None:
     private_state_artifacts: list[str] = []
     server_exit_code: int | None = None
     early_root_candidates: set[str] = set()
+    early_root_events: deque[dict[str, str]] = deque(maxlen=CLI_CAPTURE_MAX_LINES)
 
     def handle_termination(signum, _frame):
         raise KeyboardInterrupt(f"received signal {signum}")
@@ -1179,42 +1206,49 @@ def main() -> None:
             text=True,
             start_new_session=True,
         )
-        stderr_lines: list[str] = []
+        stderr_lines: deque[str] = deque(maxlen=CLI_CAPTURE_MAX_LINES)
 
         def drain(
-            stream, destination: list[str], *, capture_root: bool = False
+            stream, destination: deque[str], *, capture_root: bool = False
         ) -> None:
             if stream is None:
                 return
             try:
                 for line in stream:
-                    destination.append(line)
-                    if not capture_root:
-                        continue
-                    try:
-                        event = json.loads(line)
-                    except json.JSONDecodeError:
-                        continue
-                    session_id = (
-                        event.get("sessionID") if isinstance(event, dict) else None
-                    )
-                    if not isinstance(session_id, str) or not session_id:
-                        continue
-                    early_root_candidates.add(session_id)
-                    # Persist the CLI-supplied ID while execution is still in
-                    # progress. Final collection validates it against private
-                    # server metadata before accepting it as the root.
-                    (logs_dir / "opencode-v2-root-candidates.json").write_text(
-                        json.dumps(
-                            {
-                                "source": "cli-event",
-                                "candidate_session_ids": sorted(early_root_candidates),
-                                "validated": False,
-                            },
-                            indent=2,
+                    if capture_root:
+                        try:
+                            event = json.loads(line)
+                        except json.JSONDecodeError:
+                            event = None
+                        session_id = (
+                            event.get("sessionID") if isinstance(event, dict) else None
                         )
-                        + "\n"
-                    )
+                        if isinstance(session_id, str) and session_id:
+                            early_root_events.append({"sessionID": session_id})
+                            if (
+                                session_id not in early_root_candidates
+                                and len(early_root_candidates) < MAX_ROOT_CANDIDATES
+                            ):
+                                early_root_candidates.add(session_id)
+                                # Persist the CLI-supplied ID while execution
+                                # is in progress. Final collection validates it
+                                # against private server metadata.
+                                (
+                                    logs_dir / "opencode-v2-root-candidates.json"
+                                ).write_text(
+                                    json.dumps(
+                                        {
+                                            "source": "cli-event",
+                                            "candidate_session_ids": sorted(
+                                                early_root_candidates
+                                            ),
+                                            "validated": False,
+                                        },
+                                        indent=2,
+                                    )
+                                    + "\n"
+                                )
+                    destination.append(_bounded_cli_line(line))
             except (OSError, ValueError):
                 pass
 
@@ -1263,6 +1297,7 @@ def main() -> None:
             stderr_thread.join(timeout=1)
             cli_stderr = "".join(stderr_lines)
             events = _events(stdout_lines)
+            events.extend(early_root_events)
             dump_jsonl(logs_dir / "opencode-v2-cli-events.jsonl", events)
             try:
                 discovered = server.collect_sessions()
@@ -1281,6 +1316,7 @@ def main() -> None:
         stderr_thread.join(timeout=2)
         cli_stderr = "".join(stderr_lines)
         events = _events(stdout_lines)
+        events.extend(early_root_events)
         dump_jsonl(logs_dir / "opencode-v2-cli-events.jsonl", events)
         sessions = server.collect_sessions()
         root_id = _root_id(events, sessions, before_ids)

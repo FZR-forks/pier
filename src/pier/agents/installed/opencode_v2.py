@@ -23,6 +23,7 @@ import ipaddress
 import json
 import re
 import shlex
+import tempfile
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -611,6 +612,8 @@ class OpenCodeV2(BaseInstalledAgent):
         """Keep provider credentials off cleartext remote connections."""
         parsed = urlparse(value)
         hostname = (parsed.hostname or "").lower().rstrip(".")
+        if not hostname:
+            raise ValueError(f"Provider URLs must include a hostname, got {value!r}")
         loopback = hostname == "localhost"
         if hostname:
             try:
@@ -810,10 +813,7 @@ class OpenCodeV2(BaseInstalledAgent):
         setup_command = (
             f"mkdir -p {shlex.quote(config_path.parent.as_posix())} "
             f"{shlex.quote(remote_workdir_text)} "
-            f"{self._RUNNER_OUTPUT.parent.as_posix()}\n"
-            f"cat >{shlex.quote(config_path.as_posix())} <<'PIER_OPENCODE_V2_CONFIG'\n"
-            f"{config_json}\n"
-            "PIER_OPENCODE_V2_CONFIG\n"
+            f"{self._RUNNER_OUTPUT.parent.as_posix()}"
         )
 
         skills_command = self._build_register_skills_command()
@@ -830,6 +830,21 @@ class OpenCodeV2(BaseInstalledAgent):
 
         try:
             await self.exec_as_agent(environment, command=setup_command, env=env)
+            # Transfer the JSON through the environment file API instead of
+            # embedding credentials in a command that BaseInstalledAgent logs.
+            with tempfile.NamedTemporaryFile(
+                mode="w",
+                encoding="utf-8",
+                prefix="pier-opencode-v2-",
+                suffix=".json",
+                delete=False,
+            ) as config_file:
+                config_file.write(config_json)
+                local_config = Path(config_file.name)
+            try:
+                await environment.upload_file(local_config, config_path.as_posix())
+            finally:
+                local_config.unlink(missing_ok=True)
 
             # The runner owns the server; the CLI only talks to it via --server.
             # A non-zero runner exit must fail the run and all raw artifacts
@@ -1854,7 +1869,8 @@ class OpenCodeV2(BaseInstalledAgent):
             return []
         mismatches: list[str] = []
         for inspection in inspections:
-            for message in inspection.get("messages") or []:
+            messages = self._dedupe_messages(list(inspection.get("messages") or []))
+            for message in messages:
                 if not isinstance(message, dict):
                     continue
                 message_type = message.get("type")
@@ -1952,7 +1968,7 @@ class OpenCodeV2(BaseInstalledAgent):
         # the partial trajectory but withhold its aggregate totals.
         if (
             runner_result is None
-            or runner_result.get("collection_complete") is False
+            or runner_result.get("collection_complete") is not True
             or (discovered_ids and discovered_ids != converted_ids)
             or not attachment_complete
         ):

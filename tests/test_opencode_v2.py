@@ -36,6 +36,7 @@ class FakeEnvironment:
     def __init__(self) -> None:
         self.exec_calls: list[dict[str, Any]] = []
         self.downloads: list[tuple[str, Path]] = []
+        self.uploads: list[tuple[str, str, str]] = []
 
     def agent_process_env(self, env: dict[str, str] | None) -> dict[str, str] | None:
         return env
@@ -48,6 +49,10 @@ class FakeEnvironment:
         self.downloads.append((remote, local))
         local.parent.mkdir(parents=True, exist_ok=True)
         local.write_text("")
+
+    async def upload_file(self, source: Path | str, target: str) -> None:
+        source_path = Path(source)
+        self.uploads.append((str(source_path), target, source_path.read_text()))
 
 
 def make_agent(logs_dir: Path, **kwargs: Any) -> OpenCodeV2:
@@ -552,6 +557,15 @@ def test_provider_url_requires_https_except_loopback(tmp_path: Path):
     with pytest.raises(ValueError, match="must use HTTPS"):
         remote.network_allowlist()
 
+    malformed = make_agent(
+        tmp_path,
+        opencode_v2_config={
+            "providers": {"litellm": {"settings": {"baseURL": "https://"}}}
+        },
+    )
+    with pytest.raises(ValueError, match="must include a hostname"):
+        malformed.network_allowlist()
+
     loopback = make_agent(
         tmp_path,
         opencode_v2_config={
@@ -580,22 +594,33 @@ def test_runner_env_is_restricted(tmp_path: Path, monkeypatch):
 
 def test_run_writes_config_to_private_home(tmp_path: Path):
     environment = FakeEnvironment()
-    agent = make_agent(tmp_path)
+    agent = make_agent(
+        tmp_path,
+        opencode_v2_config={
+            "providers": {"litellm": {"settings": {"apiKey": "direct-secret"}}}
+        },
+    )
 
     import asyncio
 
     asyncio.run(agent.run("do the thing", environment, AgentContext()))
 
-    setup_calls = [
-        call
-        for call in environment.exec_calls
-        if "PIER_OPENCODE_V2_CONFIG" in call["command"]
+    config_uploads = [
+        upload for upload in environment.uploads if upload[1].endswith("opencode.json")
     ]
-    assert setup_calls, "config heredoc not written"
-    command = setup_calls[0]["command"]
+    assert config_uploads, "config file was not uploaded"
+    assert config_uploads[0][2].find('"apiKey": "direct-secret"') >= 0
+    assert all(
+        "direct-secret" not in call["command"] for call in environment.exec_calls
+    )
+    command = next(
+        call["command"]
+        for call in environment.exec_calls
+        if "mkdir -p" in call["command"]
+    )
     # Private per-trial HOME, config path injected via OPENCODE_CONFIG.
     assert "/tmp/opencode-v2-home-" in command
-    assert "opencode.json" in command
+    assert config_uploads[0][1].endswith("config/opencode/opencode.json")
     assert "mkdir -p" in command
 
 
@@ -1196,6 +1221,34 @@ def test_missing_runner_manifest_withholds_aggregate(tmp_path: Path):
     assert metrics["extra"]["collection_incomplete"] is True
 
 
+def test_incomplete_runner_manifest_withholds_aggregate(tmp_path: Path):
+    inspection = {
+        "session": {"id": "ses_incomplete_manifest"},
+        "messages": [
+            {
+                "type": "assistant",
+                "id": "msg_incomplete_manifest",
+                "model": {"id": "kimi-k3", "providerID": "litellm"},
+                "time": {"created": 1, "completed": 2},
+                "finish": "stop",
+                "tokens": {"input": 1, "output": 1, "reasoning": 0},
+                "content": [{"type": "text", "text": "partial"}],
+            }
+        ],
+        "active": None,
+        "terminal": None,
+    }
+    agent = make_agent(tmp_path)
+    write_inspections(tmp_path, [inspection])
+    (tmp_path / "opencode-v2" / "runner-result.json").write_text("{}")
+
+    agent.populate_context_post_run(AgentContext())
+
+    metrics = json.loads((tmp_path / "trajectory.json").read_text())["final_metrics"]
+    assert metrics.get("total_prompt_tokens") is None
+    assert metrics["extra"]["collection_incomplete"] is True
+
+
 def test_missing_usage_withholds_totals(tmp_path: Path):
     inspection = {
         "session": {"id": "ses_miss0000000000000000000001"},
@@ -1714,6 +1767,36 @@ def test_model_contamination_is_recorded_not_silently_used(tmp_path: Path):
         is False
     )
     assert context.n_input_tokens == 5
+
+
+def test_restricted_model_check_uses_last_duplicate_record(tmp_path: Path):
+    messages = [
+        {
+            "type": "assistant",
+            "id": "msg_replayed",
+            "model": {"id": "other-model", "providerID": "litellm"},
+            "time": {"created": 1, "completed": 2},
+            "finish": "stop",
+            "tokens": {"input": 1, "output": 1, "reasoning": 0},
+            "content": [{"type": "text", "text": "old"}],
+        },
+        {
+            "type": "assistant",
+            "id": "msg_replayed",
+            "model": {"id": "kimi-k3", "providerID": "litellm"},
+            "time": {"created": 1, "completed": 2},
+            "finish": "stop",
+            "tokens": {"input": 1, "output": 1, "reasoning": 0},
+            "content": [{"type": "text", "text": "final"}],
+        },
+    ]
+    agent = make_agent(tmp_path, model_name="litellm/kimi-k3", restrict_model=True)
+    write_inspections(
+        tmp_path,
+        [{"session": {"id": "ses_replayed"}, "messages": messages}],
+    )
+
+    agent.populate_context_post_run(AgentContext())
 
 
 def test_restricted_child_model_mismatch_hard_fails_whole_tree(tmp_path: Path):
@@ -2300,6 +2383,25 @@ def test_inspect_session_collects_background_terminal(tmp_path: Path, monkeypatc
     assert inspection["messages"] == [{"id": "msg_1"}]
 
 
+def test_inspect_session_uses_snapshot_active_ids(monkeypatch):
+    server = runner_module.OpenCodeV2Server(
+        binary="opencode", cwd="/tmp", password="pw", env={}
+    )
+    monkeypatch.setattr(server, "collect_messages", lambda _session_id: [])
+    monkeypatch.setattr(server, "inbox_items", lambda _session_id: [])
+    monkeypatch.setattr(
+        server,
+        "running_session_ids",
+        lambda: (_ for _ in ()).throw(AssertionError("active set fetched twice")),
+    )
+
+    inspection = runner_module.inspect_session(
+        server, {"id": "ses_snapshot"}, active_ids={"ses_snapshot"}
+    )
+
+    assert inspection["active"] == {"type": "running"}
+
+
 def test_session_active_state_distinguishes_running(monkeypatch):
     responses = {
         "http://127.0.0.1:1/api/session/active": (
@@ -2326,6 +2428,31 @@ def test_runner_records_server_stderr_and_events(tmp_path: Path):
     records = OpenCodeV2._read_jsonl(events_path)
     assert len(records) == 2
     assert records[1]["type"] == "cli-stdout"
+
+
+def test_private_state_excludes_credentials_and_symlinks(tmp_path: Path):
+    state = tmp_path / "state"
+    state.mkdir()
+    (state / "session.db").write_text("safe")
+    (state / "auth.json").write_text("secret")
+    secret = tmp_path / "outside-secret"
+    secret.write_text("secret")
+    (state / "linked-secret").symlink_to(secret)
+
+    copied = runner_module._preserve_private_state(
+        {"XDG_STATE_HOME": str(state)}, tmp_path / "logs"
+    )
+
+    assert any(path.endswith("session.db") for path in copied)
+    assert not any(path.endswith("auth.json") for path in copied)
+    assert not any(path.endswith("linked-secret") for path in copied)
+
+
+def test_cli_capture_line_is_bounded():
+    line = runner_module._bounded_cli_line(
+        "x" * (runner_module.CLI_CAPTURE_MAX_LINE_BYTES * 2)
+    )
+    assert len(line.encode()) <= runner_module.CLI_CAPTURE_MAX_LINE_BYTES
 
 
 def test_preflight_evidence_redacts_env_urls_and_header_credentials():
