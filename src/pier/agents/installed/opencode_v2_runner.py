@@ -956,7 +956,6 @@ def _collection_complete(
 def _raise_runner_failure(
     pending_error: BaseException | None,
     run_error: str | None,
-    _collection_errors: list[str],
 ) -> None:
     """Fail only the agent execution; collection gaps stay in the manifest."""
     if pending_error is not None:
@@ -964,8 +963,6 @@ def _raise_runner_failure(
     if run_error:
         raise SystemExit(run_error)
     # Observational gaps withhold complete aggregates through runner-result.
-    # Keeping the argument explicit makes it hard to accidentally restore the
-    # former behavior where any collection diagnostic discarded a paid run.
 
 
 def _collect_tree(
@@ -1499,7 +1496,7 @@ def main() -> None:
     }
     (logs_dir / "runner-result.json").write_text(json.dumps(result, indent=2))
 
-    _raise_runner_failure(pending_error, run_error, collection_errors)
+    _raise_runner_failure(pending_error, run_error)
 
 
 if __name__ == "__main__":

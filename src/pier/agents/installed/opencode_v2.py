@@ -471,6 +471,9 @@ class OpenCodeV2(BaseInstalledAgent):
         PA1 policy: a trial measures exactly one model. Every provider entry,
         the top-level default selection, and every agent override must either
         be the benchmark model or absent (inherit it).
+
+        Agent models have already been pinned at this point. Rechecking them
+        here is deliberate defense in depth against future merge-order changes.
         """
         provider, model_id, _ = self._model_parts()
         selection = self.model_name or f"{provider}/{model_id}"
@@ -1871,6 +1874,22 @@ class OpenCodeV2(BaseInstalledAgent):
         data["final_metrics"] = metrics
         return Trajectory.model_validate(data)
 
+    @staticmethod
+    def _populate_context_if_usage_known(
+        context: AgentContext, metrics: FinalMetrics | None
+    ) -> None:
+        """Keep withheld token totals unknown instead of coercing them to zero."""
+        if metrics is None or any(
+            value is None
+            for value in (
+                metrics.total_prompt_tokens,
+                metrics.total_completion_tokens,
+                metrics.total_cached_tokens,
+            )
+        ):
+            return
+        populate_context_from_final_metrics(context, metrics)
+
     # -- entry point -------------------------------------------------------
 
     def _model_restriction_mismatches(
@@ -1926,6 +1945,9 @@ class OpenCodeV2(BaseInstalledAgent):
 
     def populate_context_post_run(self, context: AgentContext) -> None:
         """Convert the runner's recorded sessions into ATIF trajectories."""
+        runner_result = self._read_json(
+            self.logs_dir / "opencode-v2" / "runner-result.json"
+        )
         inspections = self._read_jsonl(
             self.logs_dir / "opencode-v2" / "opencode-v2-sessions.jsonl"
         )
@@ -1941,7 +1963,73 @@ class OpenCodeV2(BaseInstalledAgent):
             )
         inspections = valid_inspections
         if not inspections:
-            self.logger.debug("No OpenCode V2 session inspections found")
+            raw_collection_errors = (runner_result or {}).get("collection_errors")
+            collection_errors = [
+                str(error)
+                for error in (
+                    raw_collection_errors
+                    if isinstance(raw_collection_errors, list)
+                    else []
+                )
+            ]
+            if not collection_errors:
+                collection_errors = [
+                    "runner result manifest missing"
+                    if runner_result is None
+                    else "no collectible session records"
+                ]
+            self.logger.error(
+                "No OpenCode V2 session inspections found: %s",
+                "; ".join(collection_errors),
+            )
+            recorded_root_id = (
+                str(runner_result.get("root_id"))
+                if runner_result and runner_result.get("root_id")
+                else None
+            )
+            stub = Trajectory(
+                schema_version="ATIF-v1.7",
+                session_id=recorded_root_id,
+                trajectory_id=recorded_root_id,
+                agent=Agent(
+                    name=self.name(),
+                    version=self.version() or "unknown",
+                    model_name=self.model_name,
+                ),
+                steps=[
+                    Step(
+                        step_id=1,
+                        source="system",
+                        message=(
+                            "OpenCode completed without collectible session records."
+                        ),
+                        extra={
+                            "collection_gap": True,
+                            "collection_errors": collection_errors,
+                        },
+                    )
+                ],
+                final_metrics=FinalMetrics(
+                    total_steps=1,
+                    extra={
+                        "metrics_complete": False,
+                        "tree_metrics_complete": False,
+                        "tree_cost_complete": False,
+                        "collection_incomplete": True,
+                        "collection_errors": collection_errors,
+                    },
+                ),
+            )
+            trajectory_path = self.logs_dir / "trajectory.json"
+            try:
+                trajectory_path.write_text(format_trajectory_json(stub.to_json_dict()))
+            except OSError as exc:
+                self.logger.error(
+                    "Failed to write incomplete trajectory file %s: %s",
+                    trajectory_path,
+                    exc,
+                )
+            self._populate_context_if_usage_known(context, stub.final_metrics)
             return
 
         restriction_mismatches = self._model_restriction_mismatches(inspections)
@@ -1956,9 +2044,6 @@ class OpenCodeV2(BaseInstalledAgent):
             self._raise_model_restriction_failure(restriction_mismatches)
             return
 
-        runner_result = self._read_json(
-            self.logs_dir / "opencode-v2" / "runner-result.json"
-        )
         recorded_root_id = (
             str(runner_result.get("root_id"))
             if runner_result and runner_result.get("root_id")
@@ -2011,6 +2096,5 @@ class OpenCodeV2(BaseInstalledAgent):
                 f"Failed to write trajectory file {trajectory_path}: {exc}"
             )
 
-        if embedded.final_metrics:
-            populate_context_from_final_metrics(context, embedded.final_metrics)
+        self._populate_context_if_usage_known(context, embedded.final_metrics)
         self._raise_model_restriction_failure(restriction_mismatches)

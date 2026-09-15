@@ -835,13 +835,15 @@ def test_run_copies_skills_into_isolated_config_dir(tmp_path: Path):
 
     asyncio.run(agent.run("do the thing", environment, AgentContext()))
 
-    setup_command = next(
-        call["command"]
+    setup_call = next(
+        call
         for call in environment.exec_calls
         if 'mkdir -p "$OPENCODE_CONFIG_DIR/skills"' in call["command"]
     )
+    setup_command = setup_call["command"]
     assert "/mnt/task-skills/*" in setup_command
     assert "~/.config/opencode/skills" not in setup_command
+    assert setup_call["env"]["OPENCODE_CONFIG_DIR"].endswith("/config/opencode")
 
 
 def test_run_passes_model_restriction_to_runner(tmp_path: Path):
@@ -1380,6 +1382,37 @@ def test_incomplete_runner_manifest_withholds_aggregate(tmp_path: Path):
     assert metrics["extra"]["collection_incomplete"] is True
 
 
+def test_empty_collection_writes_loud_incomplete_trajectory(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+):
+    runner_dir = tmp_path / "opencode-v2"
+    runner_dir.mkdir()
+    (runner_dir / "runner-result.json").write_text(
+        json.dumps(
+            {
+                "collection_complete": False,
+                "collection_errors": ["root session unresolved"],
+            }
+        )
+    )
+    context = AgentContext()
+    caplog.set_level(logging.ERROR)
+
+    make_agent(tmp_path).populate_context_post_run(context)
+
+    trajectory = json.loads((tmp_path / "trajectory.json").read_text())
+    assert trajectory["steps"][0]["extra"] == {
+        "collection_gap": True,
+        "collection_errors": ["root session unresolved"],
+    }
+    metrics = trajectory["final_metrics"]
+    assert metrics["extra"]["metrics_complete"] is False
+    assert metrics["extra"]["collection_incomplete"] is True
+    assert "total_prompt_tokens" not in metrics
+    assert context.n_input_tokens is None
+    assert "root session unresolved" in caplog.text
+
+
 def test_missing_usage_withholds_totals(tmp_path: Path):
     inspection = {
         "session": {"id": "ses_miss0000000000000000000001"},
@@ -1408,8 +1441,7 @@ def test_missing_usage_withholds_totals(tmp_path: Path):
     assert final.get("total_completion_tokens") is None
     assert final.get("total_cached_tokens") is None
     assert final.get("total_cost_usd") is None
-    # populate_context_from_final_metrics coerces withheld totals to 0.
-    assert context.n_input_tokens == 0
+    assert context.n_input_tokens is None
     assert context.cost_usd is None
 
 
@@ -2549,14 +2581,10 @@ def test_collection_is_incomplete_when_owned_server_died():
 
 
 def test_collection_errors_do_not_fail_successful_agent_execution():
-    runner_module._raise_runner_failure(
-        None, None, ["session tree did not become terminal"]
-    )
+    runner_module._raise_runner_failure(None, None)
 
     with pytest.raises(SystemExit, match="CLI exited"):
-        runner_module._raise_runner_failure(
-            None, "OpenCode CLI exited with status 1", ["partial collection"]
-        )
+        runner_module._raise_runner_failure(None, "OpenCode CLI exited with status 1")
 
 
 def test_root_id_uses_retained_cli_candidates_after_event_tail_eviction():
