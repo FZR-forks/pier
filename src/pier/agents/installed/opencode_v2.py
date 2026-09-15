@@ -70,6 +70,7 @@ _PROVIDER_ENV_KEYS: dict[str, tuple[str, ...]] = {
     "amazon-bedrock": (
         "AWS_ACCESS_KEY_ID",
         "AWS_SECRET_ACCESS_KEY",
+        "AWS_SESSION_TOKEN",
         "AWS_REGION",
     ),
     "anthropic": ("ANTHROPIC_API_KEY",),
@@ -202,6 +203,11 @@ class OpenCodeV2(BaseInstalledAgent):
         self._opencode_v2_checksums = checksums
         self._restrict_model = restrict_model
         self._instruction: str | None = None
+        provider, _, _ = self._model_parts()
+        self._log_redacted_env_keys = set(_PROVIDER_ENV_KEYS.get(provider, ()))
+        self._log_redacted_env_keys.update(
+            _env_template_values(self._opencode_v2_config)
+        )
 
     @staticmethod
     def name() -> str:
@@ -214,6 +220,13 @@ class OpenCodeV2(BaseInstalledAgent):
         value = stdout.strip()
         match = re.fullmatch(r"(?:opencode\s+)?v?(.+)", value)
         return match.group(1) if match else value
+
+    def _process_env_for_logging(self, env: dict[str, str] | None) -> dict[str, str]:
+        logged = super()._process_env_for_logging(env)
+        for key in self._log_redacted_env_keys:
+            if key in logged:
+                logged[key] = "<redacted>"
+        return logged
 
     # ------------------------------------------------------------------
     # Configuration
@@ -670,6 +683,8 @@ class OpenCodeV2(BaseInstalledAgent):
     ) -> None:
         provider, _, _ = self._model_parts()
         self._instruction = instruction
+        runtime_config = self._build_runtime_config(include_mcp=True)
+        self._log_redacted_env_keys.update(_env_template_values(runtime_config))
         # Standard trial creation builds the policy before start; repeat the
         # resolution here so direct adapter use cannot accept a URL template
         # that the filtered-egress policy would be unable to resolve.
@@ -683,9 +698,7 @@ class OpenCodeV2(BaseInstalledAgent):
 
         # The generated config resolves `{env:NAME}` templates against the
         # process environment, so every referenced variable must be present.
-        for name, placeholder in _env_template_values(
-            self._build_runtime_config(include_mcp=True)
-        ).items():
+        for name, placeholder in _env_template_values(runtime_config).items():
             value = self._get_env(name)
             if value is not None:
                 # build_process_env deliberately excludes ambient host values;
@@ -696,7 +709,7 @@ class OpenCodeV2(BaseInstalledAgent):
                     f"opencode_v2_config references {placeholder} but {name} is not set"
                 )
 
-        config = self._build_runtime_config(include_mcp=True)
+        config = runtime_config
         config_json = json.dumps(config, indent=2)
         # Every trial gets private global/config/data/state directories. The
         # task workdir remains the environment's actual cwd so OpenCode edits

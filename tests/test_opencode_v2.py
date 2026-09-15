@@ -2,6 +2,7 @@
 
 import copy
 import json
+import logging
 import os
 import signal
 import subprocess
@@ -550,12 +551,53 @@ def test_run_forwards_ambient_config_template_values(tmp_path: Path, monkeypatch
     )
 
 
+def test_config_template_values_are_redacted_only_from_debug_metadata(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+):
+    secret = "credential-that-must-not-enter-debug-metadata"
+    monkeypatch.setenv("CUSTOM_PROVIDER_HEADER", secret)
+    environment = FakeEnvironment()
+    agent = make_agent(
+        tmp_path,
+        opencode_v2_config={
+            "providers": {
+                "litellm": {
+                    "settings": {
+                        "headers": {"X-Custom": "{env:CUSTOM_PROVIDER_HEADER}"}
+                    }
+                }
+            }
+        },
+    )
+    caplog.set_level(logging.DEBUG)
+
+    import asyncio
+
+    asyncio.run(agent.run("do the thing", environment, AgentContext()))
+
+    assert environment.exec_calls
+    assert all(
+        call["env"]["CUSTOM_PROVIDER_HEADER"] == secret
+        for call in environment.exec_calls
+    )
+    env_records = [record for record in caplog.records if hasattr(record, "env")]
+    assert env_records
+    assert all(secret not in repr(record.__dict__) for record in env_records)
+    assert any(
+        record.env.get("CUSTOM_PROVIDER_HEADER") == "<redacted>"
+        for record in env_records
+    )
+
+
 @pytest.mark.parametrize(
     ("model_name", "env_name"),
     [
         ("google/gemini-test", "GOOGLE_API_KEY"),
         ("google/gemini-test", "GOOGLE_GENAI_USE_VERTEXAI"),
         ("llama/llama-test", "LLAMA_API_KEY"),
+        ("amazon-bedrock/claude-test", "AWS_SESSION_TOKEN"),
     ],
 )
 def test_run_forwards_v1_provider_environment_parity(
