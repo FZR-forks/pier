@@ -1,0 +1,113 @@
+{
+  "root": {
+    "session": {
+      "id": "ses_root0000000000000000000001",
+      "projectID": "proj_benchmark",
+      "cost": 3.0,
+      "tokens": {
+        "input": 100,
+        "output": 30,
+        "reasoning": 20,
+        "cache": {"read": 10, "write": 11}
+      },
+      "time": {"created": 1789400000000, "updated": 1789400600000}
+    },
+    "messages": [
+      {
+        "type": "user",
+        "id": "msg_u1",
+        "text": "fix the bug",
+        "time": {"created": 1789400000000}
+      },
+      {
+        "type": "assistant",
+        "id": "msg_a1",
+        "agent": "build",
+        "model": {"id": "kimi-k3", "providerID": "litellm"},
+        "time": {"created": 1789400001000, "completed": 1789400010000},
+        "finish": "tool-calls",
+        "cost": 1.0,
+        "tokens": {
+          "input": 100,
+          "output": 10,
+          "reasoning": 5,
+          "cache": {"read": 10, "write": 11}
+        },
+        "content": [
+          {"type": "reasoning", "text": "thinking about the bug"},
+          {
+            "type": "tool",
+            "id": "t1",
+            "name": "bash",
+            "executed": true,
+            "time": {"created": 1789400002000},
+            "state": {
+              "status": "completed",
+              "input": {"command": "ls"},
+              "content": [{"type": "text", "text": "file.py"}]
+            }
+          }
+        ]
+      },
+      {
+        "type": "assistant",
+        "id": "msg_a2",
+        "agent": "build",
+        "model": {"id": "kimi-k3", "providerID": "litellm"},
+        "time": {"created": 1789400020000, "completed": 1789400030000},
+        "finish": "stop",
+        "cost": 2.0,
+        "tokens": {
+          "input": 0,
+          "output": 20,
+          "reasoning": 15,
+          "cache": {"read": 0, "write": 0}
+        },
+        "content": [{"type": "text", "text": "all done"}]
+      }
+    ],
+    "active": null,
+    "terminal": null
+  },
+  "child": {
+    "session": {
+      "id": "ses_child0000000000000000000001",
+      "parentID": "ses_root0000000000000000000001",
+      "projectID": "proj_benchmark",
+      "cost": 1.5,
+      "tokens": {
+        "input": 60,
+        "output": 40,
+        "reasoning": 30,
+        "cache": {"read": 20, "write": 22}
+      },
+      "time": {"created": 1789400005000, "updated": 1789400500000}
+    },
+    "messages": [
+      {
+        "type": "user",
+        "id": "msg_cu1",
+        "text": "explore the tests",
+        "time": {"created": 1789400005000}
+      },
+      {
+        "type": "assistant",
+        "id": "msg_ca1",
+        "agent": "explore",
+        "model": {"id": "kimi-k3", "providerID": "litellm"},
+        "time": {"created": 1789400060000, "completed": 1789400070000},
+        "finish": "stop",
+        "cost": 1.5,
+        "tokens": {
+          "input": 60,
+          "output": 40,
+          "reasoning": 30,
+          "cache": {"read": 20, "write": 22}
+        },
+        "content": [{"type": "text", "text": "tests explored"}]
+      }
+    ],
+    "active": null,
+    "terminal": null
+  }
+}

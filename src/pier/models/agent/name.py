@@ -13,6 +13,7 @@ class AgentName(str, Enum):
     PI = "pi"
     SWE_AGENT = "swe-agent"
     OPENCODE = "opencode"
+    OPENCODE_V2 = "opencode-v2"
 
     @classmethod
     def values(cls) -> set[str]:
