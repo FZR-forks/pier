@@ -2419,6 +2419,56 @@ def test_preflight_rejects_subagent_model_when_restricted(tmp_path: Path, monkey
         )
 
 
+def test_preflight_rejects_inherited_contradictory_model_limits(
+    tmp_path: Path, monkeypatch
+):
+    config_path = tmp_path / "opencode.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "providers": {
+                    "litellm": {
+                        "models": {
+                            "gpt-5.6-luna": {
+                                "limit": {"context": 272000, "output": 128000}
+                            }
+                        }
+                    }
+                }
+            }
+        )
+    )
+    server = runner_module.OpenCodeV2Server(
+        binary="opencode", cwd="/tmp", password="pw", env={}
+    )
+
+    def locations(_server, endpoint):
+        if endpoint == "model":
+            return [
+                {
+                    "providerID": "litellm",
+                    "id": "gpt-5.6-luna",
+                    "variants": [{"id": "low"}],
+                    "limit": {
+                        "context": 272000,
+                        "input": 922000,
+                        "output": 128000,
+                    },
+                }
+            ]
+        return []
+
+    monkeypatch.setattr(runner_module, "_location_data", locations)
+    with pytest.raises(RuntimeError, match="limits are contradictory"):
+        runner_module.preflight_runtime(
+            server,
+            model_spec="litellm/gpt-5.6-luna#low",
+            config_file=str(config_path),
+            restrict_model=True,
+            timeout=0.01,
+        )
+
+
 # ---------------------------------------------------------------------------
 # Installation
 # ---------------------------------------------------------------------------
@@ -2441,6 +2491,7 @@ def test_install_spec_uses_configured_version_checksum_and_target_architecture(
     spec = agent.install_spec()
     assert spec.agent_name == "opencode-v2"
     assert spec.version == "2.0.3"
+    assert spec.steps[0].run == "apt-get update && apt-get install -y curl python3"
     joined = "\n".join(step.run for step in spec.steps)
     assert 'machine="$(uname -m)"' in joined
     assert "target=linux-x64" in joined

@@ -661,7 +661,7 @@ class OpenCodeV2(BaseInstalledAgent):
                 InstallStep(
                     user="root",
                     env={"DEBIAN_FRONTEND": "noninteractive"},
-                    run="apt-get update && apt-get install -y curl",
+                    run="apt-get update && apt-get install -y curl python3",
                 ),
                 InstallStep(
                     user="root",

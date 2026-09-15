@@ -640,6 +640,7 @@ def preflight_runtime(
         ((config.get("providers") or {}).get(provider_id) or {}).get("models") or {}
     ).get(model_id) or {}
     expected_body = expected_model.get("body") or {}
+    expected_limit = expected_model.get("limit") or {}
     configured_agents = config.get("agents") or {}
 
     deadline = time.monotonic() + timeout
@@ -673,6 +674,27 @@ def preflight_runtime(
                         f"resolved model body {key!r} is {resolved_body.get(key)!r}, "
                         f"expected {value!r}"
                     )
+            resolved_limit = selected.get("limit") or {}
+            for key, value in expected_limit.items():
+                if resolved_limit.get(key) != value:
+                    raise RuntimeError(
+                        f"resolved model limit {key!r} is "
+                        f"{resolved_limit.get(key)!r}, expected {value!r}"
+                    )
+            context_limit = resolved_limit.get("context")
+            input_limit = resolved_limit.get("input")
+            output_limit = resolved_limit.get("output")
+            if (
+                isinstance(context_limit, int)
+                and isinstance(input_limit, int)
+                and isinstance(output_limit, int)
+                and input_limit + output_limit > context_limit
+            ):
+                raise RuntimeError(
+                    "resolved model limits are contradictory: "
+                    f"input ({input_limit}) + output ({output_limit}) exceeds "
+                    f"context ({context_limit})"
+                )
 
             by_id = {str(item.get("id")): item for item in agents if item.get("id")}
             resolved_agents: list[dict[str, Any]] = []
