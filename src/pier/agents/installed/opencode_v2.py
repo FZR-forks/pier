@@ -1044,8 +1044,9 @@ class OpenCodeV2(BaseInstalledAgent):
         messages = self._dedupe_messages(
             raw_messages if isinstance(raw_messages, list) else []
         )
-        malformed_messages = not isinstance(raw_messages, list) or any(
-            not isinstance(message, dict) for message in raw_messages
+        malformed_messages = bool(inspection.get("_malformed_messages")) or (
+            not isinstance(raw_messages, list)
+            or any(not isinstance(message, dict) for message in raw_messages)
         )
 
         steps: list[Step] = []
@@ -1587,11 +1588,15 @@ class OpenCodeV2(BaseInstalledAgent):
         for inspection in inspections:
             inspection = copy.deepcopy(inspection)
             session_id = str((inspection.get("session") or {}).get("id") or "")
-            for message in inspection.get("messages") or []:
+            raw_messages = inspection.get("messages")
+            inspection["_malformed_messages"] = not isinstance(
+                raw_messages, list
+            ) or any(not isinstance(message, dict) for message in raw_messages)
+            for message in raw_messages if isinstance(raw_messages, list) else []:
                 if isinstance(message, dict) and session_id:
                     message.setdefault("sessionID", session_id)
             inspection["messages"] = self._dedupe_messages(
-                inspection.get("messages") or []
+                raw_messages if isinstance(raw_messages, list) else []
             )
             trajectory = self._convert_session_to_trajectory(inspection, parent_ids)
             if trajectory is not None:

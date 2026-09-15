@@ -590,6 +590,16 @@ def dump_jsonl(path: Path, records: list[dict]) -> None:
     )
 
 
+def _persist_root_candidates(
+    path: Path, payload: dict[str, Any], errors: list[str]
+) -> None:
+    """Retain root candidates without interrupting CLI stdout collection."""
+    try:
+        path.write_text(json.dumps(payload, indent=2) + "\n")
+    except OSError as error:
+        errors.append(f"root candidate persistence: {type(error).__name__}: {error}")
+
+
 def _redact(value: Any) -> Any:
     """Remove credential-shaped values from persisted preflight evidence."""
     if isinstance(value, dict):
@@ -1259,20 +1269,16 @@ def main() -> None:
                                 # Persist the CLI-supplied ID while execution
                                 # is in progress. Final collection validates it
                                 # against private server metadata.
-                                (
-                                    logs_dir / "opencode-v2-root-candidates.json"
-                                ).write_text(
-                                    json.dumps(
-                                        {
-                                            "source": "cli-event",
-                                            "candidate_session_ids": sorted(
-                                                early_root_candidates
-                                            ),
-                                            "validated": False,
-                                        },
-                                        indent=2,
-                                    )
-                                    + "\n"
+                                _persist_root_candidates(
+                                    logs_dir / "opencode-v2-root-candidates.json",
+                                    {
+                                        "source": "cli-event",
+                                        "candidate_session_ids": sorted(
+                                            early_root_candidates
+                                        ),
+                                        "validated": False,
+                                    },
+                                    collection_errors,
                                 )
                     destination.append(_bounded_cli_line(line))
             except (OSError, ValueError):

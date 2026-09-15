@@ -1297,8 +1297,9 @@ def test_missing_variant_provenance_is_unknown_not_contamination(tmp_path: Path)
     }
     agent = make_agent(tmp_path, restrict_model=True)
     write_inspections(tmp_path, [inspection])
+    context = AgentContext()
 
-    agent.populate_context_post_run(AgentContext())
+    agent.populate_context_post_run(context)
 
     metrics = json.loads((tmp_path / "trajectory.json").read_text())["final_metrics"]
     assert metrics["extra"]["model_provenance_complete"] is False
@@ -1319,7 +1320,64 @@ def test_malformed_message_record_is_preserved_as_incomplete_gap(tmp_path: Path)
     trajectory = json.loads((tmp_path / "trajectory.json").read_text())
     assert trajectory["steps"][0]["extra"]["collection_gap"] is True
     assert trajectory["final_metrics"]["extra"]["metrics_complete"] is False
+    assert trajectory["final_metrics"]["extra"]["unfinished"] is True
     assert "total_prompt_tokens" not in trajectory["final_metrics"]
+
+
+def test_malformed_message_mixed_with_valid_usage_withholds_totals(tmp_path: Path):
+    inspection = {
+        "session": {"id": "ses_mixedmessage0000000000000001"},
+        "messages": [
+            {
+                "type": "assistant",
+                "id": "msg_valid",
+                "model": {
+                    "id": "kimi-k3",
+                    "providerID": "litellm",
+                    "variant": "max",
+                },
+                "time": {"created": 1, "completed": 2},
+                "finish": "stop",
+                "tokens": {
+                    "input": 7,
+                    "output": 3,
+                    "reasoning": 1,
+                    "cache": {"read": 0, "write": 0},
+                },
+                "content": [{"type": "text", "text": "partial evidence"}],
+            },
+            "malformed",
+        ],
+    }
+    agent = make_agent(tmp_path, restrict_model=True)
+    write_inspections(tmp_path, [inspection])
+    context = AgentContext()
+
+    agent.populate_context_post_run(context)
+
+    trajectory = json.loads((tmp_path / "trajectory.json").read_text())
+    assert trajectory["steps"][0]["message"] == "partial evidence"
+    assert trajectory["final_metrics"]["extra"]["metrics_complete"] is False
+    assert trajectory["final_metrics"]["extra"]["unfinished"] is True
+    assert "total_prompt_tokens" not in trajectory["final_metrics"]
+    assert context.n_input_tokens is None
+
+
+def test_root_candidate_write_failure_is_recorded(tmp_path: Path, monkeypatch):
+    errors: list[str] = []
+
+    def fail_write(_path: Path, _contents: str) -> None:
+        raise OSError("disk unavailable")
+
+    monkeypatch.setattr(Path, "write_text", fail_write)
+
+    runner_module._persist_root_candidates(
+        tmp_path / "opencode-v2-root-candidates.json",
+        {"candidate_session_ids": ["ses_root"]},
+        errors,
+    )
+
+    assert errors == ["root candidate persistence: OSError: disk unavailable"]
 
 
 def test_missing_runner_manifest_withholds_aggregate(tmp_path: Path):
