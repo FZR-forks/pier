@@ -43,6 +43,8 @@ INSPECT_ATTEMPTS = 3
 DEFAULT_SETTLE_SECONDS = 3600.0
 SESSION_WAIT_REQUEST_SECONDS = 30.0
 SETTLE_INTERVAL_SECONDS = 1.0
+RAW_PAGE_LIMIT = 512
+RAW_PAGE_BYTES_LIMIT = 16 * 1024 * 1024
 
 
 def auth_header(password: str) -> str:
@@ -145,6 +147,52 @@ class OpenCodeV2Server:
         self._stderr_thread: threading.Thread | None = None
         self.collection_deadline: float | None = None
         self.raw_pages: list[dict[str, Any]] = []
+        self._raw_page_sizes: list[int] = []
+        self._raw_page_digests: list[str] = []
+        self._raw_page_hashes: set[str] = set()
+        self._raw_page_bytes = 0
+        self.raw_pages_dropped = 0
+        self.raw_pages_deduplicated = 0
+        self.raw_pages_oversize = 0
+
+    def _record_raw_page(self, record: dict[str, Any]) -> None:
+        """Keep a bounded, de-duplicated tail of raw HTTP page evidence."""
+        encoded = json.dumps(
+            record, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        ).encode()
+        digest = hashlib.sha256(encoded).hexdigest()
+        if digest in self._raw_page_hashes:
+            self.raw_pages_deduplicated += 1
+            return
+        if len(encoded) > RAW_PAGE_BYTES_LIMIT:
+            self.raw_pages_oversize += 1
+            record = {
+                "endpoint": str(record.get("endpoint") or "")[:2048],
+                "status": record.get("status"),
+                "oversize_page": {
+                    "encoded_bytes": len(encoded),
+                    "sha256": digest,
+                    "response_omitted": True,
+                },
+            }
+            encoded = json.dumps(
+                record, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+            ).encode()
+        self.raw_pages.append(record)
+        self._raw_page_sizes.append(len(encoded))
+        self._raw_page_digests.append(digest)
+        self._raw_page_hashes.add(digest)
+        self._raw_page_bytes += len(encoded)
+        while len(self.raw_pages) > 1 and (
+            len(self.raw_pages) > RAW_PAGE_LIMIT
+            or self._raw_page_bytes > RAW_PAGE_BYTES_LIMIT
+        ):
+            self.raw_pages.pop(0)
+            removed_size = self._raw_page_sizes.pop(0)
+            removed_digest = self._raw_page_digests.pop(0)
+            self._raw_page_hashes.discard(removed_digest)
+            self._raw_page_bytes -= removed_size
+            self.raw_pages_dropped += 1
 
     def _request_timeout(self, default: float) -> float:
         if self.collection_deadline is None:
@@ -228,7 +276,7 @@ class OpenCodeV2Server:
             self.password,
             timeout=self._request_timeout(60.0),
         )
-        self.raw_pages.append(
+        self._record_raw_page(
             {
                 "endpoint": "/api/session",
                 "query": dict(query),
@@ -263,7 +311,7 @@ class OpenCodeV2Server:
             self.password,
             timeout=self._request_timeout(60.0),
         )
-        self.raw_pages.append(
+        self._record_raw_page(
             {
                 "endpoint": f"/api/session/{session_id}/message",
                 "query": dict(query),
@@ -789,8 +837,9 @@ def _unfinished_records(inspections: list[dict]) -> list[str]:
 def _sessions_without_terminal_outcome(inspections: list[dict]) -> list[str]:
     missing: list[str] = []
     for inspection in inspections:
+        session_outcome = (inspection.get("session") or {}).get("outcome")
         messages = inspection.get("messages") or []
-        terminal = any(
+        terminal = session_outcome in {"succeeded", "failed", "interrupted"} or any(
             isinstance(message, dict)
             and message.get("type") == "idle"
             and message.get("outcome") in {"succeeded", "failed", "interrupted"}
@@ -801,6 +850,17 @@ def _sessions_without_terminal_outcome(inspections: list[dict]) -> list[str]:
                 str((inspection.get("session") or {}).get("id") or "unknown")
             )
     return missing
+
+
+def _collection_complete(
+    *,
+    settled: bool,
+    errors: list[str],
+    root_id: str | None,
+    server_exit_code: int | None,
+) -> bool:
+    """Whether collection proved a stable tree while its owned server lived."""
+    return settled and not errors and bool(root_id) and server_exit_code is None
 
 
 def _collect_tree(
@@ -1225,6 +1285,11 @@ def main() -> None:
         process = server.process
         if process is not None:
             server_exit_code = process.poll()
+            if server_exit_code is not None:
+                collection_errors.append(
+                    "OpenCode server exited unexpectedly before owned shutdown "
+                    f"(status {server_exit_code})"
+                )
         try:
             server.stop()
         except Exception as error:  # preserve artifacts if process cleanup misbehaves
@@ -1274,13 +1339,21 @@ def main() -> None:
         "run_error": run_error,
         "cancelled": cancelled,
         "root_id": root_id,
-        "collection_complete": settled and not collection_errors and bool(root_id),
+        "collection_complete": _collection_complete(
+            settled=settled,
+            errors=collection_errors,
+            root_id=root_id,
+            server_exit_code=server_exit_code,
+        ),
         "collection_errors": collection_errors,
         "discovered_session_ids": [
             str(item.get("session", {}).get("id")) for item in inspections
         ],
         "interrupted_sessions": interrupted,
         "server_exit_code_before_shutdown": server_exit_code,
+        "raw_pages_dropped": server.raw_pages_dropped,
+        "raw_pages_deduplicated": server.raw_pages_deduplicated,
+        "raw_pages_oversize": server.raw_pages_oversize,
         "resolved_model_sha256": (preflight or {}).get("resolved_model_sha256"),
         "private_state_artifacts": private_state_artifacts,
         "session_count": len(inspections),

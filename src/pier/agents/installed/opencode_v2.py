@@ -19,12 +19,14 @@ session, nested by their real ``parentID``.
 """
 
 import copy
+import ipaddress
 import json
 import re
 import shlex
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 from pier.agents.installed.base import (
     BaseInstalledAgent,
@@ -64,6 +66,35 @@ _RUNNER_PATH = "/installed-agent/opencode_v2_runner.py"
 # completed: a truncated (`length`) or content-filtered reply, or a provider
 # error, records real tokens and must not be dropped.
 _NON_STOP_FINISHES = ("error", "length", "content-filter")
+
+_PROVIDER_ENV_KEYS: dict[str, tuple[str, ...]] = {
+    "amazon-bedrock": (
+        "AWS_ACCESS_KEY_ID",
+        "AWS_SECRET_ACCESS_KEY",
+        "AWS_REGION",
+    ),
+    "anthropic": ("ANTHROPIC_API_KEY",),
+    "azure": ("AZURE_RESOURCE_NAME", "AZURE_API_KEY"),
+    "deepseek": ("DEEPSEEK_API_KEY",),
+    "github-copilot": ("GITHUB_TOKEN",),
+    "google": (
+        "GEMINI_API_KEY",
+        "GOOGLE_GENERATIVE_AI_API_KEY",
+        "GOOGLE_APPLICATION_CREDENTIALS",
+        "GOOGLE_CLOUD_PROJECT",
+        "GOOGLE_CLOUD_LOCATION",
+        "GOOGLE_GENAI_USE_VERTEXAI",
+        "GOOGLE_API_KEY",
+    ),
+    "groq": ("GROQ_API_KEY",),
+    "huggingface": ("HF_TOKEN",),
+    "llama": ("LLAMA_API_KEY",),
+    "mistral": ("MISTRAL_API_KEY",),
+    "openai": ("OPENAI_API_KEY", "OPENAI_BASE_URL"),
+    "opencode": ("OPENCODE_API_KEY",),
+    "openrouter": ("OPENROUTER_API_KEY",),
+    "xai": ("XAI_API_KEY",),
+}
 
 
 def _iso(timestamp_ms: Any) -> str | None:
@@ -448,19 +479,61 @@ class OpenCodeV2(BaseInstalledAgent):
 
     def network_allowlist(self) -> NetworkAllowlist:
         provider, _, _ = self._model_parts()
-        config = self._build_runtime_config(include_mcp=False)
-        urls = [self._get_env("OPENAI_BASE_URL") or ""]
-        urls.extend(collect_url_values(config.get("providers") or {}))
-        # Resolve provider base URLs expressed as native `{env:NAME}`
-        # templates. The config keeps the placeholder for OpenCode, while the
-        # network policy needs the concrete hostname before the trial starts.
-        for configured_url in list(urls):
-            match = re.fullmatch(r"\{env:([^{}]+)\}", configured_url)
-            if match and (value := self._get_env(match.group(1))):
-                urls.append(value)
+        config = self._build_runtime_config(include_mcp=True)
+        provider_config = (config.get("providers") or {}).get(provider) or {}
+        provider_urls = collect_url_values(provider_config)
+        if provider == "openai" and (base_url := self._get_env("OPENAI_BASE_URL")):
+            provider_urls.append(base_url)
+        urls = self._resolve_network_urls(provider_urls, kind="provider")
+        urls.extend(
+            self._resolve_network_urls(
+                collect_url_values(config.get("mcp") or {}), kind="MCP"
+            )
+        )
         return allowlist_from_urls(
             urls,
             default_domains=self._DEFAULT_PROVIDER_DOMAINS.get(provider, []),
+        )
+
+    def _resolve_network_urls(self, values: list[str], *, kind: str) -> list[str]:
+        """Resolve URL templates early enough to construct the egress policy."""
+        resolved: list[str] = []
+        for value in values:
+            match = re.fullmatch(r"\{env:([^{}]+)\}", value)
+            if match:
+                value = self._get_env(match.group(1)) or ""
+                if not value:
+                    raise ValueError(
+                        f"{kind} URL template {{env:{match.group(1)}}} cannot be "
+                        "resolved while constructing the network allowlist; "
+                        "provide it through agent.env"
+                    )
+            elif value.startswith("${"):
+                raise ValueError(
+                    f"{kind} URL template {value!r} is unresolved while "
+                    "constructing the network allowlist"
+                )
+            if kind == "provider":
+                self._validate_provider_url(value)
+            resolved.append(value)
+        return resolved
+
+    @staticmethod
+    def _validate_provider_url(value: str) -> None:
+        """Keep provider credentials off cleartext remote connections."""
+        parsed = urlparse(value)
+        hostname = (parsed.hostname or "").lower().rstrip(".")
+        loopback = hostname == "localhost"
+        if hostname:
+            try:
+                loopback = loopback or ipaddress.ip_address(hostname).is_loopback
+            except ValueError:
+                pass
+        if parsed.scheme == "https" or (parsed.scheme == "http" and loopback):
+            return
+        raise ValueError(
+            "Provider URLs must use HTTPS; only explicit loopback HTTP endpoints "
+            f"are allowed, got {value!r}"
         )
 
     # ------------------------------------------------------------------
@@ -492,13 +565,14 @@ class OpenCodeV2(BaseInstalledAgent):
                     run="apt-get update && apt-get install -y curl",
                 ),
                 InstallStep(
-                    user="agent",
+                    user="root",
                     run=(
                         "set -euo pipefail; "
+                        "install -d -m 755 /installed-agent; "
                         'package_dir="$(mktemp -d /tmp/opencode-v2-pkg.XXXXXX)"; '
                         "trap 'rm -rf -- \"$package_dir\"' EXIT; "
                         'archive="$package_dir/cli.tgz"; '
-                        f'curl -fsSL -o "$archive" {tarball_url}; '
+                        f'curl -fsSL -o "$archive" {shlex.quote(tarball_url)}; '
                         f"{checksum_command}"
                         'tar -xzf "$archive" -C "$package_dir"; '
                         f'install -m 755 "$package_dir/package/bin/opencode" '
@@ -531,35 +605,14 @@ class OpenCodeV2(BaseInstalledAgent):
     ) -> None:
         provider, _, _ = self._model_parts()
         self._instruction = instruction
+        # Standard trial creation builds the policy before start; repeat the
+        # resolution here so direct adapter use cannot accept a URL template
+        # that the filtered-egress policy would be unable to resolve.
+        self.network_allowlist()
 
         # Auth to the provider, exactly like V1's per-provider env forwarding.
-        provider_env_keys = {
-            "amazon-bedrock": (
-                "AWS_ACCESS_KEY_ID",
-                "AWS_SECRET_ACCESS_KEY",
-                "AWS_REGION",
-            ),
-            "anthropic": ("ANTHROPIC_API_KEY",),
-            "azure": ("AZURE_RESOURCE_NAME", "AZURE_API_KEY"),
-            "deepseek": ("DEEPSEEK_API_KEY",),
-            "github-copilot": ("GITHUB_TOKEN",),
-            "google": (
-                "GEMINI_API_KEY",
-                "GOOGLE_GENERATIVE_AI_API_KEY",
-                "GOOGLE_APPLICATION_CREDENTIALS",
-                "GOOGLE_CLOUD_PROJECT",
-                "GOOGLE_CLOUD_LOCATION",
-            ),
-            "groq": ("GROQ_API_KEY",),
-            "huggingface": ("HF_TOKEN",),
-            "mistral": ("MISTRAL_API_KEY",),
-            "openai": ("OPENAI_API_KEY", "OPENAI_BASE_URL"),
-            "opencode": ("OPENCODE_API_KEY",),
-            "openrouter": ("OPENROUTER_API_KEY",),
-            "xai": ("XAI_API_KEY",),
-        }
         env = self.build_process_env()
-        for key in provider_env_keys.get(provider, ()):
+        for key in _PROVIDER_ENV_KEYS.get(provider, ()):
             if value := self._get_env(key):
                 env[key] = value
 
@@ -568,7 +621,12 @@ class OpenCodeV2(BaseInstalledAgent):
         for name, placeholder in _env_template_values(
             self._build_runtime_config(include_mcp=True)
         ).items():
-            if not self._has_env(name) and name not in environment.persistent_env:
+            value = self._get_env(name)
+            if value is not None:
+                # build_process_env deliberately excludes ambient host values;
+                # explicitly forward every value referenced by the config.
+                env[name] = value
+            elif name not in environment.persistent_env:
                 raise ValueError(
                     f"opencode_v2_config references {placeholder} but {name} is not set"
                 )
@@ -1559,11 +1617,14 @@ class OpenCodeV2(BaseInstalledAgent):
         tree_extra: dict[str, Any] = dict(
             (self_metrics.extra or {}) if self_metrics else {}
         )
-        tree_extra.setdefault(
-            "metrics_complete",
-            (self_metrics.extra or {}).get("metrics_complete") is not False
-            and self_metrics is not None,
-        )
+        # A root-only success marker must not survive on a whole-tree
+        # aggregate. A complete root plus an incomplete child would otherwise
+        # publish metrics_complete=true beside tree_metrics_complete=false.
+        # Preserve an explicit false from an incomplete root as local evidence.
+        if root_incomplete:
+            tree_extra["metrics_complete"] = False
+        else:
+            tree_extra.pop("metrics_complete", None)
         if self_metrics is not None:
             tree_extra["self_only"] = {
                 "total_prompt_tokens": self_metrics.total_prompt_tokens,
@@ -1657,6 +1718,17 @@ class OpenCodeV2(BaseInstalledAgent):
         inspections = self._read_jsonl(
             self.logs_dir / "opencode-v2" / "opencode-v2-sessions.jsonl"
         )
+        valid_inspections = [
+            record
+            for record in inspections
+            if isinstance(record.get("session"), dict) and record["session"].get("id")
+        ]
+        if len(valid_inspections) != len(inspections):
+            self.logger.warning(
+                "Ignoring %d malformed OpenCode V2 session inspection record(s)",
+                len(inspections) - len(valid_inspections),
+            )
+        inspections = valid_inspections
         if not inspections:
             self.logger.debug("No OpenCode V2 session inspections found")
             return

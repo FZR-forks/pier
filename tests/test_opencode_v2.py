@@ -3,6 +3,7 @@
 import copy
 import json
 import os
+import shlex
 import signal
 import subprocess
 import time
@@ -17,6 +18,7 @@ from pier.agents.installed.opencode_v2 import OpenCodeV2
 from pier.environments.base import ExecResult
 from pier.models.agent.context import AgentContext
 from pier.models.agent.name import AgentName
+from pier.models.task.config import MCPServerConfig
 
 FIXTURES = Path(__file__).parent / "fixtures" / "opencode_v2"
 
@@ -28,6 +30,7 @@ FIXTURES = Path(__file__).parent / "fixtures" / "opencode_v2"
 
 class FakeEnvironment:
     session_id = "trial-session"
+    persistent_env: dict[str, str] = {}
 
     def __init__(self) -> None:
         self.exec_calls: list[dict[str, Any]] = []
@@ -303,7 +306,7 @@ def test_no_output_limit_means_no_body_override(tmp_path: Path):
     assert "options" not in config["providers"]["litellm"]
 
 
-def test_caller_body_override_wins_over_generated(tmp_path: Path):
+def test_v1_provider_options_syntax_is_rejected(tmp_path: Path):
     agent = make_agent(
         tmp_path,
         opencode_v2_config={
@@ -332,9 +335,18 @@ def test_allowlist_defaults_to_provider_domain(tmp_path: Path):
 def test_allowlist_picks_up_base_url(tmp_path: Path):
     agent = make_agent(
         tmp_path,
+        model_name="openai/kimi-k3#max",
         extra_env={"OPENAI_BASE_URL": "https://gateway.example.com/v1"},
     )
     assert "gateway.example.com" in agent.network_allowlist().domains
+
+
+def test_allowlist_ignores_openai_base_url_for_other_provider(tmp_path: Path):
+    agent = make_agent(
+        tmp_path,
+        extra_env={"OPENAI_BASE_URL": "http://unrelated.example.com/v1"},
+    )
+    assert "unrelated.example.com" not in agent.network_allowlist().domains
 
 
 def test_allowlist_picks_up_config_urls(tmp_path: Path):
@@ -369,6 +381,56 @@ def test_allowlist_resolves_config_env_template(tmp_path: Path):
     )
     assert "templated-gateway.example.com" in agent.network_allowlist().domains
     assert "sk.secret.value" not in agent.network_allowlist().domains
+
+
+def test_allowlist_includes_remote_mcp_host(tmp_path: Path):
+    agent = make_agent(
+        tmp_path,
+        mcp_servers=[
+            MCPServerConfig(
+                name="docs",
+                transport="streamable-http",
+                url="https://mcp.example.com/api",
+            )
+        ],
+    )
+    assert "mcp.example.com" in agent.network_allowlist().domains
+
+
+def test_allowlist_rejects_unresolved_url_template(tmp_path: Path):
+    agent = make_agent(
+        tmp_path,
+        opencode_v2_config={
+            "providers": {
+                "litellm": {"settings": {"baseURL": "{env:TASK_ONLY_GATEWAY_URL}"}}
+            }
+        },
+    )
+    with pytest.raises(ValueError, match="provide it through agent.env"):
+        agent.network_allowlist()
+
+
+def test_provider_url_requires_https_except_loopback(tmp_path: Path):
+    remote = make_agent(
+        tmp_path,
+        opencode_v2_config={
+            "providers": {
+                "litellm": {"settings": {"baseURL": "http://gateway.example.com/v1"}}
+            }
+        },
+    )
+    with pytest.raises(ValueError, match="must use HTTPS"):
+        remote.network_allowlist()
+
+    loopback = make_agent(
+        tmp_path,
+        opencode_v2_config={
+            "providers": {
+                "litellm": {"settings": {"baseURL": "http://127.0.0.1:8080/v1"}}
+            }
+        },
+    )
+    assert "127.0.0.1" in loopback.network_allowlist().domains
 
 
 # ---------------------------------------------------------------------------
@@ -419,6 +481,55 @@ def test_run_never_passes_server_password_through_logged_exec_env(tmp_path: Path
     for call in environment.exec_calls:
         assert "OPENCODE_PASSWORD" not in (call.get("env") or {})
         assert "OPENCODE_SERVER_PASSWORD" not in (call.get("env") or {})
+
+
+def test_run_forwards_ambient_config_template_values(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("CUSTOM_PROVIDER_HEADER", "ambient-value")
+    environment = FakeEnvironment()
+    agent = make_agent(
+        tmp_path,
+        opencode_v2_config={
+            "providers": {
+                "litellm": {
+                    "settings": {
+                        "headers": {"X-Custom": "{env:CUSTOM_PROVIDER_HEADER}"}
+                    }
+                }
+            }
+        },
+    )
+
+    import asyncio
+
+    asyncio.run(agent.run("do the thing", environment, AgentContext()))
+
+    assert environment.exec_calls
+    assert all(
+        call["env"]["CUSTOM_PROVIDER_HEADER"] == "ambient-value"
+        for call in environment.exec_calls
+    )
+
+
+@pytest.mark.parametrize(
+    ("model_name", "env_name"),
+    [
+        ("google/gemini-test", "GOOGLE_API_KEY"),
+        ("google/gemini-test", "GOOGLE_GENAI_USE_VERTEXAI"),
+        ("llama/llama-test", "LLAMA_API_KEY"),
+    ],
+)
+def test_run_forwards_v1_provider_environment_parity(
+    tmp_path: Path, monkeypatch, model_name: str, env_name: str
+):
+    monkeypatch.setenv(env_name, "configured-value")
+    environment = FakeEnvironment()
+    agent = make_agent(tmp_path, model_name=model_name)
+
+    import asyncio
+
+    asyncio.run(agent.run("do the thing", environment, AgentContext()))
+
+    assert environment.exec_calls[-1]["env"][env_name] == "configured-value"
 
 
 def test_server_password_env_is_reserved(tmp_path: Path):
@@ -1485,6 +1596,36 @@ def test_empty_root_preserves_child_but_withholds_tree_totals(tmp_path: Path):
     assert trajectory["final_metrics"]["extra"]["tree_metrics_complete"] is False
 
 
+def test_incomplete_child_does_not_leave_root_metrics_complete_true(tmp_path: Path):
+    inspections = load_fixture()
+    inspections[1]["messages"] = []
+    agent = make_agent(tmp_path)
+    write_inspections(tmp_path, inspections)
+
+    agent.populate_context_post_run(AgentContext())
+
+    extra = json.loads((tmp_path / "trajectory.json").read_text())["final_metrics"][
+        "extra"
+    ]
+    assert extra["tree_metrics_complete"] is False
+    assert "metrics_complete" not in extra
+
+
+def test_malformed_session_line_does_not_create_unknown_root(tmp_path: Path):
+    inspections = load_fixture()
+    write_inspections(tmp_path, inspections)
+    sessions_path = tmp_path / "opencode-v2" / "opencode-v2-sessions.jsonl"
+    with sessions_path.open("a") as stream:
+        stream.write('{"session":')
+
+    context = AgentContext()
+    make_agent(tmp_path).populate_context_post_run(context)
+
+    trajectory = json.loads((tmp_path / "trajectory.json").read_text())
+    assert trajectory["trajectory_id"] == "ses_root0000000000000000000001"
+    assert context.n_input_tokens == 223
+
+
 # ---------------------------------------------------------------------------
 # Runner behavior: multipage, nested, background terminal, failure paths
 # ---------------------------------------------------------------------------
@@ -1572,6 +1713,45 @@ def test_collect_messages_follows_cursor_pages(tmp_path: Path, monkeypatch):
     )
     result = server.collect_messages("ses_1")
     assert [m["id"] for m in result] == ["msg_1", "msg_2", "msg_3"]
+
+
+def test_raw_page_evidence_is_deduplicated_and_bounded(monkeypatch):
+    monkeypatch.setattr(runner_module, "RAW_PAGE_LIMIT", 2)
+    server = runner_module.OpenCodeV2Server(
+        binary="opencode", cwd="/tmp", password="pw", env={}
+    )
+    first = {"endpoint": "/api/session", "status": 200, "response": {"n": 1}}
+    server._record_raw_page(first)
+    server._record_raw_page(first)
+    server._record_raw_page(
+        {"endpoint": "/api/session", "status": 200, "response": {"n": 2}}
+    )
+    server._record_raw_page(
+        {"endpoint": "/api/session", "status": 200, "response": {"n": 3}}
+    )
+
+    assert [item["response"]["n"] for item in server.raw_pages] == [2, 3]
+    assert server.raw_pages_deduplicated == 1
+    assert server.raw_pages_dropped == 1
+
+
+def test_oversize_raw_page_is_replaced_by_bounded_digest_marker(monkeypatch):
+    monkeypatch.setattr(runner_module, "RAW_PAGE_BYTES_LIMIT", 1024)
+    server = runner_module.OpenCodeV2Server(
+        binary="opencode", cwd="/tmp", password="pw", env={}
+    )
+    server._record_raw_page(
+        {
+            "endpoint": "/api/session/ses_1/message",
+            "status": 200,
+            "response": {"data": "x" * 4096},
+        }
+    )
+
+    assert server._raw_page_bytes <= runner_module.RAW_PAGE_BYTES_LIMIT
+    assert server.raw_pages[0]["oversize_page"]["response_omitted"] is True
+    assert server.raw_pages[0]["oversize_page"]["encoded_bytes"] > 4096
+    assert server.raw_pages_oversize == 1
 
 
 def test_message_pages_use_order_only_before_cursor(monkeypatch):
@@ -1738,6 +1918,25 @@ def test_collect_tree_timeout_interrupts_discovered_tree(monkeypatch):
     assert errors
 
 
+def test_session_metadata_outcome_is_a_terminal_state_without_idle_message():
+    inspections = [
+        {
+            "session": {"id": "ses_root", "outcome": "succeeded"},
+            "messages": [],
+        }
+    ]
+    assert runner_module._sessions_without_terminal_outcome(inspections) == []
+
+
+def test_collection_is_incomplete_when_owned_server_died():
+    assert runner_module._collection_complete(
+        settled=True, errors=[], root_id="ses_root", server_exit_code=None
+    )
+    assert not runner_module._collection_complete(
+        settled=True, errors=[], root_id="ses_root", server_exit_code=1
+    )
+
+
 def test_runner_preserves_primary_error_on_cancellation(tmp_path: Path):
     """A failed runner run must keep its artifacts for post-run diagnosis."""
 
@@ -1868,12 +2067,25 @@ def test_install_spec_pins_v2_cli_version(tmp_path: Path):
     assert "sha256sum -c" in joined
     assert "4b8c2cad67297c715adff18a569c8808b22fe23c7197fd1775bc11cbfa04022d" in joined
     assert "opencode-ai" not in joined  # V1 package never pinned
+    assert spec.steps[-1].user == "root"
+    assert "install -d -m 755 /installed-agent" in spec.steps[-1].run
 
 
 def test_install_spec_respects_explicit_version(tmp_path: Path):
     agent = make_agent(tmp_path, version="2.0.2")
     joined = "\n".join(step.run for step in agent.install_spec().steps)
     assert "2.0.2" in joined
+
+
+def test_install_spec_shell_quotes_explicit_version_url(tmp_path: Path):
+    version = "2.0.3; touch /tmp/injected"
+    agent = make_agent(tmp_path, version=version)
+    command = agent.install_spec().steps[-1].run
+    expected = (
+        "https://registry.npmjs.org/@opencode%2fcli-linux-x64/-/"
+        f"cli-linux-x64-{version}.tgz"
+    )
+    assert shlex.quote(expected) in command
 
 
 def test_version_command_uses_remote_binary(tmp_path: Path):
