@@ -23,6 +23,7 @@ import ipaddress
 import json
 import re
 import shlex
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -203,6 +204,11 @@ class OpenCodeV2(BaseInstalledAgent):
         self._opencode_v2_checksums = checksums
         self._restrict_model = restrict_model
         self._instruction: str | None = None
+        # A floating `latest` install cannot safely reuse a Docker image whose
+        # static build command may have resolved an older release. Keep this
+        # stable for one agent instance but unique across trials, and use it as
+        # the unpinned install cache key below.
+        self._unpinned_install_token = uuid.uuid4().hex
         provider, _, _ = self._model_parts()
         self._log_redacted_env_keys = set(_PROVIDER_ENV_KEYS.get(provider, ()))
         self._log_redacted_env_keys.update(
@@ -612,6 +618,11 @@ class OpenCodeV2(BaseInstalledAgent):
         return AgentInstallSpec(
             agent_name=self.name(),
             version=version,
+            cache_key=(
+                f"opencode-v2-unpinned-{self._unpinned_install_token}"
+                if not version
+                else None
+            ),
             steps=[
                 InstallStep(
                     user="root",

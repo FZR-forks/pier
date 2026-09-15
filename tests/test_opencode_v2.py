@@ -2409,6 +2409,24 @@ def test_install_spec_without_version_resolves_latest_for_generic_use(tmp_path: 
     )
 
 
+def test_unpinned_install_disables_cross_trial_layer_cache_reuse(tmp_path: Path):
+    first = OpenCodeV2(logs_dir=tmp_path / "first", model_name="litellm/kimi-k3")
+    second = OpenCodeV2(logs_dir=tmp_path / "second", model_name="litellm/kimi-k3")
+
+    assert first.install_spec().fingerprint() == first.install_spec().fingerprint()
+    assert first.install_spec().fingerprint() != second.install_spec().fingerprint()
+    assert first.install_spec().cache_key != second.install_spec().cache_key
+    assert first.install_spec().steps[-1].run == second.install_spec().steps[-1].run
+
+
+def test_pinned_install_keeps_stable_cross_trial_cache_identity(tmp_path: Path):
+    first = make_agent(tmp_path / "first")
+    second = make_agent(tmp_path / "second")
+
+    assert first.install_spec().fingerprint() == second.install_spec().fingerprint()
+    assert first.install_spec().steps[-1].run == second.install_spec().steps[-1].run
+
+
 def test_install_spec_rejects_unsafe_version(tmp_path: Path):
     agent = make_agent(tmp_path, version="2.0.3; touch /tmp/injected")
     with pytest.raises(ValueError, match="unsupported characters"):
