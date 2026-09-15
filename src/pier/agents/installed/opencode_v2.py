@@ -156,6 +156,7 @@ class OpenCodeV2(BaseInstalledAgent):
         opencode_v2_config: dict[str, Any] | None = None,
         opencode_v2_checksums: dict[str, str] | None = None,
         restrict_model: bool = False,
+        variant: str | None = None,
         **kwargs,
     ):
         extra_env = kwargs.get("extra_env") or {}
@@ -171,6 +172,10 @@ class OpenCodeV2(BaseInstalledAgent):
             )
         if not isinstance(restrict_model, bool):
             raise ValueError("restrict_model must be a boolean")
+        if variant is not None and (
+            not isinstance(variant, str) or not variant or "#" in variant
+        ):
+            raise ValueError("variant must be a non-empty string without '#'")
         if opencode_v2_config is not None and not isinstance(opencode_v2_config, dict):
             raise ValueError("opencode_v2_config must be an object")
         if opencode_v2_checksums is not None and not isinstance(
@@ -195,6 +200,7 @@ class OpenCodeV2(BaseInstalledAgent):
         )
         self._opencode_v2_checksums = checksums
         self._restrict_model = restrict_model
+        self._variant = variant
         self._instruction: str | None = None
         # A floating `latest` install cannot safely reuse a Docker image whose
         # static build command may have resolved an older release. Keep this
@@ -240,19 +246,23 @@ class OpenCodeV2(BaseInstalledAgent):
         return base
 
     def _model_parts(self) -> tuple[str, str, str | None]:
-        """Split model_name into provider, model id and optional variant."""
+        """Split model_name into provider/model and return the kwarg variant."""
         if not self.model_name or "/" not in self.model_name:
             raise ValueError("Model name must be in the format provider/model_name")
         spec = self.model_name
-        variant: str | None = None
         if "#" in spec:
-            spec, variant = spec.split("#", 1)
-            if not variant:
-                raise ValueError("Model variant after '#' must not be empty")
+            raise ValueError(
+                "model_name must not include '#'; pass variant=... instead"
+            )
         provider, model_id = spec.split("/", 1)
         if not provider or not model_id:
             raise ValueError("Model name must include non-empty provider and model")
-        return provider, model_id, variant
+        return provider, model_id, self._variant
+
+    def _model_selection(self) -> str:
+        """Return OpenCode's native provider/model#variant selection reference."""
+        provider, model_id, variant = self._model_parts()
+        return f"{provider}/{model_id}" + (f"#{variant}" if variant else "")
 
     def _resolved_variant(self) -> str | None:
         _, _, variant = self._model_parts()
@@ -371,7 +381,7 @@ class OpenCodeV2(BaseInstalledAgent):
         # `provider/model#variant` is the native V2 selection syntax; the same
         # identity must be used by the root agent, every subagent, and
         # compaction so all requests stay on one benchmark model.
-        selection = self.model_name
+        selection = self._model_selection()
         return {
             agent_id: {
                 "model": selection,
@@ -399,7 +409,7 @@ class OpenCodeV2(BaseInstalledAgent):
         """
         if not self._restrict_model or not self.model_name:
             return
-        config["model"] = self.model_name
+        config["model"] = self._model_selection()
         agents = config.setdefault("agents", {})
         if not isinstance(agents, dict):
             raise ValueError("agents must be an object")
@@ -416,7 +426,7 @@ class OpenCodeV2(BaseInstalledAgent):
             agent_config = agents.setdefault(agent_id, {})
             if not isinstance(agent_config, dict):
                 raise ValueError(f"agents.{agent_id} must be an object")
-            agent_config["model"] = self.model_name
+            agent_config["model"] = self._model_selection()
             if agent_id in {"title", "summary"}:
                 agent_config["disabled"] = True
 
@@ -476,7 +486,7 @@ class OpenCodeV2(BaseInstalledAgent):
         here is deliberate defense in depth against future merge-order changes.
         """
         provider, model_id, _ = self._model_parts()
-        selection = self.model_name or f"{provider}/{model_id}"
+        selection = self._model_selection()
         offenders: list[str] = []
 
         providers = config.get("providers")
@@ -1079,7 +1089,7 @@ class OpenCodeV2(BaseInstalledAgent):
                 if self._restrict_model and self.model_name:
                     actual_model = self._assistant_model_name(message)
                     model_status = self._model_identity_status(
-                        actual_model, self.model_name
+                        actual_model, self._model_selection()
                     )
                     if model_status == "unknown":
                         model_provenance_complete = False
@@ -1101,7 +1111,7 @@ class OpenCodeV2(BaseInstalledAgent):
                 if self._restrict_model and self.model_name:
                     actual_model = self._compaction_model_name(message)
                     model_status = self._model_identity_status(
-                        actual_model, self.model_name
+                        actual_model, self._model_selection()
                     )
                     if model_status == "unknown":
                         model_provenance_complete = False
@@ -1922,7 +1932,10 @@ class OpenCodeV2(BaseInstalledAgent):
                 # Missing persisted provenance (including a missing variant)
                 # is unknown and remains visible through trajectory metadata.
                 # Only an observed conflict proves the restriction failed.
-                if self._model_identity_status(actual, self.model_name) == "mismatch":
+                if (
+                    self._model_identity_status(actual, self._model_selection())
+                    == "mismatch"
+                ):
                     mismatches.append(f"{record_id}:{actual}")
         return list(dict.fromkeys(mismatches))
 

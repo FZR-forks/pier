@@ -56,7 +56,8 @@ class FakeEnvironment:
 
 
 def make_agent(logs_dir: Path, **kwargs: Any) -> OpenCodeV2:
-    kwargs.setdefault("model_name", "litellm/kimi-k3#max")
+    kwargs.setdefault("model_name", "litellm/kimi-k3")
+    kwargs.setdefault("variant", "max")
     kwargs.setdefault("version", "2.0.3")
     return OpenCodeV2(logs_dir=logs_dir, **kwargs)
 
@@ -381,7 +382,8 @@ def test_allowlist_defaults_to_provider_domain(tmp_path: Path):
 def test_allowlist_picks_up_base_url(tmp_path: Path):
     agent = make_agent(
         tmp_path,
-        model_name="openai/kimi-k3#max",
+        model_name="openai/kimi-k3",
+        variant="max",
         extra_env={"OPENAI_BASE_URL": "https://gateway.example.com/v1"},
     )
     assert "gateway.example.com" in agent.network_allowlist().domains
