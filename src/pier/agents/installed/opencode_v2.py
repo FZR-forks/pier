@@ -525,6 +525,16 @@ class OpenCodeV2(BaseInstalledAgent):
         provider, _, _ = self._model_parts()
         config = self._build_runtime_config(include_mcp=True)
         provider_ids = {provider}
+        top_level_model = config.get("model")
+        if top_level_model is not None:
+            if not isinstance(top_level_model, str) or "/" not in top_level_model:
+                raise ValueError(
+                    "top-level OpenCode model must use provider/model syntax"
+                )
+            top_level_provider, _ = top_level_model.split("/", 1)
+            if not top_level_provider:
+                raise ValueError("top-level OpenCode model has no provider")
+            provider_ids.add(top_level_provider)
         agents = config.get("agents") or {}
         if not isinstance(agents, dict):
             raise ValueError("agents must be an object")

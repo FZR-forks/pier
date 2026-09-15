@@ -419,6 +419,24 @@ def test_allowlist_includes_enabled_agent_provider_urls(tmp_path: Path):
     assert "child-gateway.example.com" in domains
 
 
+def test_allowlist_includes_top_level_inherited_agent_provider(tmp_path: Path):
+    agent = make_agent(
+        tmp_path,
+        opencode_v2_config={
+            "model": "openai/inherited-model#low",
+            "providers": {
+                "openai": {
+                    "settings": {"baseURL": "https://inherited-gateway.example.com/v1"}
+                }
+            },
+            # An enabled agent with no model inherits config.model.
+            "agents": {"general": {"permission": {"read": "allow"}}},
+        },
+    )
+
+    assert "inherited-gateway.example.com" in agent.network_allowlist().domains
+
+
 def test_allowlist_includes_enabled_agent_default_provider_and_openai_override(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):
@@ -1916,6 +1934,20 @@ def test_collect_sessions_follows_cursor_pages(tmp_path: Path, monkeypatch):
     assert [s["id"] for s in result] == ["ses_1", "ses_2", "ses_3", "ses_4"]
 
 
+def test_collect_sessions_rejects_repeated_cursor(monkeypatch):
+    pages = [([], "cursor-1"), ([], "cursor-1")]
+    monkeypatch.setattr(
+        runner_module.OpenCodeV2Server,
+        "page_sessions",
+        lambda self, parent_id=None, cursor=None: pages.pop(0),
+    )
+    server = runner_module.OpenCodeV2Server(
+        binary="opencode", cwd="/tmp", password="pw", env={}
+    )
+    with pytest.raises(RuntimeError, match="session pagination cursor repeated"):
+        server.collect_sessions()
+
+
 def test_collect_sessions_scoped_to_parent(tmp_path: Path, monkeypatch):
     seen: list[str | None] = []
 
@@ -1971,6 +2003,20 @@ def test_collect_messages_follows_cursor_pages(tmp_path: Path, monkeypatch):
     )
     result = server.collect_messages("ses_1")
     assert [m["id"] for m in result] == ["msg_1", "msg_2", "msg_3"]
+
+
+def test_collect_messages_rejects_repeated_cursor(monkeypatch):
+    pages = [([], "cursor-1"), ([], "cursor-1")]
+    monkeypatch.setattr(
+        runner_module.OpenCodeV2Server,
+        "page_messages",
+        lambda self, session_id, cursor=None: pages.pop(0),
+    )
+    server = runner_module.OpenCodeV2Server(
+        binary="opencode", cwd="/tmp", password="pw", env={}
+    )
+    with pytest.raises(RuntimeError, match="message pagination cursor repeated"):
+        server.collect_messages("ses_1")
 
 
 def test_raw_page_evidence_is_deduplicated_and_bounded(monkeypatch):

@@ -341,8 +341,12 @@ class OpenCodeV2Server:
         while True:
             page, next_cursor = self.page_sessions(parent_id=parent_id, cursor=cursor)
             sessions.extend(page)
-            if not next_cursor or next_cursor in seen:
+            if not next_cursor:
                 break
+            if next_cursor in seen:
+                raise RuntimeError(
+                    f"session pagination cursor repeated: {next_cursor!r}"
+                )
             seen.add(next_cursor)
             cursor = next_cursor
         return sessions
@@ -355,8 +359,12 @@ class OpenCodeV2Server:
         while True:
             page, next_cursor = self.page_messages(session_id, cursor=cursor)
             messages.extend(page)
-            if not next_cursor or next_cursor in seen:
+            if not next_cursor:
                 break
+            if next_cursor in seen:
+                raise RuntimeError(
+                    f"message pagination cursor repeated: {next_cursor!r}"
+                )
             seen.add(next_cursor)
             cursor = next_cursor
         return messages
