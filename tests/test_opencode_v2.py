@@ -454,6 +454,25 @@ def test_allowlist_ignores_disabled_agent_provider(tmp_path: Path):
     assert "disabled.example.com" not in agent.network_allowlist().domains
 
 
+def test_restricted_allowlist_does_not_admit_contaminating_agent_provider(
+    tmp_path: Path,
+):
+    agent = make_agent(
+        tmp_path,
+        restrict_model=True,
+        opencode_v2_config={
+            "providers": {
+                "openai": {
+                    "settings": {"baseURL": "https://contaminating.example.com/v1"}
+                }
+            },
+            "agents": {"general": {"model": "openai/other-model#high"}},
+        },
+    )
+
+    assert "contaminating.example.com" not in agent.network_allowlist().domains
+
+
 def test_allowlist_resolves_config_env_template(tmp_path: Path):
     agent = make_agent(
         tmp_path,
