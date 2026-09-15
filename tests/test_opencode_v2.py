@@ -402,6 +402,58 @@ def test_allowlist_picks_up_config_urls(tmp_path: Path):
     assert "gw.example.com" in agent.network_allowlist().domains
 
 
+def test_allowlist_includes_enabled_agent_provider_urls(tmp_path: Path):
+    agent = make_agent(
+        tmp_path,
+        opencode_v2_config={
+            "providers": {
+                "openai": {
+                    "settings": {"baseURL": "https://child-gateway.example.com/v1"}
+                }
+            },
+            "agents": {"general": {"model": "openai/child-model#low"}},
+        },
+    )
+
+    domains = agent.network_allowlist().domains
+    assert "child-gateway.example.com" in domains
+
+
+def test_allowlist_includes_enabled_agent_default_provider_and_openai_override(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    monkeypatch.setenv("OPENAI_BASE_URL", "https://child-openai.example.com/v1")
+    agent = make_agent(
+        tmp_path,
+        opencode_v2_config={"agents": {"general": {"model": "openai/child-model#low"}}},
+    )
+
+    domains = agent.network_allowlist().domains
+    assert "api.openai.com" in domains
+    assert "child-openai.example.com" in domains
+
+
+def test_allowlist_ignores_disabled_agent_provider(tmp_path: Path):
+    agent = make_agent(
+        tmp_path,
+        opencode_v2_config={
+            "providers": {
+                "anthropic": {
+                    "settings": {"baseURL": "https://disabled.example.com/v1"}
+                }
+            },
+            "agents": {
+                "explore": {
+                    "model": "anthropic/child-model",
+                    "disabled": True,
+                }
+            },
+        },
+    )
+
+    assert "disabled.example.com" not in agent.network_allowlist().domains
+
+
 def test_allowlist_resolves_config_env_template(tmp_path: Path):
     agent = make_agent(
         tmp_path,

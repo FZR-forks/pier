@@ -524,10 +524,44 @@ class OpenCodeV2(BaseInstalledAgent):
     def network_allowlist(self) -> NetworkAllowlist:
         provider, _, _ = self._model_parts()
         config = self._build_runtime_config(include_mcp=True)
-        provider_config = (config.get("providers") or {}).get(provider) or {}
-        provider_urls = collect_url_values(provider_config)
-        if provider == "openai" and (base_url := self._get_env("OPENAI_BASE_URL")):
-            provider_urls.append(base_url)
+        provider_ids = {provider}
+        agents = config.get("agents") or {}
+        if not isinstance(agents, dict):
+            raise ValueError("agents must be an object")
+        for agent_id, agent_config in agents.items():
+            if (
+                not isinstance(agent_config, dict)
+                or agent_config.get("disabled") is True
+            ):
+                continue
+            model = agent_config.get("model")
+            if model is None:
+                continue
+            if not isinstance(model, str) or "/" not in model:
+                raise ValueError(
+                    f"enabled OpenCode agent {agent_id!r} model must use "
+                    "provider/model syntax"
+                )
+            agent_provider, _ = model.split("/", 1)
+            if not agent_provider:
+                raise ValueError(
+                    f"enabled OpenCode agent {agent_id!r} model has no provider"
+                )
+            provider_ids.add(agent_provider)
+
+        providers = config.get("providers") or {}
+        if not isinstance(providers, dict):
+            raise ValueError("providers must be an object")
+        provider_urls: list[str] = []
+        default_domains: set[str] = set()
+        for provider_id in provider_ids:
+            provider_config = providers.get(provider_id) or {}
+            provider_urls.extend(collect_url_values(provider_config))
+            default_domains.update(self._DEFAULT_PROVIDER_DOMAINS.get(provider_id, ()))
+            if provider_id == "openai" and (
+                base_url := self._get_env("OPENAI_BASE_URL")
+            ):
+                provider_urls.append(base_url)
         urls = self._resolve_network_urls(provider_urls, kind="provider")
         urls.extend(
             self._resolve_network_urls(
@@ -536,7 +570,7 @@ class OpenCodeV2(BaseInstalledAgent):
         )
         return allowlist_from_urls(
             urls,
-            default_domains=self._DEFAULT_PROVIDER_DOMAINS.get(provider, []),
+            default_domains=default_domains,
         )
 
     def _resolve_network_urls(self, values: list[str], *, kind: str) -> list[str]:
