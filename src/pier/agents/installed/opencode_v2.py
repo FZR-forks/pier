@@ -1582,6 +1582,31 @@ class OpenCodeV2(BaseInstalledAgent):
             result.append(message)
         return result
 
+    @staticmethod
+    def _message_has_malformed_nested_fields(message: dict[str, Any]) -> bool:
+        """Reject nested shapes that conversion accesses as mappings."""
+        message_type = message.get("type")
+        if message_type in {"assistant", "compaction", "user"}:
+            if "time" in message and not isinstance(message["time"], dict):
+                return True
+
+        if message_type == "assistant":
+            content = message.get("content")
+            if content is not None and not isinstance(content, list):
+                return True
+            for part in content or []:
+                if not isinstance(part, dict):
+                    return True
+                if part.get("type") == "tool":
+                    state = part.get("state")
+                    if "state" in part and not isinstance(state, dict):
+                        return True
+        elif message_type == "tool":
+            state = message.get("state")
+            if "state" in message and not isinstance(state, dict):
+                return True
+        return False
+
     # -- tree assembly -------------------------------------------------------
 
     def _convert_inspections_to_trajectories(
@@ -1599,15 +1624,19 @@ class OpenCodeV2(BaseInstalledAgent):
             inspection = copy.deepcopy(inspection)
             session_id = str((inspection.get("session") or {}).get("id") or "")
             raw_messages = inspection.get("messages")
-            inspection["_malformed_messages"] = not isinstance(
-                raw_messages, list
-            ) or any(not isinstance(message, dict) for message in raw_messages)
+            malformed_messages = not isinstance(raw_messages, list)
+            valid_messages: list[dict[str, Any]] = []
             for message in raw_messages if isinstance(raw_messages, list) else []:
-                if isinstance(message, dict) and session_id:
+                if not isinstance(
+                    message, dict
+                ) or self._message_has_malformed_nested_fields(message):
+                    malformed_messages = True
+                    continue
+                if session_id:
                     message.setdefault("sessionID", session_id)
-            inspection["messages"] = self._dedupe_messages(
-                raw_messages if isinstance(raw_messages, list) else []
-            )
+                valid_messages.append(message)
+            inspection["_malformed_messages"] = malformed_messages
+            inspection["messages"] = self._dedupe_messages(valid_messages)
             trajectory = self._convert_session_to_trajectory(inspection, parent_ids)
             if trajectory is not None:
                 trajectories.append(trajectory)

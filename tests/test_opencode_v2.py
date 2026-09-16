@@ -1365,6 +1365,65 @@ def test_malformed_message_mixed_with_valid_usage_withholds_totals(tmp_path: Pat
     assert context.n_input_tokens is None
 
 
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        pytest.param({"time": []}, id="assistant-time"),
+        pytest.param(
+            {
+                "content": [
+                    {
+                        "type": "tool",
+                        "id": "tool_bad_state",
+                        "name": "read",
+                        "state": [],
+                    }
+                ]
+            },
+            id="assistant-tool-state",
+        ),
+    ],
+)
+def test_malformed_nested_assistant_fields_preserve_incomplete_session(
+    tmp_path: Path, overrides: dict[str, Any]
+):
+    common = {
+        "type": "assistant",
+        "model": {
+            "id": "kimi-k3",
+            "providerID": "litellm",
+            "variant": "max",
+        },
+        "time": {"created": 1, "completed": 2},
+        "finish": "stop",
+        "tokens": {
+            "input": 7,
+            "output": 3,
+            "reasoning": 1,
+            "cache": {"read": 0, "write": 0},
+        },
+        "content": [{"type": "text", "text": "partial evidence"}],
+    }
+    malformed = {**common, "id": "msg_malformed_nested", **overrides}
+    valid = {**common, "id": "msg_valid_nested"}
+    inspection = {
+        "session": {"id": "ses_malformed_nested00000000001"},
+        "messages": [valid, malformed],
+    }
+    agent = make_agent(tmp_path, restrict_model=True)
+    write_inspections(tmp_path, [inspection])
+    context = AgentContext()
+
+    agent.populate_context_post_run(context)
+
+    trajectory = json.loads((tmp_path / "trajectory.json").read_text())
+    assert trajectory["steps"][0]["message"] == "partial evidence"
+    assert trajectory["final_metrics"]["extra"]["metrics_complete"] is False
+    assert trajectory["final_metrics"]["extra"]["unfinished"] is True
+    assert "total_prompt_tokens" not in trajectory["final_metrics"]
+    assert context.n_input_tokens is None
+
+
 def test_root_candidate_write_failure_is_recorded(tmp_path: Path, monkeypatch):
     errors: list[str] = []
 
