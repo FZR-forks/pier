@@ -2249,6 +2249,73 @@ def test_server_start_preserves_readiness_error_when_cleanup_also_fails(monkeypa
     assert any("cleanup evidence" in note for note in raised.value.__notes__)
 
 
+@pytest.mark.parametrize(
+    ("statuses", "paths", "succeeds"),
+    [
+        ([200], ["api/status"], True),
+        ([404], ["api/status"], False),
+        ([401], ["api/status"], False),
+        ([503], ["api/status"], False),
+    ],
+)
+def test_server_readiness_uses_status_endpoint(monkeypatch, statuses, paths, succeeds):
+    class FakeProcess:
+        stderr: list[str] = []
+
+    monkeypatch.setattr(
+        runner_module.subprocess, "Popen", lambda *a, **k: FakeProcess()
+    )
+    monkeypatch.setattr(
+        runner_module, "wait_for_server", lambda process: "http://127.0.0.1:1"
+    )
+    calls = []
+    replies = iter(statuses)
+
+    def get(url, password, timeout):
+        calls.append(url.removeprefix("http://127.0.0.1:1/"))
+        return next(replies), "{}"
+
+    monkeypatch.setattr(runner_module, "http_get", get)
+    server = runner_module.OpenCodeV2Server("opencode", "/tmp", "pw", {})
+    stopped = []
+    monkeypatch.setattr(server, "stop", lambda: stopped.append(True))
+    if succeeds:
+        assert server.start() == "http://127.0.0.1:1"
+        assert not stopped
+    else:
+        with pytest.raises(RuntimeError, match="readiness check"):
+            server.start()
+        assert stopped == [True]
+    assert calls == paths
+
+
+@pytest.mark.parametrize(
+    ("statuses", "succeeds"),
+    [
+        ([204], True),
+        ([200], True),
+        ([404], False),
+        ([401], False),
+        ([503], False),
+    ],
+)
+def test_session_wait_uses_experimental_endpoint(monkeypatch, statuses, succeeds):
+    calls = []
+    replies = iter(statuses)
+
+    def post(url, password, payload, timeout):
+        calls.append(url)
+        assert payload == {}
+        return next(replies)
+
+    monkeypatch.setattr(runner_module, "http_post", post)
+    server = runner_module.OpenCodeV2Server("opencode", "/tmp", "pw", {})
+    server.url = "http://127.0.0.1:1"
+    assert server.wait_session("ses_test") is succeeds
+    expected = ["http://127.0.0.1:1/api/experimental/session/ses_test/wait"]
+    assert calls == expected
+
+
 def test_collect_sessions_follows_cursor_pages(tmp_path: Path, monkeypatch):
     pages = [
         ([{"id": "ses_1"}, {"id": "ses_2"}], "cursor-1"),

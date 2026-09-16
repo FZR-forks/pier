@@ -260,7 +260,7 @@ class OpenCodeV2Server:
         # do not leak the server if readiness itself fails.
         try:
             status, _ = http_get(
-                self._api_url("api/health"), self.password, timeout=10.0
+                self._api_url("api/status"), self.password, timeout=10.0
             )
             if status != 200:
                 raise RuntimeError(
@@ -433,7 +433,7 @@ class OpenCodeV2Server:
         if not self.url:
             return False
         return http_post(
-            self._api_url(f"api/session/{session_id}/wait"),
+            self._api_url(f"api/experimental/session/{session_id}/wait"),
             self.password,
             {},
             timeout=self._request_timeout(timeout),
