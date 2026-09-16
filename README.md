@@ -163,7 +163,8 @@ through your env file.
 
 **OpenCode V2** is an independent server-backed adapter selected with
 `--agent opencode-v2`. Its `model_name` is `provider/model` with an optional
-variant suffix (`provider/model#variant`). Configure the V2 native provider
+`variant` keyword argument (for example, `variant: low`); do not append it to
+`model_name`. Configure the V2 native provider
 and model schema through `opencode_v2_config`; model-level `body` is used for
 transport-specific fields such as an output-token cap. Pin the release with
 `kwargs.version`; optional target-specific SHA-256 values belong in

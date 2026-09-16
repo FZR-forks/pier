@@ -1,4 +1,4 @@
-"""Pier adapter for OpenCode V2 (``@opencode-ai/cli`` 2.x).
+"""Pier adapter for OpenCode V2 (``@opencode/cli`` 2.x).
 
 Unlike the V1 adapter, which parses ``opencode run --format=json`` stdout, the
 V2 adapter runs against an OpenCode server the runner owns. ``opencode run
@@ -72,6 +72,7 @@ _PROVIDER_ENV_KEYS: dict[str, tuple[str, ...]] = {
         "AWS_SECRET_ACCESS_KEY",
         "AWS_SESSION_TOKEN",
         "AWS_REGION",
+        "AWS_DEFAULT_REGION",
     ),
     "anthropic": ("ANTHROPIC_API_KEY",),
     "azure": ("AZURE_RESOURCE_NAME", "AZURE_API_KEY"),
@@ -147,6 +148,28 @@ class OpenCodeV2(BaseInstalledAgent):
     _CLI_EVENTS_OUTPUT = _RUNNER_LOG_DIR / "opencode-v2-cli-events.jsonl"
     _INSTRUCTION_PATH = _RUNNER_LOG_DIR / "instruction.txt"
 
+    # These values define the adapter's private process/config boundary.  A
+    # caller-supplied agent.env value must not be able to replace them after
+    # BaseInstalledAgent._exec merges its extra environment.
+    _RESERVED_ENV_KEYS = frozenset(
+        {
+            "HOME",
+            "PWD",
+            "XDG_CONFIG_HOME",
+            "XDG_DATA_HOME",
+            "XDG_STATE_HOME",
+            "OPENCODE_CONFIG",
+            "OPENCODE_CONFIG_DIR",
+            "OPENCODE_CONFIG_PROJECT_DISABLE",
+            "OPENCODE_DISABLE_MODELS_FETCH",
+            "OPENCODE_DISABLE_AUTOUPDATE",
+            "OPENCODE_PASSWORD",
+            "OPENCODE_SERVER_PASSWORD",
+            "NO_PROXY",
+            "no_proxy",
+        }
+    )
+
     # V2 default egress, mirroring V1's allowlist defaults.
     _DEFAULT_PROVIDER_DOMAINS: dict[str, list[str]] = OpenCode._DEFAULT_PROVIDER_DOMAINS
 
@@ -160,15 +183,20 @@ class OpenCodeV2(BaseInstalledAgent):
         **kwargs,
     ):
         extra_env = kwargs.get("extra_env") or {}
-        reserved_passwords = {
-            key
-            for key in ("OPENCODE_PASSWORD", "OPENCODE_SERVER_PASSWORD")
-            if key in extra_env
-        }
-        if reserved_passwords:
+        reserved_env = set(extra_env).intersection(self._RESERVED_ENV_KEYS)
+        if reserved_env:
+            if reserved_env.intersection(
+                {"OPENCODE_PASSWORD", "OPENCODE_SERVER_PASSWORD"}
+            ):
+                message = (
+                    "runner-owned server passwords cannot be supplied through agent env"
+                )
+            else:
+                message = (
+                    "adapter-owned environment cannot be supplied through agent env"
+                )
             raise ValueError(
-                "OpenCode V2 server passwords are runner-owned and cannot be "
-                "supplied through agent env: " + ", ".join(sorted(reserved_passwords))
+                "OpenCode V2 " + message + ": " + ", ".join(sorted(reserved_env))
             )
         if not isinstance(restrict_model, bool):
             raise ValueError("restrict_model must be a boolean")
@@ -207,10 +235,31 @@ class OpenCodeV2(BaseInstalledAgent):
         # stable for one agent instance but unique across trials, and use it as
         # the unpinned install cache key below.
         self._unpinned_install_token = uuid.uuid4().hex
-        provider, _, _ = self._model_parts()
-        self._log_redacted_env_keys = set(_PROVIDER_ENV_KEYS.get(provider, ()))
+        self._log_redacted_env_keys = {
+            key for keys in _PROVIDER_ENV_KEYS.values() for key in keys
+        }
+        self._log_redacted_env_keys.update(
+            key
+            for key in set(extra_env) | set(self._resolved_env_vars)
+            if self._looks_like_credential_env_key(key)
+        )
         self._log_redacted_env_keys.update(
             _env_template_values(self._opencode_v2_config)
+        )
+
+    @staticmethod
+    def _looks_like_credential_env_key(key: str) -> bool:
+        normalized = key.upper()
+        return normalized.endswith("_BASE_URL") or any(
+            marker in normalized
+            for marker in (
+                "API_KEY",
+                "TOKEN",
+                "SECRET",
+                "PASSWORD",
+                "AUTH",
+                "CREDENTIAL",
+            )
         )
 
     @staticmethod
@@ -571,12 +620,27 @@ class OpenCodeV2(BaseInstalledAgent):
         default_domains: set[str] = set()
         for provider_id in provider_ids:
             provider_config = providers.get(provider_id) or {}
-            provider_urls.extend(collect_url_values(provider_config))
+            configured_urls = collect_url_values(provider_config)
+            provider_urls.extend(configured_urls)
             default_domains.update(self._DEFAULT_PROVIDER_DOMAINS.get(provider_id, ()))
             if provider_id == "openai" and (
                 base_url := self._get_env("OPENAI_BASE_URL")
             ):
                 provider_urls.append(base_url)
+            if provider_id == "amazon-bedrock" and not configured_urls:
+                region = self._get_env("AWS_REGION") or self._get_env(
+                    "AWS_DEFAULT_REGION"
+                )
+                if region is None:
+                    raise ValueError(
+                        "amazon-bedrock requires an explicit provider URL or "
+                        "AWS_REGION/AWS_DEFAULT_REGION for the egress allowlist"
+                    )
+                if not re.fullmatch(r"[a-z0-9-]+", region):
+                    raise ValueError(
+                        "AWS region for amazon-bedrock contains unsupported characters"
+                    )
+                provider_urls.append(f"https://bedrock-runtime.{region}.amazonaws.com")
         urls = self._resolve_network_urls(provider_urls, kind="provider")
         urls.extend(
             self._resolve_network_urls(
@@ -807,8 +871,12 @@ class OpenCodeV2(BaseInstalledAgent):
         # The copied runner generates its fresh server password internally so
         # Pier never passes it through BaseInstalledAgent._exec, whose debug
         # metadata intentionally records process environments.
-        env.pop("OPENCODE_PASSWORD", None)
-        env.pop("OPENCODE_SERVER_PASSWORD", None)
+        # Explicitly shadow task-level persistent values. The runner creates
+        # its own password for the child server/CLI; an empty value here keeps
+        # a task password out of setup and runner processes.
+        for key in ("OPENCODE_PASSWORD", "OPENCODE_SERVER_PASSWORD"):
+            if key in environment.persistent_env:
+                env[key] = ""
         for key in ("NO_PROXY", "no_proxy"):
             current = env.get(key, "")
             entries = [item.strip() for item in current.split(",") if item.strip()]

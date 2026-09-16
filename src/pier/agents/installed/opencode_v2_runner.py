@@ -454,7 +454,11 @@ class OpenCodeV2Server:
         if status != 200 or not isinstance(payload, dict):
             return None
         data = payload.get("data")
-        return data if isinstance(data, list) else []
+        return (
+            data
+            if isinstance(data, list) and all(isinstance(item, dict) for item in data)
+            else None
+        )
 
     def get_session(self, session_id: str) -> dict | None:
         """Fetch one session without relying on global-list pagination."""
@@ -561,8 +565,9 @@ class OpenCodeV2Server:
             # global session list. The native point lookup avoids guessing
             # from whichever historical session happens to be newest.
             root = self.get_session(root_id)
-        if root is not None:
-            found.insert(0, root)
+        if root is None:
+            raise RuntimeError(f"root session {root_id} was not returned")
+        found.insert(0, root)
         return found
 
 

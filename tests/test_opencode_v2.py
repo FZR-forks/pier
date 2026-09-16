@@ -650,8 +650,11 @@ def test_run_never_passes_server_password_through_logged_exec_env(tmp_path: Path
 
     assert environment.exec_calls
     for call in environment.exec_calls:
-        assert "OPENCODE_PASSWORD" not in (call.get("env") or {})
-        assert "OPENCODE_SERVER_PASSWORD" not in (call.get("env") or {})
+        assert (call.get("env") or {}).get("OPENCODE_PASSWORD") in (None, "")
+        assert (call.get("env") or {}).get("OPENCODE_SERVER_PASSWORD") in (
+            None,
+            "",
+        )
 
 
 def test_run_forwards_ambient_config_template_values(tmp_path: Path, monkeypatch):
@@ -786,6 +789,8 @@ def test_run_forwards_v1_provider_environment_parity(
     tmp_path: Path, monkeypatch, model_name: str, env_name: str
 ):
     monkeypatch.setenv(env_name, "configured-value")
+    if model_name.startswith("amazon-bedrock/"):
+        monkeypatch.setenv("AWS_REGION", "us-east-1")
     environment = FakeEnvironment()
     agent = make_agent(tmp_path, model_name=model_name)
 
