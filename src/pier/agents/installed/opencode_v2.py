@@ -575,9 +575,9 @@ class OpenCodeV2(BaseInstalledAgent):
                 + "; ".join(sorted(set(offenders)))
             )
 
-    def network_allowlist(self) -> NetworkAllowlist:
+    def _effective_provider_ids(self, config: dict[str, Any]) -> set[str]:
+        """Providers reachable by the selected root and enabled configured agents."""
         provider, _, _ = self._model_parts()
-        config = self._build_runtime_config(include_mcp=True)
         provider_ids = {provider}
         top_level_model = config.get("model")
         if top_level_model is not None:
@@ -589,6 +589,7 @@ class OpenCodeV2(BaseInstalledAgent):
             if not top_level_provider:
                 raise ValueError("top-level OpenCode model has no provider")
             provider_ids.add(top_level_provider)
+
         agents = config.get("agents") or {}
         if not isinstance(agents, dict):
             raise ValueError("agents must be an object")
@@ -612,7 +613,11 @@ class OpenCodeV2(BaseInstalledAgent):
                     f"enabled OpenCode agent {agent_id!r} model has no provider"
                 )
             provider_ids.add(agent_provider)
+        return provider_ids
 
+    def network_allowlist(self) -> NetworkAllowlist:
+        config = self._build_runtime_config(include_mcp=True)
+        provider_ids = self._effective_provider_ids(config)
         providers = config.get("providers") or {}
         if not isinstance(providers, dict):
             raise ValueError("providers must be an object")
@@ -812,7 +817,6 @@ class OpenCodeV2(BaseInstalledAgent):
         environment: BaseEnvironment,
         context: AgentContext,
     ) -> None:
-        provider, _, _ = self._model_parts()
         self._instruction = instruction
         runtime_config = self._build_runtime_config(include_mcp=True)
         self._log_redacted_env_keys.update(_env_template_values(runtime_config))
@@ -821,11 +825,13 @@ class OpenCodeV2(BaseInstalledAgent):
         # that the filtered-egress policy would be unable to resolve.
         self.network_allowlist()
 
-        # Auth to the provider, exactly like V1's per-provider env forwarding.
+        # Forward ambient credentials for every provider that the effective
+        # unrestricted config can select, not just the root benchmark provider.
         env = self.build_process_env()
-        for key in _PROVIDER_ENV_KEYS.get(provider, ()):
-            if value := self._get_env(key):
-                env[key] = value
+        for provider_id in self._effective_provider_ids(runtime_config):
+            for key in _PROVIDER_ENV_KEYS.get(provider_id, ()):
+                if value := self._get_env(key):
+                    env[key] = value
 
         # The generated config resolves `{env:NAME}` templates against the
         # process environment, so every referenced variable must be present.

@@ -801,6 +801,27 @@ def test_run_forwards_v1_provider_environment_parity(
     assert environment.exec_calls[-1]["env"][env_name] == "configured-value"
 
 
+def test_run_forwards_enabled_child_provider_credentials(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "child-provider-key")
+    environment = FakeEnvironment()
+    agent = make_agent(
+        tmp_path,
+        opencode_v2_config={"agents": {"general": {"model": "anthropic/claude-test"}}},
+    )
+
+    import asyncio
+
+    asyncio.run(agent.run("do the thing", environment, AgentContext()))
+
+    assert environment.exec_calls
+    assert all(
+        call["env"]["ANTHROPIC_API_KEY"] == "child-provider-key"
+        for call in environment.exec_calls
+    )
+
+
 def test_server_password_env_is_reserved(tmp_path: Path):
     with pytest.raises(ValueError, match="runner-owned"):
         make_agent(tmp_path, extra_env={"OPENCODE_PASSWORD": "must-not-be-logged"})
