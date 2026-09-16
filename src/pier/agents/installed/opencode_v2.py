@@ -1669,6 +1669,12 @@ class OpenCodeV2(BaseInstalledAgent):
                     state = part.get("state")
                     if "state" in part and not isinstance(state, dict):
                         return True
+                    if isinstance(state, dict) and "content" in state:
+                        state_content = state["content"]
+                        if not isinstance(state_content, list) or any(
+                            not isinstance(content, dict) for content in state_content
+                        ):
+                            return True
         elif message_type == "tool":
             state = message.get("state")
             if "state" in message and not isinstance(state, dict):

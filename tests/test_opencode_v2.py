@@ -1387,6 +1387,32 @@ def test_malformed_message_mixed_with_valid_usage_withholds_totals(tmp_path: Pat
             },
             id="assistant-tool-state",
         ),
+        pytest.param(
+            {
+                "content": [
+                    {
+                        "type": "tool",
+                        "id": "tool_bad_content",
+                        "name": "read",
+                        "state": {"content": "not-a-list"},
+                    }
+                ]
+            },
+            id="assistant-tool-state-content-not-list",
+        ),
+        pytest.param(
+            {
+                "content": [
+                    {
+                        "type": "tool",
+                        "id": "tool_bad_content_member",
+                        "name": "read",
+                        "state": {"content": ["not-a-dictionary"]},
+                    }
+                ]
+            },
+            id="assistant-tool-state-content-member-not-dictionary",
+        ),
     ],
 )
 def test_malformed_nested_assistant_fields_preserve_incomplete_session(
