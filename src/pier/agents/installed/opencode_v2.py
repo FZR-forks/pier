@@ -163,6 +163,7 @@ class OpenCodeV2(BaseInstalledAgent):
             "OPENCODE_CONFIG_PROJECT_DISABLE",
             "OPENCODE_DISABLE_MODELS_FETCH",
             "OPENCODE_DISABLE_AUTOUPDATE",
+            "OPENCODE_MODELS_PATH",
             "OPENCODE_PASSWORD",
             "OPENCODE_SERVER_PASSWORD",
             "NO_PROXY",
@@ -178,6 +179,7 @@ class OpenCodeV2(BaseInstalledAgent):
         *args,
         opencode_v2_config: dict[str, Any] | None = None,
         opencode_v2_checksums: dict[str, str] | None = None,
+        model_catalog_file: str | None = None,
         restrict_model: bool = False,
         variant: str | None = None,
         **kwargs,
@@ -204,12 +206,26 @@ class OpenCodeV2(BaseInstalledAgent):
             not isinstance(variant, str) or not variant or "#" in variant
         ):
             raise ValueError("variant must be a non-empty string without '#'")
+        if restrict_model and not variant:
+            raise ValueError(
+                "restrict_model requires variant so the selectable model catalog "
+                "can be reduced to one reasoning level"
+            )
         if opencode_v2_config is not None and not isinstance(opencode_v2_config, dict):
             raise ValueError("opencode_v2_config must be an object")
         if opencode_v2_checksums is not None and not isinstance(
             opencode_v2_checksums, dict
         ):
             raise ValueError("opencode_v2_checksums must be an object")
+        if model_catalog_file is not None and not isinstance(model_catalog_file, str):
+            raise ValueError("model_catalog_file must be a path string")
+        if model_catalog_file and not restrict_model:
+            raise ValueError("model_catalog_file requires restrict_model=true")
+        if restrict_model and not model_catalog_file:
+            raise ValueError(
+                "restrict_model requires model_catalog_file so OpenCode's selectable "
+                "model catalog can be reduced to one model"
+            )
         checksums = copy.deepcopy(opencode_v2_checksums or {})
         for target, digest in checksums.items():
             if not re.fullmatch(r"linux-(?:x64|arm64)", target):
@@ -227,6 +243,7 @@ class OpenCodeV2(BaseInstalledAgent):
             opencode_v2_config or {}
         )
         self._opencode_v2_checksums = checksums
+        self._model_catalog_file = model_catalog_file
         self._restrict_model = restrict_model
         self._variant = variant
         self._instruction: str | None = None
@@ -316,6 +333,62 @@ class OpenCodeV2(BaseInstalledAgent):
     def _resolved_variant(self) -> str | None:
         _, _, variant = self._model_parts()
         return variant
+
+    @staticmethod
+    def narrow_model_catalog(
+        catalog: dict[str, Any],
+        provider_id: str,
+        model_id: str,
+        variant: str | None,
+    ) -> dict[str, Any]:
+        """Return a models.dev catalog exposing one model and reasoning variant."""
+        provider = catalog.get(provider_id)
+        if not isinstance(provider, dict):
+            raise ValueError(f"model catalog does not contain provider {provider_id!r}")
+        models = provider.get("models")
+        if not isinstance(models, dict) or not isinstance(models.get(model_id), dict):
+            raise ValueError(f"model catalog does not contain {provider_id}/{model_id}")
+
+        selected_provider = copy.deepcopy(provider)
+        selected_model = copy.deepcopy(models[model_id])
+        # Experimental modes materialize as separately selectable model IDs.
+        selected_model.pop("experimental", None)
+        if variant:
+            options = selected_model.get("reasoning_options")
+            matching_effort = False
+            if isinstance(options, list):
+                for option in options:
+                    if not isinstance(option, dict) or option.get("type") != "effort":
+                        continue
+                    values = option.get("values")
+                    if isinstance(values, list) and variant in values:
+                        matching_effort = True
+                        break
+            if not matching_effort:
+                raise ValueError(
+                    f"model catalog entry {provider_id}/{model_id} does not "
+                    f"support variant {variant!r}"
+                )
+            selected_model["reasoning_options"] = [
+                {"type": "effort", "values": [variant]}
+            ]
+        selected_provider["models"] = {model_id: selected_model}
+        return {provider_id: selected_provider}
+
+    def _narrowed_model_catalog(self) -> dict[str, Any] | None:
+        if not self._restrict_model:
+            return None
+        assert self._model_catalog_file is not None
+        try:
+            catalog = json.loads(Path(self._model_catalog_file).read_text())
+        except (OSError, json.JSONDecodeError) as exc:
+            raise ValueError(
+                f"could not read model_catalog_file {self._model_catalog_file!r}: {exc}"
+            ) from exc
+        if not isinstance(catalog, dict):
+            raise ValueError("model_catalog_file must contain a JSON object")
+        provider, model_id, variant = self._model_parts()
+        return self.narrow_model_catalog(catalog, provider, model_id, variant)
 
     def _build_providers_config(self) -> dict[str, Any]:
         """The provider settings, models and variants the run needs.
@@ -459,6 +532,16 @@ class OpenCodeV2(BaseInstalledAgent):
         if not self._restrict_model or not self.model_name:
             return
         config["model"] = self._model_selection()
+        provider, model_id, variant = self._model_parts()
+        if variant:
+            model_config = config["providers"][provider]["models"][model_id]
+            configured_variants = model_config.get("variants")
+            if isinstance(configured_variants, list):
+                model_config["variants"] = [
+                    item
+                    for item in configured_variants
+                    if isinstance(item, dict) and item.get("id") == variant
+                ]
         agents = config.setdefault("agents", {})
         if not isinstance(agents, dict):
             raise ValueError("agents must be an object")
@@ -819,6 +902,7 @@ class OpenCodeV2(BaseInstalledAgent):
     ) -> None:
         self._instruction = instruction
         runtime_config = self._build_runtime_config(include_mcp=True)
+        narrowed_catalog = self._narrowed_model_catalog()
         self._log_redacted_env_keys.update(_env_template_values(runtime_config))
         # Standard trial creation builds the policy before start; repeat the
         # resolution here so direct adapter use cannot accept a URL template
@@ -854,6 +938,7 @@ class OpenCodeV2(BaseInstalledAgent):
         session_id = re.sub(r"[^A-Za-z0-9_.-]+", "-", environment.session_id)
         remote_home = Path(f"/tmp/opencode-v2-home-{session_id}")
         config_path = remote_home / "config" / "opencode" / "opencode.json"
+        model_catalog_path = remote_home / "config" / "opencode" / "models.json"
         try:
             pwd_result = await self.exec_as_agent(environment, command="pwd", env=env)
             remote_workdir = Path(
@@ -870,6 +955,8 @@ class OpenCodeV2(BaseInstalledAgent):
         env["XDG_STATE_HOME"] = (remote_home / "state").as_posix()
         env["OPENCODE_CONFIG_DIR"] = (remote_home / "config" / "opencode").as_posix()
         env["OPENCODE_CONFIG"] = config_path.as_posix()
+        if narrowed_catalog is not None:
+            env["OPENCODE_MODELS_PATH"] = model_catalog_path.as_posix()
         env["OPENCODE_CONFIG_PROJECT_DISABLE"] = "1"
         env["OPENCODE_DISABLE_MODELS_FETCH"] = "1"
         env["OPENCODE_DISABLE_AUTOUPDATE"] = "1"
@@ -928,6 +1015,22 @@ class OpenCodeV2(BaseInstalledAgent):
                 await environment.upload_file(local_config, config_path.as_posix())
             finally:
                 local_config.unlink(missing_ok=True)
+            if narrowed_catalog is not None:
+                with tempfile.NamedTemporaryFile(
+                    mode="w",
+                    encoding="utf-8",
+                    prefix="pier-opencode-v2-models-",
+                    suffix=".json",
+                    delete=False,
+                ) as catalog_file:
+                    json.dump(narrowed_catalog, catalog_file, separators=(",", ":"))
+                    local_catalog = Path(catalog_file.name)
+                try:
+                    await environment.upload_file(
+                        local_catalog, model_catalog_path.as_posix()
+                    )
+                finally:
+                    local_catalog.unlink(missing_ok=True)
 
             # The runner owns the server; the CLI only talks to it via --server.
             # A non-zero runner exit must fail the run and all raw artifacts

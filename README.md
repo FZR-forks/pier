@@ -169,9 +169,12 @@ and model schema through `opencode_v2_config`; model-level `body` is used for
 transport-specific fields such as an output-token cap. Pin the release with
 `kwargs.version`; optional target-specific SHA-256 values belong in
 `kwargs.opencode_v2_checksums` under `linux-x64` and/or `linux-arm64`. Setting
-`restrict_model: true` locks every root, child, and compaction request to
-`model_name`; unrestricted runs preserve and preflight each configured agent's
-own model. V2 runs with an isolated config/state directory and collects root
+`restrict_model: true` requires both `variant` and `model_catalog_file`, narrows
+that models.dev catalog to the selected model and effort variant, and locks every
+root, child, and compaction request to `model_name`; unrestricted runs preserve
+and preflight each configured agent's own model. Toggle- and token-budget-only
+profiles are rejected in restricted mode rather than translated into a different
+transport control. V2 runs with an isolated config/state directory and collects root
 and delegated child sessions into augmented ATIF, so do not reuse V1's
 `opencode_config` syntax.
 

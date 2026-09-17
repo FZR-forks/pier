@@ -259,9 +259,7 @@ class OpenCodeV2Server:
         # Fail fast when the URL could never answer a benchmark request, and
         # do not leak the server if readiness itself fails.
         try:
-            status, _ = http_get(
-                self._api_url("api/status"), self.password, timeout=10.0
-            )
+            status, _ = http_get(self._api_url("api/info"), self.password, timeout=10.0)
             if status != 200:
                 raise RuntimeError(
                     f"OpenCode server {self.url} failed its readiness check (HTTP {status})"
@@ -709,6 +707,24 @@ def preflight_runtime(
             }
             if variant and variant not in variants:
                 raise RuntimeError(f"selected variant {variant!r} is absent")
+            if restrict_model:
+                identities = {
+                    (str(item.get("providerID")), str(item.get("id")))
+                    for item in models
+                }
+                if identities != {(provider_id, model_id)}:
+                    raise RuntimeError(
+                        "restricted model catalog exposed unexpected models: "
+                        + ", ".join(
+                            f"{provider}/{model}"
+                            for provider, model in sorted(identities)
+                        )
+                    )
+                if variant and variants != {variant}:
+                    raise RuntimeError(
+                        "restricted model catalog exposed unexpected variants: "
+                        + ", ".join(sorted(variants))
+                    )
             resolved_body = selected.get("body") or {}
             for key, value in expected_body.items():
                 if resolved_body.get(key) != value:

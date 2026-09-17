@@ -58,7 +58,45 @@ class FakeEnvironment:
 def make_agent(logs_dir: Path, **kwargs: Any) -> OpenCodeV2:
     kwargs.setdefault("model_name", "litellm/kimi-k3")
     kwargs.setdefault("variant", "max")
-    kwargs.setdefault("version", "2.0.3")
+    kwargs.setdefault("version", "2.0.6")
+    if kwargs.get("restrict_model") and "model_catalog_file" not in kwargs:
+        provider, model = kwargs["model_name"].split("/", 1)
+        catalog_path = logs_dir / "models.json"
+        catalog_path.parent.mkdir(parents=True, exist_ok=True)
+        catalog_path.write_text(
+            json.dumps(
+                {
+                    provider: {
+                        "id": provider,
+                        "name": provider,
+                        "env": [],
+                        "npm": "@ai-sdk/openai-compatible",
+                        "models": {
+                            model: {
+                                "id": model,
+                                "name": model,
+                                "attachment": False,
+                                "reasoning": True,
+                                "reasoning_options": [
+                                    {
+                                        "type": "effort",
+                                        "values": ["low", "high", "max"],
+                                    }
+                                ],
+                                "tool_call": True,
+                                "release_date": "2026-01-01",
+                                "modalities": {
+                                    "input": ["text"],
+                                    "output": ["text"],
+                                },
+                                "limit": {"context": 1000, "output": 100},
+                            }
+                        },
+                    }
+                }
+            )
+        )
+        kwargs["model_catalog_file"] = str(catalog_path)
     return OpenCodeV2(logs_dir=logs_dir, **kwargs)
 
 
@@ -106,7 +144,7 @@ def test_opencode_v2_is_registered():
         AgentName.OPENCODE_V2,
         logs_dir=Path("/tmp/opencode-v2-test-logs"),
         model_name="litellm/kimi-k3",
-        version="2.0.3",
+        version="2.0.6",
     )
     assert agent.name() == "opencode-v2"
     assert AgentName("opencode-v2") is AgentName.OPENCODE_V2
@@ -156,6 +194,57 @@ def test_restrict_model_pins_builtin_agents(tmp_path: Path):
     }
     assert config["agents"]["title"]["disabled"] is True
     assert config["agents"]["summary"]["disabled"] is True
+
+
+def test_restrict_model_narrows_catalog_and_reasoning_variant(tmp_path: Path):
+    catalog = {
+        "litellm": {
+            "id": "litellm",
+            "models": {
+                "kimi-k3": {
+                    "id": "kimi-k3",
+                    "reasoning_options": [
+                        {"type": "toggle"},
+                        {"type": "effort", "values": ["low", "high", "max"]},
+                    ],
+                    "experimental": {"modes": {"fast": {}}},
+                },
+                "other": {"id": "other"},
+            },
+        },
+        "openai": {"id": "openai", "models": {"other": {"id": "other"}}},
+    }
+
+    narrowed = OpenCodeV2.narrow_model_catalog(catalog, "litellm", "kimi-k3", "max")
+
+    assert set(narrowed) == {"litellm"}
+    assert set(narrowed["litellm"]["models"]) == {"kimi-k3"}
+    model = narrowed["litellm"]["models"]["kimi-k3"]
+    assert model["reasoning_options"] == [{"type": "effort", "values": ["max"]}]
+    assert "experimental" not in model
+    assert "experimental" in catalog["litellm"]["models"]["kimi-k3"]
+
+
+def test_restrict_model_requires_explicit_effort_variant(tmp_path: Path):
+    with pytest.raises(ValueError, match="requires variant"):
+        OpenCodeV2(
+            logs_dir=tmp_path,
+            model_name="litellm/kimi-k3",
+            restrict_model=True,
+            model_catalog_file=str(tmp_path / "models.json"),
+        )
+
+    catalog = {
+        "litellm": {
+            "models": {
+                "kimi-k3": {
+                    "reasoning_options": [{"type": "toggle"}],
+                }
+            }
+        }
+    }
+    with pytest.raises(ValueError, match="does not support variant"):
+        OpenCodeV2.narrow_model_catalog(catalog, "litellm", "kimi-k3", "thinking")
 
 
 def test_restrict_model_overwrites_caller_model_contamination(tmp_path: Path):
@@ -889,6 +978,17 @@ def test_run_passes_model_restriction_to_runner(tmp_path: Path):
         and "--logs-dir" in call["command"]
     )
     assert "--restrict-model" in runner_command
+    catalog_upload = next(
+        upload for upload in environment.uploads if upload[1].endswith("/models.json")
+    )
+    uploaded_catalog = json.loads(catalog_upload[2])
+    assert set(uploaded_catalog["litellm"]["models"]) == {"kimi-k3"}
+    runner_call = next(
+        call
+        for call in environment.exec_calls
+        if "opencode_v2_runner.py" in call["command"]
+    )
+    assert runner_call["env"]["OPENCODE_MODELS_PATH"].endswith("/models.json")
 
 
 # ---------------------------------------------------------------------------
@@ -2363,13 +2463,13 @@ def test_server_start_preserves_readiness_error_when_cleanup_also_fails(monkeypa
 @pytest.mark.parametrize(
     ("statuses", "paths", "succeeds"),
     [
-        ([200], ["api/status"], True),
-        ([404], ["api/status"], False),
-        ([401], ["api/status"], False),
-        ([503], ["api/status"], False),
+        ([200], ["api/info"], True),
+        ([404], ["api/info"], False),
+        ([401], ["api/info"], False),
+        ([503], ["api/info"], False),
     ],
 )
-def test_server_readiness_uses_status_endpoint(monkeypatch, statuses, paths, succeeds):
+def test_server_readiness_uses_info_endpoint(monkeypatch, statuses, paths, succeeds):
     class FakeProcess:
         stderr: list[str] = []
 
@@ -3181,7 +3281,7 @@ def test_install_spec_uses_configured_version_checksum_and_target_architecture(
     )
     spec = agent.install_spec()
     assert spec.agent_name == "opencode-v2"
-    assert spec.version == "2.0.3"
+    assert spec.version == "2.0.6"
     assert spec.steps[0].run == "apt-get update && apt-get install -y curl python3"
     joined = "\n".join(step.run for step in spec.steps)
     assert 'machine="$(uname -m)"' in joined
@@ -3204,9 +3304,9 @@ def test_install_spec_uses_configured_version_checksum_and_target_architecture(
 
 
 def test_install_spec_respects_explicit_version(tmp_path: Path):
-    agent = make_agent(tmp_path, version="2.0.2")
+    agent = make_agent(tmp_path, version="2.0.5")
     joined = "\n".join(step.run for step in agent.install_spec().steps)
-    assert "2.0.2" in joined
+    assert "2.0.5" in joined
 
 
 def test_install_spec_without_version_resolves_latest_for_generic_use(tmp_path: Path):
@@ -3241,7 +3341,7 @@ def test_pinned_install_keeps_stable_cross_trial_cache_identity(tmp_path: Path):
 
 
 def test_install_spec_rejects_unsafe_version(tmp_path: Path):
-    agent = make_agent(tmp_path, version="2.0.3; touch /tmp/injected")
+    agent = make_agent(tmp_path, version="2.0.6; touch /tmp/injected")
     with pytest.raises(ValueError, match="unsupported characters"):
         agent.install_spec()
 
