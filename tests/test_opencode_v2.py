@@ -174,7 +174,9 @@ def test_opencode_v2_is_in_installed_agents_for_ca_tests():
 def test_config_carries_model_and_variant(tmp_path: Path):
     agent = make_agent(tmp_path, restrict_model=True)
     config = agent._build_runtime_config(include_mcp=False)
-    assert config["providers"]["litellm"]["models"] == {"kimi-k3": {}}
+    assert config["providers"]["litellm"]["models"] == {
+        "kimi-k3": {"settings": {"reasoningEffort": "max"}}
+    }
     assert config["agents"]["build"]["model"] == "litellm/kimi-k3#max"
     assert config["agents"]["general"]["model"] == "litellm/kimi-k3#max"
 

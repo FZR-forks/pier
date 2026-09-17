@@ -535,6 +535,19 @@ class OpenCodeV2(BaseInstalledAgent):
         provider, model_id, variant = self._model_parts()
         if variant:
             model_config = config["providers"][provider]["models"][model_id]
+            if not isinstance(model_config, dict):
+                raise ValueError(
+                    f"providers.{provider}.models.{model_id} must be an object"
+                )
+            settings = model_config.setdefault("settings", {})
+            if not isinstance(settings, dict):
+                raise ValueError(
+                    f"providers.{provider}.models.{model_id}.settings must be an object"
+                )
+            # OpenCode permits a subagent to omit #variant. Put the selected
+            # effort on the base model too, so omission cannot fall back to
+            # the provider's default reasoning level.
+            settings["reasoningEffort"] = variant
             configured_variants = model_config.get("variants")
             if isinstance(configured_variants, list):
                 model_config["variants"] = [
@@ -542,6 +555,10 @@ class OpenCodeV2(BaseInstalledAgent):
                     for item in configured_variants
                     if isinstance(item, dict) and item.get("id") == variant
                 ]
+            elif isinstance(configured_variants, dict):
+                model_config["variants"] = {
+                    variant: configured_variants.get(variant, {})
+                }
         agents = config.setdefault("agents", {})
         if not isinstance(agents, dict):
             raise ValueError("agents must be an object")
