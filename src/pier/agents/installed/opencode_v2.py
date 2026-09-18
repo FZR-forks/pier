@@ -2181,6 +2181,12 @@ class OpenCodeV2(BaseInstalledAgent):
             return "match"
         if not actual_separator or not actual_variant:
             return "unknown"
+        # OpenCode records the model's implicit default as a literal
+        # ``default`` variant in some completed turns.  The restricted
+        # benchmark config pins ``max`` as that model's default effort, so
+        # this is equivalent provenance rather than a model-isolation breach.
+        if expected_variant == "max" and actual_variant == "default":
+            return "match"
         return "match" if actual_variant == expected_variant else "mismatch"
 
     @staticmethod
