@@ -404,6 +404,25 @@ class OpenCodeV2(BaseInstalledAgent):
         narrowed = self.narrow_model_catalog(
             catalog, catalog_provider, model_id, variant
         )
+        configured_provider = (self._opencode_v2_config.get("providers") or {}).get(
+            provider
+        )
+        transport_package = (
+            configured_provider.get("package")
+            if isinstance(configured_provider, dict)
+            else None
+        )
+        normalized_package = (
+            transport_package.removeprefix("aisdk:")
+            if isinstance(transport_package, str)
+            else None
+        )
+        if normalized_package == "@opencode/ai/providers/fireworks":
+            # The catalog provider package controls native variant generation.
+            # Keep the canonical provider/model metadata, but select the
+            # Fireworks transport so DeepSeek does not regain its native
+            # `thinking` body after the transport override.
+            narrowed[catalog_provider]["npm"] = normalized_package
         if catalog_provider == provider:
             return narrowed
         # Keep the selectable identity on the transport alias.  The model
@@ -569,7 +588,10 @@ class OpenCodeV2(BaseInstalledAgent):
             # important for native Anthropic models, whose effort setting is
             # coupled to adaptive thinking rather than reasoningEffort.
             overlay = self._restricted_variant_overlay(
-                provider, model_id, model_config, variant
+                provider,
+                model_id,
+                model_config,
+                variant,
             )
             for section in ("settings", "body", "headers"):
                 values = overlay.get(section)
@@ -594,13 +616,13 @@ class OpenCodeV2(BaseInstalledAgent):
                     for item in configured_variants
                     if isinstance(item, dict) and item.get("id") == variant
                 ]
-                model_config["variants"] = selected or [
-                    {"id": variant, **copy.deepcopy(overlay)}
-                ]
+                model_config["variants"] = [
+                    self._merge_variant_overlay(item, overlay) for item in selected
+                ] or [{"id": variant, **copy.deepcopy(overlay)}]
             elif isinstance(configured_variants, dict):
                 selected = configured_variants.get(variant)
                 model_config["variants"] = {
-                    variant: copy.deepcopy(selected)
+                    variant: self._merge_variant_overlay(selected, overlay)
                     if isinstance(selected, dict)
                     else copy.deepcopy(overlay)
                 }
@@ -670,6 +692,23 @@ class OpenCodeV2(BaseInstalledAgent):
                     if isinstance(target, dict):
                         cls._deep_merge_static(target, values)
         return overlay
+
+    @staticmethod
+    def _merge_variant_overlay(
+        variant: dict[str, Any], overlay: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Merge a restricted overlay into an explicitly configured variant."""
+        merged = copy.deepcopy(variant)
+        for section in ("settings", "body", "headers"):
+            values = overlay.get(section)
+            if not isinstance(values, dict):
+                continue
+            existing = merged.setdefault(section, {})
+            if not isinstance(existing, dict):
+                existing = {}
+                merged[section] = existing
+            OpenCodeV2._deep_merge_static(existing, values)
+        return merged
 
     @staticmethod
     def _deep_merge_static(base: dict[str, Any], override: dict[str, Any]) -> None:
