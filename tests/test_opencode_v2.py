@@ -2897,7 +2897,10 @@ def test_collect_tree_uses_bounded_backoff_before_incomplete_result(monkeypatch)
 
     assert settled is False
     assert sleeps == [1.0, 2.0, 4.0, 3.0]
-    assert runner_module.DEFAULT_SETTLE_SECONDS <= 120
+    # Bounded, but wide enough for a DeepSWE-scale tree: settlement needs
+    # two full re-reads of every session plus a native wait per session,
+    # and timing out here withholds every token and cost aggregate.
+    assert 600 <= runner_module.DEFAULT_SETTLE_SECONDS <= 1800
     assert errors == ["sessions lack terminal idle outcome: ses_root"]
 
 

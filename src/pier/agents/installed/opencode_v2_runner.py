@@ -41,7 +41,7 @@ AUTH_USERNAME = "opencode"
 SESSION_PAGE_SIZE = 200
 MESSAGE_PAGE_SIZE = 200
 INSPECT_ATTEMPTS = 3
-DEFAULT_SETTLE_SECONDS = 120.0
+DEFAULT_SETTLE_SECONDS = 600.0
 SESSION_WAIT_REQUEST_SECONDS = 30.0
 SETTLE_INTERVAL_SECONDS = 1.0
 SETTLE_MAX_INTERVAL_SECONDS = 5.0
@@ -603,6 +603,29 @@ def _persist_root_candidates(
         errors.append(f"root candidate persistence: {type(error).__name__}: {error}")
 
 
+# Bare key names that are always a credential.
+_CREDENTIAL_KEYS = frozenset({"token", "auth", "key", "apikey", "secret", "password"})
+# Substrings that only appear in credential-bearing key names. A bare "token"
+# is deliberately absent: model metadata uses `max_tokens`, `maxTokensField`
+# and `outputTokens`, and redacting those would destroy the output-cap
+# evidence the preflight record exists to prove (PA1 #40/#46).
+_CREDENTIAL_MARKERS = (
+    "apikey",
+    "authorization",
+    "password",
+    "passwd",
+    "secret",
+    "credential",
+    "accesstoken",
+    "authtoken",
+    "bearertoken",
+    "idtoken",
+    "refreshtoken",
+    "sessiontoken",
+    "apitoken",
+)
+
+
 def _redact(value: Any) -> Any:
     """Remove credential-shaped values from persisted preflight evidence."""
     if isinstance(value, dict):
@@ -611,15 +634,8 @@ def _redact(value: Any) -> Any:
             normalized = "".join(char for char in key.lower() if char.isalnum())
             if normalized in {"baseurl", "url"}:
                 result[key] = "<redacted-url>"
-            elif normalized.endswith("apikey") or any(
-                marker in normalized
-                for marker in (
-                    "authorization",
-                    "password",
-                    "secret",
-                    "token",
-                    "credential",
-                )
+            elif normalized in _CREDENTIAL_KEYS or any(
+                marker in normalized for marker in _CREDENTIAL_MARKERS
             ):
                 result[key] = "<redacted>"
             else:
