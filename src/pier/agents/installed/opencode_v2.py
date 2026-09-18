@@ -388,7 +388,31 @@ class OpenCodeV2(BaseInstalledAgent):
         if not isinstance(catalog, dict):
             raise ValueError("model_catalog_file must contain a JSON object")
         provider, model_id, variant = self._model_parts()
-        return self.narrow_model_catalog(catalog, provider, model_id, variant)
+        # A configured transport alias can inherit the selected model's
+        # catalogue metadata from its upstream provider.  Keep the frozen
+        # catalogue canonical (for example ``zai/glm-5.3-flash``) instead of
+        # duplicating a Fireworks profile solely so the restricted catalogue
+        # can resolve ``fireworks/glm-5.3-flash``.
+        catalog_provider = provider
+        if provider not in catalog:
+            configured = (self._opencode_v2_config.get("providers") or {}).get(provider)
+            canonical = (
+                configured.get("canonical") if isinstance(configured, dict) else None
+            )
+            if isinstance(canonical, str) and canonical in catalog:
+                catalog_provider = canonical
+        narrowed = self.narrow_model_catalog(
+            catalog, catalog_provider, model_id, variant
+        )
+        if catalog_provider == provider:
+            return narrowed
+        # Keep the selectable identity on the transport alias.  The model
+        # fields came from the canonical upstream entry above; emitting the
+        # source provider as well would expose a second selectable model and
+        # defeat restricted-model isolation.
+        selected = narrowed.pop(catalog_provider)
+        selected["id"] = provider
+        return {provider: selected}
 
     def _build_providers_config(self) -> dict[str, Any]:
         """The provider settings, models and variants the run needs.
