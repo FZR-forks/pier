@@ -407,8 +407,11 @@ class OpenCodeV2(BaseInstalledAgent):
         configured_provider = (self._opencode_v2_config.get("providers") or {}).get(
             provider
         )
+        # `_validate_selected_model_config` accepts either spelling and reads
+        # `npm` first, so an alias declared with `npm` must receive the same
+        # catalogue override as one declared with `package`.
         transport_package = (
-            configured_provider.get("package")
+            configured_provider.get("npm") or configured_provider.get("package")
             if isinstance(configured_provider, dict)
             else None
         )

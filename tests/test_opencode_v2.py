@@ -227,6 +227,48 @@ def test_restrict_model_narrows_catalog_and_reasoning_variant(tmp_path: Path):
     assert "experimental" in catalog["litellm"]["models"]["kimi-k3"]
 
 
+@pytest.mark.parametrize("field", ["package", "npm"])
+def test_restricted_catalog_takes_the_fireworks_transport_either_spelling(
+    tmp_path: Path, field: str
+):
+    """A Fireworks transport alias must reach the narrowed catalog.
+
+    ``_validate_selected_model_config`` accepts both ``npm`` and ``package``
+    on a provider entry and reads ``npm`` first, so leaving the catalog on its
+    canonical ``@ai-sdk/openai-compatible`` package for an ``npm``-spelled
+    alias would let the upstream provider's native reasoning body come back
+    after the transport override.
+    """
+    agent = make_agent(
+        tmp_path,
+        restrict_model=True,
+        opencode_v2_config={
+            "providers": {
+                "litellm": {
+                    field: "@opencode/ai/providers/fireworks",
+                    "models": {"kimi-k3": {}},
+                }
+            }
+        },
+    )
+
+    narrowed = agent._narrowed_model_catalog()
+
+    assert narrowed is not None
+    assert narrowed["litellm"]["npm"] == "@opencode/ai/providers/fireworks"
+
+
+def test_restricted_catalog_keeps_canonical_package_without_a_transport_alias(
+    tmp_path: Path,
+):
+    agent = make_agent(tmp_path, restrict_model=True)
+
+    narrowed = agent._narrowed_model_catalog()
+
+    assert narrowed is not None
+    assert narrowed["litellm"]["npm"] == "@ai-sdk/openai-compatible"
+
+
 def test_restrict_model_requires_explicit_effort_variant(tmp_path: Path):
     with pytest.raises(ValueError, match="requires variant"):
         OpenCodeV2(
