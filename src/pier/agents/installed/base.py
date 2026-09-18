@@ -331,6 +331,15 @@ class BaseInstalledAgent(BaseAgent, ABC):
         )
         return {key: value for key, value in ca_env.items() if key not in task_env}
 
+    def _process_env_for_logging(self, env: dict[str, str] | None) -> dict[str, str]:
+        """Return process environment metadata safe to attach to debug logs.
+
+        Installed agents can override this hook when they know particular
+        variables contain credentials. The environment passed to the process
+        is deliberately left untouched.
+        """
+        return dict(env or {})
+
     async def _exec(
         self,
         environment: BaseEnvironment,
@@ -364,7 +373,7 @@ class BaseInstalledAgent(BaseAgent, ABC):
             f"Running command: {command}",
             extra={
                 "user": str(user),
-                "env": merged_env or {},
+                "env": self._process_env_for_logging(merged_env),
             },
         )
 
