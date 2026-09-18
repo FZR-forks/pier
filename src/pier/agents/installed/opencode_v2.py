@@ -563,26 +563,51 @@ class OpenCodeV2(BaseInstalledAgent):
                 raise ValueError(
                     f"providers.{provider}.models.{model_id} must be an object"
                 )
-            settings = model_config.setdefault("settings", {})
-            if not isinstance(settings, dict):
-                raise ValueError(
-                    f"providers.{provider}.models.{model_id}.settings must be an object"
-                )
-            # OpenCode permits a subagent to omit #variant. Put the selected
-            # effort on the base model too, so omission cannot fall back to
-            # the provider's default reasoning level.
-            settings["reasoningEffort"] = variant
+            # OpenCode permits a subagent to omit #variant. Copy the complete
+            # native variant overlay onto the base model so omission cannot
+            # fall back to the provider's default reasoning level. This is
+            # important for native Anthropic models, whose effort setting is
+            # coupled to adaptive thinking rather than reasoningEffort.
+            overlay = self._restricted_variant_overlay(
+                provider, model_id, model_config, variant
+            )
+            for section in ("settings", "body", "headers"):
+                values = overlay.get(section)
+                if values is None:
+                    continue
+                if not isinstance(values, dict):
+                    raise ValueError(
+                        f"providers.{provider}.models.{model_id}.{section} "
+                        "must be an object"
+                    )
+                existing = model_config.setdefault(section, {})
+                if not isinstance(existing, dict):
+                    raise ValueError(
+                        f"providers.{provider}.models.{model_id}.{section} "
+                        "must be an object"
+                    )
+                self._deep_merge(existing, copy.deepcopy(values))
             configured_variants = model_config.get("variants")
             if isinstance(configured_variants, list):
-                model_config["variants"] = [
+                selected = [
                     item
                     for item in configured_variants
                     if isinstance(item, dict) and item.get("id") == variant
                 ]
+                model_config["variants"] = selected or [
+                    {"id": variant, **copy.deepcopy(overlay)}
+                ]
             elif isinstance(configured_variants, dict):
+                selected = configured_variants.get(variant)
                 model_config["variants"] = {
-                    variant: configured_variants.get(variant, {})
+                    variant: copy.deepcopy(selected)
+                    if isinstance(selected, dict)
+                    else copy.deepcopy(overlay)
                 }
+            elif provider == "anthropic" and "effort" in (
+                overlay.get("settings") or {}
+            ):
+                model_config["variants"] = [{"id": variant, **copy.deepcopy(overlay)}]
         agents = config.setdefault("agents", {})
         if not isinstance(agents, dict):
             raise ValueError("agents must be an object")
@@ -602,6 +627,58 @@ class OpenCodeV2(BaseInstalledAgent):
             agent_config["model"] = self._model_selection()
             if agent_id in {"title", "summary"}:
                 agent_config["disabled"] = True
+
+    @classmethod
+    def _restricted_variant_overlay(
+        cls,
+        provider: str,
+        model_id: str,
+        model_config: dict[str, Any],
+        variant: str,
+    ) -> dict[str, Any]:
+        """Return the native settings needed when ``#variant`` is omitted."""
+        if provider == "anthropic" and re.search(
+            r"(?:^|[-./])claude-(?:opus|sonnet|haiku)-[45]", model_id, re.IGNORECASE
+        ):
+            overlay: dict[str, Any] = {
+                "settings": {
+                    "thinking": {"type": "adaptive", "display": "summarized"},
+                    "effort": variant,
+                }
+            }
+        else:
+            overlay = {"settings": {"reasoningEffort": variant}}
+
+        configured_variants = model_config.get("variants")
+        configured: Any = None
+        if isinstance(configured_variants, list):
+            configured = next(
+                (
+                    item
+                    for item in configured_variants
+                    if isinstance(item, dict) and item.get("id") == variant
+                ),
+                None,
+            )
+        elif isinstance(configured_variants, dict):
+            configured = configured_variants.get(variant)
+        if isinstance(configured, dict):
+            for section in ("settings", "body", "headers"):
+                values = configured.get(section)
+                if isinstance(values, dict):
+                    target = overlay.setdefault(section, {})
+                    if isinstance(target, dict):
+                        cls._deep_merge_static(target, values)
+        return overlay
+
+    @staticmethod
+    def _deep_merge_static(base: dict[str, Any], override: dict[str, Any]) -> None:
+        """Small merge helper for class-level variant overlay construction."""
+        for key, value in override.items():
+            if key in base and isinstance(base[key], dict) and isinstance(value, dict):
+                OpenCodeV2._deep_merge_static(base[key], value)
+            else:
+                base[key] = copy.deepcopy(value)
 
     def _build_runtime_config(self, *, include_mcp: bool) -> dict[str, Any]:
         """The opencode.json V2 config for this run.
@@ -2207,9 +2284,10 @@ class OpenCodeV2(BaseInstalledAgent):
             return "unknown"
         # OpenCode records the model's implicit default as a literal
         # ``default`` variant in some completed turns.  The restricted
-        # benchmark config pins ``max`` as that model's default effort, so
-        # this is equivalent provenance rather than a model-isolation breach.
-        if expected_variant == "max" and actual_variant == "default":
+        # benchmark config pins the selected variant's complete native
+        # settings onto the base model, so this is equivalent provenance for
+        # every supported variant rather than a model-isolation breach.
+        if actual_variant == "default":
             return "match"
         return "match" if actual_variant == expected_variant else "mismatch"
 
