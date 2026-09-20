@@ -4460,3 +4460,336 @@ def test_killed_runner_identifies_the_tool_that_was_actually_stuck(tmp_path: Pat
     assert not (logs_dir / "runner-result.json").exists()
     events = (logs_dir / runner_module.EVENTS_FILENAME).read_text().splitlines()
     assert any("session.tool.called" in line for line in events)
+
+
+# ---------------------------------------------------------------------------
+# Termination
+#
+# An agent timeout cancels the exec host-side, and killing a
+# `docker compose exec` client does not signal the process inside the
+# container. These cover stopping OpenCode without killing it unnecessarily.
+# ---------------------------------------------------------------------------
+
+
+class _FakeProc:
+    """A Popen stand-in that exits after a given number of wait() calls."""
+
+    def __init__(self, exits_after: int | None):
+        self.pid = 4242
+        self._waits = 0
+        self._exits_after = exits_after
+        self.signals: list[int] = []
+
+    def wait(self, timeout=None):
+        self._waits += 1
+        if self._exits_after is not None and self._waits >= self._exits_after:
+            return 0
+        raise subprocess.TimeoutExpired("cli", timeout or 0)
+
+
+def _stop_cli_with(monkeypatch, tmp_path, exits_after):
+    recorder = runner_module.LiveRecorder(tmp_path, echo=False, heartbeat_seconds=0)
+    proc = _FakeProc(exits_after)
+    monkeypatch.setattr(
+        runner_module.os, "killpg", lambda pid, sig: proc.signals.append(sig)
+    )
+    monkeypatch.setattr(runner_module, "CLI_INTERRUPT_GRACE_SECONDS", 0.01)
+    monkeypatch.setattr(runner_module, "CLI_SIGTERM_GRACE_SECONDS", 0.01)
+    monkeypatch.setattr(runner_module, "CLI_SIGKILL_GRACE_SECONDS", 0.01)
+    errors: list[str] = []
+    method = runner_module._stop_cli(proc, recorder, errors)
+    recorder.close()
+    return method, proc.signals, errors
+
+
+def test_cli_that_stops_on_interrupt_is_never_signalled(tmp_path, monkeypatch):
+    """The polite route: OpenCode ends the turn itself, we send no signal."""
+    method, signals, errors = _stop_cli_with(monkeypatch, tmp_path, exits_after=1)
+    assert method == "exited-after-interrupt"
+    assert signals == [], "a cooperating CLI must not be signalled"
+    assert errors == []
+
+
+def test_cli_is_escalated_only_as_far_as_needed(tmp_path, monkeypatch):
+    method, signals, _ = _stop_cli_with(monkeypatch, tmp_path, exits_after=2)
+    assert method == "sigterm"
+    assert signals == [signal.SIGTERM], "must not reach SIGKILL when SIGTERM works"
+
+    method, signals, _ = _stop_cli_with(monkeypatch, tmp_path, exits_after=3)
+    assert method == "sigkill"
+    assert signals == [signal.SIGTERM, signal.SIGKILL]
+
+    method, signals, errors = _stop_cli_with(monkeypatch, tmp_path, exits_after=None)
+    assert method == "survived-sigkill"
+    assert errors == ["CLI process did not exit after cancellation"]
+
+
+def test_sessions_are_interrupted_before_any_signal(tmp_path, monkeypatch):
+    """OpenCode must be asked to stop before the CLI is touched."""
+    order: list[str] = []
+    recorder = runner_module.LiveRecorder(tmp_path, echo=False, heartbeat_seconds=0)
+
+    class Server(runner_module.OpenCodeV2Server):
+        def collect_sessions(self, parent_id=None):
+            return [{"id": "ses_a"}, {"id": "ses_b"}]
+
+        def interrupt_session(self, session_id):
+            order.append(f"interrupt:{session_id}")
+
+    server = Server(binary="x", cwd=str(tmp_path), password="p", env={})
+    errors: list[str] = []
+    stopped = runner_module._request_graceful_stop(server, recorder, errors)
+    recorder.close()
+
+    assert stopped == ["ses_a", "ses_b"]
+    assert order == ["interrupt:ses_a", "interrupt:ses_b"]
+    # Already-interrupted sessions are not asked twice.
+    assert (
+        runner_module._request_graceful_stop(
+            server, recorder, errors, already={"ses_a", "ses_b"}
+        )
+        == []
+    )
+
+
+class _ScriptedEnvironment(FakeEnvironment):
+    """Answers runner liveness probes from a scripted sequence."""
+
+    def __init__(self, answers: list[str]):
+        super().__init__()
+        self._answers = list(answers)
+
+    async def exec(self, **kwargs: Any) -> ExecResult:
+        self.exec_calls.append(kwargs)
+        command = kwargs.get("command", "")
+        if "/proc/$pid/stat" in command:
+            answer = self._answers.pop(0) if self._answers else "GONE"
+            return ExecResult(return_code=0, stdout=answer, stderr="")
+        return ExecResult(return_code=0, stdout="", stderr="")
+
+    def signals_sent(self) -> list[str]:
+        sent = []
+        for call in self.exec_calls:
+            command = call.get("command", "")
+            if "pkill -KILL" in command:
+                sent.append("SWEEP")
+            elif "kill -TERM" in command:
+                sent.append("TERM")
+            elif "kill -KILL" in command:
+                sent.append("KILL")
+        return sent
+
+
+def test_finished_runner_is_left_alone(tmp_path: Path):
+    """The normal path must not signal anything."""
+    import asyncio
+
+    environment = _ScriptedEnvironment(["GONE"])
+    asyncio.run(make_agent(tmp_path)._ensure_runner_stopped(environment))
+    assert environment.signals_sent() == []
+
+
+def test_timed_out_runner_is_asked_to_stop_and_not_killed(tmp_path: Path):
+    """SIGTERM reaches the runner's graceful path; SIGKILL is not needed."""
+    import asyncio
+
+    agent = make_agent(tmp_path)
+    agent._RUNNER_STOP_POLL_SECONDS = 0.01
+    environment = _ScriptedEnvironment(["RUNNING", "GONE"])
+    asyncio.run(agent._ensure_runner_stopped(environment))
+    assert environment.signals_sent() == ["TERM"]
+
+
+def test_runner_that_ignores_sigterm_is_killed_and_opencode_swept(tmp_path: Path):
+    import asyncio
+
+    agent = make_agent(tmp_path)
+    agent._RUNNER_STOP_POLL_SECONDS = 0.01
+    agent._RUNNER_STOP_GRACE_SECONDS = 0.05
+    environment = _ScriptedEnvironment(["RUNNING"] * 50)
+    asyncio.run(agent._ensure_runner_stopped(environment))
+    # Its own cleanup never ran, so the owned OpenCode processes are swept.
+    assert environment.signals_sent() == ["TERM", "KILL", "SWEEP"]
+
+
+def test_exited_runner_awaiting_reaping_is_not_killed(tmp_path: Path):
+    """A zombie is a finished runner, not a stuck one.
+
+    Container PID 1 often does not reap, and `kill -0` succeeds for zombies,
+    so a liveness check based on that alone would SIGKILL every clean run.
+    """
+    import asyncio
+
+    recorded: list[str] = []
+
+    class ProcEnvironment(FakeEnvironment):
+        async def exec(self, **kwargs: Any) -> ExecResult:
+            command = kwargs.get("command", "")
+            recorded.append(command)
+            if "/proc/$pid/stat" in command:
+                # Emulate the real shell against a zombie's stat line.
+                stat = "4242 (python3) Z 1 4242 4242 0 -1 4194560 0 0"
+                state = stat.split(") ")[-1].split()[0]
+                return ExecResult(
+                    return_code=0,
+                    stdout="GONE" if state == "Z" else "RUNNING",
+                    stderr="",
+                )
+            return ExecResult(return_code=0, stdout="", stderr="")
+
+    environment = ProcEnvironment()
+    asyncio.run(make_agent(tmp_path)._ensure_runner_stopped(environment))
+    # Only the liveness probe should have run; no signal was delivered.
+    assert not any(
+        'kill -TERM "$pid"' in command or 'kill -KILL "$pid"' in command
+        for command in recorded
+    )
+
+
+_FAKE_POLITE_OPENCODE = '''#!/usr/bin/env python3
+"""OpenCode stand-in whose CLI exits when its session is interrupted."""
+import json, os, sys, threading, time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import urlparse
+
+SID = "ses_polite00000000000000000"
+FLAG = os.environ["POLITE_FLAG"]
+
+
+class H(BaseHTTPRequestHandler):
+    def log_message(self, *a):
+        pass
+
+    def _json(self, payload):
+        body = json.dumps(payload).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self):
+        path = urlparse(self.path).path
+        if path == "/api/model":
+            return self._json({"data": [{"providerID": "fake", "id": "model",
+                                         "variants": [], "body": {}, "limit": {}}]})
+        if path == "/api/agent":
+            return self._json({"data": []})
+        if path == "/api/session":
+            return self._json({"data": [{"id": SID, "parentID": None}], "cursor": {}})
+        if path == "/api/session/active":
+            return self._json({"data": {}})
+        return self._json({"data": {}})
+
+    def do_POST(self):
+        if self.path.endswith("/interrupt"):
+            open(FLAG, "w").close()
+        self._json({"data": True})
+
+
+def serve():
+    httpd = ThreadingHTTPServer(("127.0.0.1", 0), H)
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    print(json.dumps({"url": "http://127.0.0.1:%d" % httpd.server_address[1]}), flush=True)
+    sys.stdin.read()
+
+
+def run():
+    while not os.path.exists(FLAG):
+        time.sleep(0.05)
+    sys.exit(0)
+
+
+if "serve" in sys.argv:
+    serve()
+elif "run" in sys.argv:
+    run()
+elif "--version" in sys.argv:
+    print("fake-polite 0.0.1")
+'''
+
+
+def test_timeout_shutdown_stops_opencode_without_killing_it(tmp_path: Path):
+    """End to end: SIGTERM to the runner stops OpenCode the polite way.
+
+    This is the timeout case. The runner interrupts the session, the CLI
+    exits on its own, the server is closed down, and the evidence is written
+    -- with no signal ever sent to an OpenCode process.
+    """
+    binary = tmp_path / "fake-polite"
+    binary.write_text(_FAKE_POLITE_OPENCODE)
+    binary.chmod(0o755)
+    logs_dir = tmp_path / "logs"
+    logs_dir.mkdir()
+    work_dir = tmp_path / "work"
+    work_dir.mkdir()
+    instruction = tmp_path / "instruction.txt"
+    instruction.write_text("do the task")
+
+    process = subprocess.Popen(
+        [
+            "python3",
+            str(Path(runner_module.__file__)),
+            "--instruction-file",
+            str(instruction),
+            "--logs-dir",
+            str(logs_dir),
+            "--work-dir",
+            str(work_dir),
+            "--binary",
+            str(binary),
+            "--model",
+            "fake/model",
+        ],
+        env={
+            **os.environ,
+            "HOME": str(tmp_path),
+            "POLITE_FLAG": str(tmp_path / "flag"),
+        },
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    pidfile = logs_dir / runner_module.RUNNER_PIDFILE
+    try:
+        deadline = time.monotonic() + 60
+        while time.monotonic() < deadline and not pidfile.exists():
+            time.sleep(0.05)
+        assert pidfile.exists(), "the runner never recorded its pid"
+        # Wait until OpenCode is actually up before asking it to stop.
+        while time.monotonic() < deadline:
+            try:
+                if json.loads(
+                    (logs_dir / runner_module.STATUS_FILENAME).read_text()
+                ).get("cli_started"):
+                    break
+            except (OSError, json.JSONDecodeError):
+                pass
+            time.sleep(0.05)
+
+        # Exactly what the adapter does when the agent times out.
+        os.kill(int(pidfile.read_text().strip()), signal.SIGTERM)
+        process.wait(timeout=90)
+    finally:
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            pass
+        try:
+            subprocess.run(["pkill", "-9", "-f", str(binary)], check=False)
+        except OSError:
+            pass
+
+    result = json.loads((logs_dir / "runner-result.json").read_text())
+    assert result["cancelled"] is True
+    # The session was asked to stop, and that alone was enough.
+    assert result["interrupted_sessions"] == ["ses_polite00000000000000000"]
+    assert result["live_status"]["cli_stop_method"] == "exited-after-interrupt"
+    # Evidence still reached disk through the graceful path.
+    assert (logs_dir / runner_module.STATUS_FILENAME).exists()
+
+    # Nothing OpenCode owned is left behind.
+    survivors = subprocess.run(
+        ["pgrep", "-f", str(binary)], capture_output=True, text=True
+    ).stdout.split()
+    assert not survivors, f"OpenCode processes survived shutdown: {survivors}"

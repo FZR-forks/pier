@@ -60,12 +60,26 @@ CLI_STDERR_FILENAME = "opencode-v2-cli-stderr.log"
 SERVER_STDERR_FILENAME = "opencode-v2-server-stderr.log"
 PARTIAL_SESSIONS_FILENAME = "opencode-v2-sessions.partial.jsonl"
 EVENTS_FILENAME = "opencode-v2-events.jsonl"
+# Lets Pier signal exactly this runner on timeout instead of pattern-matching
+# process lists, which would also match the probe command itself.
+RUNNER_PIDFILE = "opencode-v2-runner.pid"
 
 # Cap on how much of a tool's input we keep in the live status. The full
 # argument list is already in the durable event log.
 TOOL_INPUT_PREVIEW_BYTES = 2048
 EVENT_STREAM_RECONNECT_DELAY = 1.0
 EVENT_STREAM_MAX_RECONNECTS = 20
+
+# Graceful shutdown ladder. Interrupting the session is how OpenCode is meant
+# to be stopped: it aborts the model turn and its running tools itself and
+# lets the CLI exit normally, which keeps the run's own records intact.
+# Signals are an escalation, used only when the polite route does not work.
+CLI_INTERRUPT_GRACE_SECONDS = float(
+    os.environ.get("PIER_OPENCODE_V2_INTERRUPT_GRACE", "30")
+)
+CLI_SIGTERM_GRACE_SECONDS = 10.0
+CLI_SIGKILL_GRACE_SECONDS = 5.0
+SERVER_STDIN_GRACE_SECONDS = 10.0
 
 LIVE_LOG_MAX_BYTES = 64 * 1024 * 1024
 # What `opencode run --format json` can and cannot tell us. This is a
@@ -1157,7 +1171,10 @@ class OpenCodeV2Server:
         except OSError:
             pass
         try:
-            process.wait(timeout=3)
+            # Closing stdin is how `serve --stdio` is asked to exit. Give it a
+            # real chance before escalating; this costs nothing when the
+            # server exits promptly.
+            process.wait(timeout=SERVER_STDIN_GRACE_SECONDS)
         except subprocess.TimeoutExpired:
             pass
         # The lease-owning leader may exit while a helper remains in the
@@ -1846,6 +1863,95 @@ def _collect_tree(
     return inspections, stable
 
 
+def _request_graceful_stop(
+    server: OpenCodeV2Server,
+    recorder: LiveRecorder,
+    errors: list[str],
+    already: set[str] | None = None,
+) -> list[str]:
+    """Ask OpenCode to abort its own work, the way a user pressing Esc would.
+
+    This is the first rung of the shutdown ladder. It stops the model turn and
+    any running tool inside OpenCode, which is both cleaner than a signal and
+    the only way the agent's own session records stay consistent.
+    """
+    already = already or set()
+    stopped: list[str] = []
+    try:
+        discovered = server.collect_sessions()
+    except Exception as error:
+        errors.append(f"interruption discovery: {type(error).__name__}: {error}")
+        return stopped
+    for session in discovered:
+        session_id = str(session.get("id") or "")
+        if not session_id or session_id in already:
+            continue
+        try:
+            server.interrupt_session(session_id)
+        except Exception as error:
+            errors.append(f"interrupt {session_id}: {type(error).__name__}: {error}")
+            continue
+        stopped.append(session_id)
+    if stopped:
+        recorder.note(
+            "sessions-interrupted",
+            "asked OpenCode to stop " + ", ".join(sorted(stopped)),
+        )
+    return stopped
+
+
+def _stop_cli(
+    cli_process: subprocess.Popen,
+    recorder: LiveRecorder,
+    errors: list[str],
+) -> str:
+    """Escalate only as far as the CLI actually requires.
+
+    Returns which rung of the ladder ended the process, so the artifacts
+    record whether OpenCode shut itself down or had to be killed.
+    """
+    # 1. It may already be finishing off the back of the interrupt.
+    try:
+        cli_process.wait(timeout=CLI_INTERRUPT_GRACE_SECONDS)
+        return "exited-after-interrupt"
+    except subprocess.TimeoutExpired:
+        pass
+
+    # 2. Ask the process group to terminate.
+    recorder.note(
+        "cli-escalation",
+        "CLI did not exit after session interrupt; sending SIGTERM",
+    )
+    try:
+        os.killpg(cli_process.pid, signal.SIGTERM)
+    except (ProcessLookupError, PermissionError):
+        try:
+            cli_process.terminate()
+        except OSError:
+            pass
+    try:
+        cli_process.wait(timeout=CLI_SIGTERM_GRACE_SECONDS)
+        return "sigterm"
+    except subprocess.TimeoutExpired:
+        pass
+
+    # 3. Last resort.
+    recorder.note("cli-escalation", "CLI ignored SIGTERM; sending SIGKILL")
+    try:
+        os.killpg(cli_process.pid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError):
+        try:
+            cli_process.kill()
+        except OSError:
+            pass
+    try:
+        cli_process.wait(timeout=CLI_SIGKILL_GRACE_SECONDS)
+        return "sigkill"
+    except subprocess.TimeoutExpired:
+        errors.append("CLI process did not exit after cancellation")
+        return "survived-sigkill"
+
+
 def _preserve_private_state(env: dict[str, str], logs_dir: Path) -> list[str]:
     """Copy safe private state after failure without parsing credential stores."""
     copied: list[str] = []
@@ -1903,6 +2009,10 @@ def main() -> None:
     # Start recording before anything else can fail, so even an immediate
     # crash leaves a stage behind.
     recorder = LiveRecorder(logs_dir)
+    try:
+        (logs_dir / RUNNER_PIDFILE).write_text(f"{os.getpid()}\n")
+    except OSError as error:
+        recorder.note("pidfile-failed", f"{type(error).__name__}: {error}")
     work_dir = Path(args.work_dir).resolve()
     instruction = Path(args.instruction_file).read_text()
     binary = resolve_binary(args.binary)
@@ -1976,7 +2086,12 @@ def main() -> None:
         recorder.stage("server-starting")
         server.start()
         assert server.url is not None
-        recorder.stage("server-started", server_started=True, server_url_known=True)
+        recorder.stage(
+            "server-started",
+            server_started=True,
+            server_url_known=True,
+            server_pid=server.process.pid if server.process else None,
+        )
         # Subscribe before the CLI starts so no agent activity is missed.
         event_stream = OpenCodeEventStream(server.url, password, recorder)
         event_stream.start()
@@ -2104,52 +2219,35 @@ def main() -> None:
             cli_returncode = cli_process.wait()
             recorder.stage("cli-exited", cli_returncode=cli_returncode)
         except BaseException as error:
-            # Cancellation or runner shutdown: kill the CLI, then interrupt
-            # every session the server has discovered before tearing down.
+            # Cancellation or runner shutdown. Ask OpenCode to stop before
+            # reaching for a signal: interrupting the session aborts the turn
+            # and its tools cleanly and lets the CLI exit on its own, so the
+            # agent's own records stay consistent. Signals escalate from there
+            # only if that does not work.
             cancelled = True
             recorder.stage(
                 "cli-cancelled",
                 cancelled=True,
                 cancel_cause=f"{type(error).__name__}: {error}",
             )
-            try:
-                os.killpg(cli_process.pid, signal.SIGTERM)
-            except (ProcessLookupError, PermissionError):
-                cli_process.kill()
-            try:
-                cli_process.wait(timeout=10)
-            except subprocess.TimeoutExpired:
-                try:
-                    os.killpg(cli_process.pid, signal.SIGKILL)
-                except (ProcessLookupError, PermissionError):
-                    try:
-                        cli_process.kill()
-                    except OSError:
-                        pass
-                try:
-                    cli_process.wait(timeout=2)
-                except subprocess.TimeoutExpired:
-                    collection_errors.append(
-                        "CLI process did not exit after cancellation"
-                    )
+            interrupted.extend(
+                _request_graceful_stop(server, recorder, collection_errors)
+            )
+            stop_method = _stop_cli(cli_process, recorder, collection_errors)
+            recorder.stage("cli-stopped", cli_stop_method=stop_method)
             stdout_thread.join(timeout=1)
             stderr_thread.join(timeout=1)
             cli_stderr = "".join(stderr_lines)
             events = _events(stdout_lines)
             events.extend(early_root_events)
             dump_jsonl(logs_dir / "opencode-v2-cli-events.jsonl", events)
-            try:
-                discovered = server.collect_sessions()
-            except Exception as discover_error:
-                discovered = []
-                collection_errors.append(
-                    f"interruption discovery: {type(discover_error).__name__}: {discover_error}"
+            # Re-interrupt anything discovered after the CLI went away, so no
+            # late-created child session is left running server-side.
+            interrupted.extend(
+                _request_graceful_stop(
+                    server, recorder, collection_errors, already=set(interrupted)
                 )
-            for session in discovered:
-                session_id = session.get("id")
-                if session_id:
-                    server.interrupt_session(str(session_id))
-                    interrupted.append(str(session_id))
+            )
             raise error
         stdout_thread.join(timeout=2)
         stderr_thread.join(timeout=2)
@@ -2211,13 +2309,14 @@ def main() -> None:
         # On cancellation, interrupt the entire currently-discovered tree and
         # take one partial snapshot before closing the server.
         try:
+            # Same polite request as the CLI path, skipping anything already
+            # asked to stop so a session is not interrupted twice.
+            interrupted.extend(
+                _request_graceful_stop(
+                    server, recorder, collection_errors, already=set(interrupted)
+                )
+            )
             discovered = server.collect_sessions()
-            discovered_ids = {
-                str(item.get("id")) for item in discovered if item.get("id")
-            }
-            for session_id in sorted(discovered_ids):
-                server.interrupt_session(session_id)
-                interrupted.append(session_id)
             if root_id is None:
                 root_id = _root_id(
                     events,

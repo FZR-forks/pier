@@ -18,12 +18,15 @@ The persisted messages are converted into one ATIF trajectory per unique
 session, nested by their real ``parentID``.
 """
 
+import asyncio
 import copy
 import ipaddress
 import json
+import os
 import re
 import shlex
 import tempfile
+import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -170,6 +173,14 @@ class OpenCodeV2(BaseInstalledAgent):
     _CLI_STDERR_OUTPUT = _RUNNER_LOG_DIR / "opencode-v2-cli-stderr.log"
     _SERVER_STDERR_OUTPUT = _RUNNER_LOG_DIR / "opencode-v2-server-stderr.log"
     _EVENTS_OUTPUT = _RUNNER_LOG_DIR / "opencode-v2-events.jsonl"
+    _RUNNER_PIDFILE = _RUNNER_LOG_DIR / "opencode-v2-runner.pid"
+    # How long the runner is given to shut itself down after SIGTERM. Its own
+    # graceful path is bounded (interrupt, short collection, server stop), so
+    # this only has to be comfortably larger than that.
+    _RUNNER_STOP_GRACE_SECONDS = float(
+        os.environ.get("PIER_OPENCODE_V2_RUNNER_STOP_GRACE", "90")
+    )
+    _RUNNER_STOP_POLL_SECONDS = 2.0
     _INSTRUCTION_PATH = _RUNNER_LOG_DIR / "instruction.txt"
 
     # These values define the adapter's private process/config boundary.  A
@@ -1262,6 +1273,15 @@ class OpenCodeV2(BaseInstalledAgent):
                 env=env,
             )
         finally:
+            # A timed-out agent is cancelled host-side, and killing a
+            # `docker compose exec` client does not signal the process inside
+            # the container. Without this the runner, the OpenCode server and
+            # the agent's tools keep running while Pier collects artifacts and
+            # grades the task. Stop them before anything is read.
+            try:
+                await self._ensure_runner_stopped(environment, env)
+            except Exception:
+                self.logger.exception("OpenCode V2 runner shutdown failed")
             # Preserve the primary execution error even when artifact
             # collection fails; the runner keeps its JSONL evidence on disk
             # precisely so a failed run can still be graded.
@@ -1277,6 +1297,101 @@ class OpenCodeV2(BaseInstalledAgent):
             'mkdir -p "$OPENCODE_CONFIG_DIR/skills" && '
             f"cp -r {shlex.quote(self.skills_dir)}/* "
             '"$OPENCODE_CONFIG_DIR/skills/" 2>/dev/null || true'
+        )
+
+    async def _probe(
+        self,
+        environment: BaseEnvironment,
+        command: str,
+        env: dict[str, str] | None = None,
+    ) -> str:
+        """Run a short shell probe that always succeeds, returning its stdout."""
+        result = await self.exec_as_agent(
+            environment,
+            command=f"{{ {command} ; }} 2>/dev/null || true",
+            env=env,
+            timeout_sec=30,
+        )
+        return (getattr(result, "stdout", "") or "").strip()
+
+    async def _runner_is_running(
+        self, environment: BaseEnvironment, env: dict[str, str] | None = None
+    ) -> bool:
+        pidfile = shlex.quote(self._RUNNER_PIDFILE.as_posix())
+        # Signalling a recorded PID avoids matching the probe's own command
+        # line, which any `pgrep -f` over the runner path would do.
+        #
+        # A runner that has exited stays visible as a zombie until something
+        # reaps it, and container PID 1 frequently does not. `kill -0`
+        # succeeds for zombies, so checking only that would report a cleanly
+        # finished runner as still running and escalate to SIGKILL for no
+        # reason. Read the process state and treat Z as gone.
+        answer = await self._probe(
+            environment,
+            f"pid=$(cat {pidfile} 2>/dev/null); "
+            'if [ -z "$pid" ]; then echo GONE; '
+            'elif [ -r "/proc/$pid/stat" ]; then '
+            "  state=$(sed 's/.*) //' \"/proc/$pid/stat\" | cut -d' ' -f1); "
+            '  if [ "$state" = "Z" ]; then echo GONE; else echo RUNNING; fi; '
+            'elif kill -0 "$pid" 2>/dev/null; then echo RUNNING; '
+            "else echo GONE; fi",
+            env,
+        )
+        return answer.endswith("RUNNING")
+
+    async def _ensure_runner_stopped(
+        self, environment: BaseEnvironment, env: dict[str, str] | None = None
+    ) -> None:
+        """Stop the runner without killing OpenCode unless it is necessary.
+
+        The ladder is deliberate. SIGTERM reaches the runner's own handler,
+        which interrupts the OpenCode sessions, lets the CLI exit, collects
+        what evidence it can and shuts the server down cleanly. Only a runner
+        that ignores that is killed, and only then is a stray OpenCode process
+        swept up.
+        """
+        try:
+            if not await self._runner_is_running(environment, env):
+                return  # the normal path: it already exited on its own
+        except Exception:
+            self.logger.debug("Could not probe the OpenCode V2 runner")
+            return
+
+        self.logger.warning(
+            "OpenCode V2 runner is still running; requesting graceful shutdown"
+        )
+        pidfile = shlex.quote(self._RUNNER_PIDFILE.as_posix())
+        await self._probe(
+            environment,
+            f'pid=$(cat {pidfile} 2>/dev/null); [ -n "$pid" ] && kill -TERM "$pid"',
+            env,
+        )
+
+        deadline = time.monotonic() + self._RUNNER_STOP_GRACE_SECONDS
+        while time.monotonic() < deadline:
+            await asyncio.sleep(self._RUNNER_STOP_POLL_SECONDS)
+            try:
+                if not await self._runner_is_running(environment, env):
+                    self.logger.info("OpenCode V2 runner shut down gracefully")
+                    return
+            except Exception:
+                return
+
+        # It ignored SIGTERM. Kill it, then sweep any OpenCode process it owned,
+        # because its own cleanup never got to run.
+        self.logger.warning(
+            "OpenCode V2 runner ignored SIGTERM after %.0fs; killing it",
+            self._RUNNER_STOP_GRACE_SECONDS,
+        )
+        await self._probe(
+            environment,
+            f'pid=$(cat {pidfile} 2>/dev/null); [ -n "$pid" ] && kill -KILL "$pid"',
+            env,
+        )
+        await self._probe(
+            environment,
+            f"pkill -KILL -f {shlex.quote(self._REMOTE_BINARY.as_posix())}",
+            env,
         )
 
     async def _collect_runner_artifacts(self, environment: BaseEnvironment) -> None:
