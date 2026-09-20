@@ -193,13 +193,15 @@ class LiveRecorder:
             "cli_stderr_lines": 0,
             "server_stderr_lines": 0,
             "last_cli_activity_at": None,
+            "last_server_activity_at": None,
             "settle_iterations": 0,
             "sessions_snapshot_count": None,
             "sessions_snapshot_at": None,
             "incident_count": 0,
             "last_incident": None,
         }
-        self._last_activity_monotonic: float | None = None
+        self._last_cli_activity: float | None = None
+        self._last_server_activity: float | None = None
         self.stage("starting")
         # A hung agent stops calling _activity, so without an independent
         # heartbeat the status file would freeze with its last-known
@@ -263,7 +265,12 @@ class LiveRecorder:
             record.update(fields)
             self._status["incident_count"] = self._incident_count
             self._status["last_incident"] = record
-            self.incidents.write(json.dumps(record, ensure_ascii=False) + "\n")
+            # default=str mirrors _write_status: this runs on the CLI drain
+            # thread, and a TypeError here would stop draining and stall the
+            # benchmarked CLI on a full pipe.
+            self.incidents.write(
+                json.dumps(record, ensure_ascii=False, default=str) + "\n"
+            )
             self._write_status()
         self._echo(f"[opencode-v2] {kind}: {message}")
 
@@ -271,15 +278,15 @@ class LiveRecorder:
 
     def cli_stdout_line(self, line: str) -> None:
         self.cli_stream.write(line if line.endswith("\n") else line + "\n")
-        self._activity("cli_stdout_lines")
+        self._activity("cli_stdout_lines", source="cli")
 
     def cli_stderr_line(self, line: str) -> None:
         self.cli_stderr.write(line if line.endswith("\n") else line + "\n")
-        self._activity("cli_stderr_lines")
+        self._activity("cli_stderr_lines", source="cli")
 
     def server_stderr_line(self, line: str) -> None:
         self.server_stderr.write(line if line.endswith("\n") else line + "\n")
-        self._activity("server_stderr_lines")
+        self._activity("server_stderr_lines", source="server")
 
     def observe_event(self, event: dict[str, Any]) -> None:
         """Note what the CLI is doing right now, without forcing a write.
@@ -310,14 +317,24 @@ class LiveRecorder:
                     "at": _iso(time.time()),
                 }
 
-    def _activity(self, counter: str) -> None:
+    def _activity(self, counter: str, *, source: str) -> None:
         """Count a line and refresh status, throttled so a chatty CLI cannot
-        turn every line of output into a status rewrite."""
+        turn every line of output into a status rewrite.
+
+        CLI and server activity are timed separately on purpose. The server
+        logs on its own schedule, so folding it into the CLI's clock would
+        let a chatty server make a hung agent look busy -- destroying the
+        signal that distinguishes "still working" from "stopped".
+        """
         now = time.monotonic()
         with self._lock:
             self._status[counter] = int(self._status.get(counter) or 0) + 1
-            self._last_activity_monotonic = now
-            self._status["last_cli_activity_at"] = _iso(time.time())
+            if source == "cli":
+                self._last_cli_activity = now
+                self._status["last_cli_activity_at"] = _iso(time.time())
+            else:
+                self._last_server_activity = now
+                self._status["last_server_activity_at"] = _iso(time.time())
             if now - self._last_status_write >= STATUS_MIN_INTERVAL_SECONDS:
                 self._write_status()
 
@@ -356,8 +373,13 @@ class LiveRecorder:
         payload["updated_at"] = _iso(time.time())
         payload["elapsed_seconds"] = round(now - self._start, 3)
         payload["seconds_since_cli_activity"] = (
-            round(now - self._last_activity_monotonic, 3)
-            if self._last_activity_monotonic is not None
+            round(now - self._last_cli_activity, 3)
+            if self._last_cli_activity is not None
+            else None
+        )
+        payload["seconds_since_server_activity"] = (
+            round(now - self._last_server_activity, 3)
+            if self._last_server_activity is not None
             else None
         )
         payload["live_logs"] = {
@@ -1955,13 +1977,18 @@ def main() -> None:
                     f"private state preservation: {type(error).__name__}: {error}"
                 )
 
+    # Written atomically: a half-written final dump would otherwise be
+    # preferred over the intact partial snapshot, which defeats the point of
+    # keeping the snapshot at all.
     sessions_dump = logs_dir / "opencode-v2-sessions.jsonl"
-    sessions_dump.write_text(
+    sessions_temporary = sessions_dump.with_suffix(".jsonl.tmp")
+    sessions_temporary.write_text(
         "".join(
             json.dumps(inspection, ensure_ascii=False) + "\n"
             for inspection in inspections
         )
     )
+    os.replace(sessions_temporary, sessions_dump)
     dump_jsonl(logs_dir / "opencode-v2-raw-pages.jsonl", server.raw_pages)
 
     try:
@@ -2012,7 +2039,9 @@ def main() -> None:
         # runner-result.json knows the live record exists and how far it got.
         "live_status": recorder.snapshot(),
     }
-    (logs_dir / "runner-result.json").write_text(json.dumps(result, indent=2))
+    (logs_dir / "runner-result.json").write_text(
+        json.dumps(result, indent=2, default=str)
+    )
     recorder.stage(
         "finished",
         root_id=root_id,

@@ -152,6 +152,8 @@ class OpenCodeV2(BaseInstalledAgent):
     _INCIDENTS_OUTPUT = _RUNNER_LOG_DIR / "opencode-v2-incidents.jsonl"
     _CLI_STREAM_OUTPUT = _RUNNER_LOG_DIR / "opencode-v2-cli-stream.jsonl"
     _PARTIAL_SESSIONS_OUTPUT = _RUNNER_LOG_DIR / "opencode-v2-sessions.partial.jsonl"
+    _CLI_STDERR_OUTPUT = _RUNNER_LOG_DIR / "opencode-v2-cli-stderr.log"
+    _SERVER_STDERR_OUTPUT = _RUNNER_LOG_DIR / "opencode-v2-server-stderr.log"
     _INSTRUCTION_PATH = _RUNNER_LOG_DIR / "instruction.txt"
 
     # These values define the adapter's private process/config boundary.  A
@@ -1297,6 +1299,14 @@ class OpenCodeV2(BaseInstalledAgent):
                 self._PARTIAL_SESSIONS_OUTPUT,
                 self.logs_dir / "opencode-v2" / "opencode-v2-sessions.partial.jsonl",
             ),
+            (
+                self._CLI_STDERR_OUTPUT,
+                self.logs_dir / "opencode-v2" / "opencode-v2-cli-stderr.log",
+            ),
+            (
+                self._SERVER_STDERR_OUTPUT,
+                self.logs_dir / "opencode-v2" / "opencode-v2-server-stderr.log",
+            ),
         ):
             try:
                 await environment.download_file(remote.as_posix(), local)
@@ -2373,6 +2383,17 @@ class OpenCodeV2(BaseInstalledAgent):
         status = self._read_json(base / "opencode-v2-status.json") or {}
         incidents = self._read_jsonl(base / "opencode-v2-incidents.jsonl")
         evidence: dict[str, Any] = {}
+        # The runner only publishes ``root_id`` once it has confirmed the root
+        # against server metadata, and only stamps the candidates file as
+        # validated at the same point. ``root_candidates`` on its own is what
+        # the CLI claimed and may name a subagent, so it stays diagnostic.
+        candidates_file = (
+            self._read_json(base / "opencode-v2-root-candidates.json") or {}
+        )
+        if candidates_file.get("validated") is True and candidates_file.get("root_id"):
+            evidence["validated_root_id"] = str(candidates_file["root_id"])
+        if status.get("root_id"):
+            evidence["validated_root_id"] = str(status["root_id"])
         if status:
             for key in (
                 "stage",
@@ -2422,10 +2443,17 @@ class OpenCodeV2(BaseInstalledAgent):
         ]
         if evidence.get("elapsed_seconds") is not None:
             parts.append(f"after {evidence['elapsed_seconds']}s")
-        root = evidence.get("root_id") or (evidence.get("root_candidates") or [None])[0]
-        if root:
-            parts.append(f"in session {root}")
+        if evidence.get("validated_root_id"):
+            parts.append(f"in session {evidence['validated_root_id']}")
         sentence = " ".join(parts) + "."
+        candidates = evidence.get("root_candidates") or []
+        if not evidence.get("validated_root_id") and candidates:
+            # Reported, but never treated as the run's identity.
+            sentence += (
+                " The root session was never confirmed; the CLI named "
+                f"{', '.join(str(item) for item in candidates[:5])} "
+                "as unvalidated candidate(s)."
+            )
         tool = evidence.get("last_tool")
         if isinstance(tool, dict) and tool.get("tool"):
             sentence += (
@@ -2454,7 +2482,6 @@ class OpenCodeV2(BaseInstalledAgent):
         runner_result = self._read_json(
             self.logs_dir / "opencode-v2" / "runner-result.json"
         )
-        live_evidence = self._live_evidence()
         inspections = self._read_jsonl(
             self.logs_dir / "opencode-v2" / "opencode-v2-sessions.jsonl"
         )
@@ -2487,6 +2514,9 @@ class OpenCodeV2(BaseInstalledAgent):
             )
         inspections = valid_inspections
         if not inspections:
+            # Only read now: the CLI stream can be large and a successful
+            # collection never looks at it.
+            live_evidence = self._live_evidence()
             raw_collection_errors = (runner_result or {}).get("collection_errors")
             collection_errors = [
                 str(error)
@@ -2516,16 +2546,11 @@ class OpenCodeV2(BaseInstalledAgent):
                 else None
             )
             if recorded_root_id is None:
-                # The runner records the root the moment the CLI reveals it,
-                # long before the manifest exists.
-                candidates = live_evidence.get("root_candidates") or []
-                recorded_root_id = (
-                    str(
-                        live_evidence.get("root_id")
-                        or (candidates[0] if candidates else "")
-                    )
-                    or None
-                )
+                # The runner confirms the root against server metadata well
+                # before the manifest exists, so that confirmed value is safe
+                # to adopt. An unvalidated CLI candidate is not: it can name a
+                # subagent and would misattribute the whole trajectory.
+                recorded_root_id = live_evidence.get("validated_root_id") or None
             stub = Trajectory(
                 schema_version="ATIF-v1.7",
                 session_id=recorded_root_id,

@@ -3699,7 +3699,11 @@ def test_killed_runner_still_explains_what_opencode_was_doing(tmp_path: Path):
     finally:
         os.killpg(process.pid, signal.SIGKILL)
         process.wait(timeout=30)
-        subprocess.run(["pkill", "-9", "-f", str(binary)], check=False)
+        try:
+            subprocess.run(["pkill", "-9", "-f", str(binary)], check=False)
+        except OSError:
+            # check=False covers a non-zero exit, not a missing pkill.
+            pass
 
     # The runner never finalized, so its end-of-run artifacts cannot exist.
     assert not (logs_dir / "runner-result.json").exists()
@@ -3772,11 +3776,14 @@ def test_stub_trajectory_reports_the_live_evidence(tmp_path: Path):
     make_agent(tmp_path).populate_context_post_run(AgentContext())
 
     trajectory = json.loads((tmp_path / "trajectory.json").read_text())
-    # The session is known even though no manifest was ever written.
-    assert trajectory["session_id"] == "ses_abc"
+    # The CLI named a candidate but nothing ever confirmed it was the root, so
+    # it must not become the run's identity -- it could be a subagent.
+    assert trajectory.get("session_id") is None
     message = trajectory["steps"][0]["message"]
     assert "'cli-started'" in message
     assert "9000.0s" in message
+    # ... but it is still reported, explicitly as unvalidated.
+    assert "never confirmed" in message
     assert "ses_abc" in message
     assert "bash" in message
     assert "412 output line(s)" in message
@@ -3848,3 +3855,93 @@ def test_completed_collection_ignores_any_partial_snapshot(tmp_path: Path):
 
     trajectory = json.loads((tmp_path / "trajectory.json").read_text())
     assert trajectory["trajectory_id"] == "ses_real"
+
+
+def test_only_a_validated_root_becomes_the_trajectory_identity(tmp_path: Path):
+    """An unvalidated CLI candidate may name a subagent, never the run."""
+    runner_dir = tmp_path / "opencode-v2"
+    runner_dir.mkdir()
+    (runner_dir / "opencode-v2-status.json").write_text(
+        json.dumps({"stage": "cli-started", "root_candidates": ["ses_a", "ses_b"]})
+    )
+    make_agent(tmp_path).populate_context_post_run(AgentContext())
+    trajectory = json.loads((tmp_path / "trajectory.json").read_text())
+    assert trajectory.get("session_id") is None
+    assert trajectory.get("trajectory_id") is None
+    assert "never confirmed" in trajectory["steps"][0]["message"]
+
+    # Once the runner has confirmed the root against server metadata, adopting
+    # it is safe even though no manifest was ever written.
+    (runner_dir / "opencode-v2-root-candidates.json").write_text(
+        json.dumps(
+            {
+                "candidate_session_ids": ["ses_a", "ses_b"],
+                "root_id": "ses_b",
+                "validated": True,
+            }
+        )
+    )
+    make_agent(tmp_path).populate_context_post_run(AgentContext())
+    trajectory = json.loads((tmp_path / "trajectory.json").read_text())
+    assert trajectory["session_id"] == "ses_b"
+    assert "in session ses_b" in trajectory["steps"][0]["message"]
+
+
+def test_server_chatter_does_not_mask_a_silent_cli(tmp_path: Path):
+    """A chatty server must not make a hung agent look like it is working."""
+    recorder = runner_module.LiveRecorder(tmp_path, echo=False, heartbeat_seconds=0)
+    recorder.cli_stdout_line('{"type": "tool_use"}')
+    time.sleep(0.2)
+    # The CLI has gone quiet; only the server is still logging.
+    for _ in range(5):
+        recorder.server_stderr_line("server: still here")
+    recorder.close()
+
+    status = json.loads((tmp_path / runner_module.STATUS_FILENAME).read_text())
+    assert status["cli_stdout_lines"] == 1
+    assert status["server_stderr_lines"] == 5
+    # The CLI clock keeps running even though the server just spoke.
+    assert status["seconds_since_cli_activity"] >= 0.2
+    assert status["seconds_since_server_activity"] < 0.2
+
+
+def test_final_session_dump_is_written_atomically(tmp_path: Path):
+    """A truncated final dump must never shadow the intact partial snapshot."""
+    source = Path(runner_module.__file__).read_text()
+    dump = source[source.index("sessions_dump = logs_dir") :]
+    dump = dump[: dump.index("dump_jsonl(")]
+    assert "os.replace(sessions_temporary, sessions_dump)" in dump
+    assert ".jsonl.tmp" in dump
+
+
+def test_incident_records_survive_unserializable_values(tmp_path: Path):
+    """note() runs on the drain thread, so it must never raise."""
+    recorder = runner_module.LiveRecorder(tmp_path, echo=False, heartbeat_seconds=0)
+    recorder.note("odd", "message", payload=object())
+    recorder.close()
+    incidents = (tmp_path / runner_module.INCIDENTS_FILENAME).read_text().splitlines()
+    assert json.loads(incidents[0])["kind"] == "odd"
+
+
+def test_degraded_download_fetches_every_live_artifact(tmp_path: Path):
+    """The per-file fallback must preserve the same evidence as download_dir.
+
+    ``FakeEnvironment`` has no ``download_dir``, so this drives the real
+    degraded path rather than asserting on constants.
+    """
+    import asyncio
+
+    environment = FakeEnvironment()
+    agent = make_agent(tmp_path)
+    asyncio.run(agent._collect_runner_artifacts(environment))
+
+    fetched = {Path(remote).name for remote, _ in environment.downloads}
+    for name in (
+        runner_module.STATUS_FILENAME,
+        runner_module.INCIDENTS_FILENAME,
+        runner_module.CLI_STREAM_FILENAME,
+        runner_module.PARTIAL_SESSIONS_FILENAME,
+        runner_module.CLI_STDERR_FILENAME,
+        runner_module.SERVER_STDERR_FILENAME,
+    ):
+        assert name in fetched, f"{name} would be lost when download_dir is absent"
