@@ -1368,9 +1368,13 @@ class OpenCodeV2(BaseInstalledAgent):
         A process that has exited stays visible as a zombie until something
         reaps it, and container PID 1 often does not, so this reads the
         process state rather than using `kill -0`, which succeeds for
-        zombies. An unreadable probe reports GONE: the caller only uses this
-        to decide whether to keep escalating, and guessing "still running"
-        there would just burn the grace period.
+        zombies.
+
+        A probe that cannot be read reports UNKNOWN rather than GONE. This
+        adapter exists to stop the run flying blind, so "I could not tell"
+        must not be recorded as "it definitely stopped". Shutdown stays
+        best-effort and bounded either way; UNKNOWN just means the cleanup
+        runs and the uncertainty is logged.
         """
         checks = "; ".join(
             f"{{ {self._pid_expr(key)}; "
@@ -1387,13 +1391,13 @@ class OpenCodeV2(BaseInstalledAgent):
             answer = await self._probe(environment, checks, env)
         except Exception:
             self.logger.debug("Could not probe the OpenCode V2 processes")
-            return {key: "GONE" for key in self._OWNED_PROCESSES}
+            return {key: "UNKNOWN" for key in self._OWNED_PROCESSES}
         reported = dict(
             line.split("=", 1)
             for line in answer.split()
             if "=" in line and line.split("=", 1)[1] in {"GONE", "RUNNING"}
         )
-        return {key: reported.get(key, "GONE") for key in self._OWNED_PROCESSES}
+        return {key: reported.get(key, "UNKNOWN") for key in self._OWNED_PROCESSES}
 
     @staticmethod
     def _all_stopped(states: dict[str, str]) -> bool:
@@ -1401,7 +1405,7 @@ class OpenCodeV2(BaseInstalledAgent):
 
     @staticmethod
     def _still_alive(states: dict[str, str]) -> list[str]:
-        return sorted(key for key, state in states.items() if state == "RUNNING")
+        return sorted(key for key, state in states.items() if state != "GONE")
 
     async def _ensure_runner_stopped(
         self, environment: BaseEnvironment, env: dict[str, str] | None = None
@@ -1422,24 +1426,32 @@ class OpenCodeV2(BaseInstalledAgent):
         if self._all_stopped(states):
             return  # the normal path: it already exited on its own
 
-        self.logger.warning(
-            "OpenCode V2 is still running (%s); requesting graceful shutdown",
-            ", ".join(self._still_alive(states)),
-        )
-        await self._signal(
-            environment,
-            f'{self._pid_expr("runner")}; [ -n "$pid" ] && kill -TERM "$pid"',
-            env,
-        )
+        if states.get("runner") == "GONE":
+            # Nothing left to ask politely: the runner that would interrupt
+            # the sessions has already exited, so signalling its pid and
+            # waiting out the grace period would achieve nothing.
+            self.logger.warning(
+                "OpenCode V2 runner has exited but %s remain; cleaning up",
+                ", ".join(self._still_alive(states)),
+            )
+        else:
+            self.logger.warning(
+                "OpenCode V2 is still running (%s); requesting graceful shutdown",
+                ", ".join(self._still_alive(states)),
+            )
+            await self._signal(
+                environment,
+                f'{self._pid_expr("runner")}; [ -n "$pid" ] && kill -TERM "$pid"',
+                env,
+            )
 
-        deadline = time.monotonic() + self._RUNNER_STOP_GRACE_SECONDS
-        while time.monotonic() < deadline:
-            await asyncio.sleep(self._RUNNER_STOP_POLL_SECONDS)
-            if self._all_stopped(await self._owned_states(environment, env)):
-                self.logger.info("OpenCode V2 shut down gracefully")
-                return
-
-        self.logger.warning("OpenCode V2 ignored SIGTERM; killing it")
+            deadline = time.monotonic() + self._RUNNER_STOP_GRACE_SECONDS
+            while time.monotonic() < deadline:
+                await asyncio.sleep(self._RUNNER_STOP_POLL_SECONDS)
+                if self._all_stopped(await self._owned_states(environment, env)):
+                    self.logger.info("OpenCode V2 shut down gracefully")
+                    return
+            self.logger.warning("OpenCode V2 ignored SIGTERM; killing it")
         await self._force_stop(environment, env)
 
         states = await self._owned_states(environment, env)
@@ -1454,8 +1466,14 @@ class OpenCodeV2(BaseInstalledAgent):
     ) -> None:
         """Kill the recorded processes and the groups they lead.
 
-        The server and CLI are session leaders, so signalling their groups
-        reaches the tools they spawned.
+        This covers the runner, the server, the CLI, and anything still
+        running the OpenCode binary. It deliberately does *not* claim to
+        reach every shell command OpenCode started: v2.0.8 spawns those with
+        `detached: true` (`packages/core/src/shell.ts`), giving each its own
+        group and session, so no signal aimed at the recorded processes finds
+        them. Interrupting the sessions during graceful shutdown is what asks
+        OpenCode to stop its own tools; this is the fallback for a runner
+        that will not cooperate.
         """
         for key in ("cli", "server", "runner"):
             await self._signal(
