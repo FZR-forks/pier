@@ -1,18 +1,16 @@
-from importlib.metadata import version
-
 import typer
 from typer import Typer
 
+from pier import __version__
 from pier.cli.analyze import analyze_command, check_command
 from pier.cli.critique import critique_app
 from pier.cli.jobs import jobs_app, start
 from pier.cli.view import view_command
-from pier.constants import PYPI_PACKAGE_NAME
 
 
 def version_callback(value: bool) -> None:
     if value:
-        print(version(PYPI_PACKAGE_NAME))
+        print(__version__)
         raise typer.Exit()
 
 
