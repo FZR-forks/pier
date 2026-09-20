@@ -51,6 +51,736 @@ CLI_CAPTURE_MAX_LINES = 256
 CLI_CAPTURE_MAX_LINE_BYTES = 16 * 1024
 MAX_ROOT_CANDIDATES = 1024
 
+# Live (write-through) observability artifacts. These mirror state the runner
+# already holds; nothing here issues a request to the OpenCode server.
+STATUS_FILENAME = "opencode-v2-status.json"
+INCIDENTS_FILENAME = "opencode-v2-incidents.jsonl"
+CLI_STREAM_FILENAME = "opencode-v2-cli-stream.jsonl"
+CLI_STDERR_FILENAME = "opencode-v2-cli-stderr.log"
+SERVER_STDERR_FILENAME = "opencode-v2-server-stderr.log"
+PARTIAL_SESSIONS_FILENAME = "opencode-v2-sessions.partial.jsonl"
+EVENTS_FILENAME = "opencode-v2-events.jsonl"
+# Lets Pier signal exactly this runner on timeout instead of pattern-matching
+# process lists, which would also match the probe command itself.
+RUNNER_PIDFILE = "opencode-v2-runner.pid"
+
+# Cap on how much of a tool's input we keep in the live status. The full
+# argument list is already in the durable event log.
+TOOL_INPUT_PREVIEW_BYTES = 2048
+EVENT_STREAM_RECONNECT_DELAY = 1.0
+EVENT_STREAM_MAX_RECONNECTS = 20
+EVENT_LINE_MAX_BYTES = 4 * 1024 * 1024
+EVENT_LINE_DISCARD_MAX_BYTES = 64 * 1024 * 1024
+
+# Graceful shutdown ladder. Interrupting the session is how OpenCode is meant
+# to be stopped: it aborts the model turn and its running tools itself and
+# lets the CLI exit normally, which keeps the run's own records intact.
+# Signals are an escalation, used only when the polite route does not work.
+CLI_INTERRUPT_GRACE_SECONDS = float(
+    os.environ.get("PIER_OPENCODE_V2_INTERRUPT_GRACE", "30")
+)
+CLI_SIGTERM_GRACE_SECONDS = 10.0
+CLI_SIGKILL_GRACE_SECONDS = 5.0
+SERVER_STDIN_GRACE_SECONDS = 10.0
+
+LIVE_LOG_MAX_BYTES = 64 * 1024 * 1024
+# What `opencode run --format json` can and cannot tell us. This is a
+# presentation stream, not the raw event bus: the CLI emits a `tool_use`
+# record only once a tool succeeds or fails, and drops every event belonging
+# to a session other than the root. Verified against OpenCode v2.0.8
+# (packages/cli/src/run/noninteractive.ts): tool input/called/progress events
+# mutate CLI-local state and emit nothing, and non-root sessions are filtered.
+CLI_STREAM_LIMITATIONS = (
+    "opencode run --format json reports a tool only after it completes or "
+    "fails, and omits events from non-root (child) sessions. A tool that is "
+    "still running is therefore invisible here, so CLI silence does not "
+    "prove the agent stopped working."
+)
+STATUS_MIN_INTERVAL_SECONDS = 1.0
+STATUS_HEARTBEAT_SECONDS = 5.0
+
+
+# -- write-through observability ---------------------------------------------
+#
+# Pi, Codex and Claude Code stream agent output straight to a file while the
+# agent runs, so an interrupted trial still shows what the agent was doing.
+# This runner consumes the CLI and server pipes itself, so without the helpers
+# below its evidence would only reach disk during final collection -- exactly
+# the path a killed or timed-out run never reaches.
+#
+# Two rules keep this benchmark-neutral. Everything recorded is state the
+# runner already observes, so the OpenCode process is never polled or
+# perturbed. And every write is best effort: the threads that feed these logs
+# are the same threads that keep the benchmarked CLI's pipes drained, so a
+# failing log must degrade to silence rather than raise.
+
+
+def _iso(timestamp: float) -> str:
+    return (
+        time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(timestamp))
+        + f".{int((timestamp % 1) * 1000):03d}Z"
+    )
+
+
+class LiveLog:
+    """An append-only, byte-capped, never-raising text log."""
+
+    def __init__(self, path: Path, max_bytes: int = LIVE_LOG_MAX_BYTES):
+        self.path = path
+        self.max_bytes = max_bytes
+        self.written = 0
+        self.truncated = False
+        self.disabled_reason: str | None = None
+        self._handle: Any = None
+        self._lock = threading.Lock()
+
+    def _open(self) -> Any:
+        if self._handle is None and self.disabled_reason is None:
+            try:
+                self._handle = self.path.open("a", encoding="utf-8", errors="replace")
+            except OSError as error:
+                self.disabled_reason = f"{type(error).__name__}: {error}"
+        return self._handle
+
+    def write(self, text: str) -> None:
+        """Persist ``text`` immediately, or give up permanently on failure."""
+        if not text:
+            return
+        with self._lock:
+            if self.truncated or self.disabled_reason is not None:
+                return
+            handle = self._open()
+            if handle is None:
+                return
+            size = len(text.encode("utf-8", "replace"))
+            if self.written + size > self.max_bytes:
+                text = (
+                    f"\n[pier] live log truncated after {self.written} bytes "
+                    f"(cap {self.max_bytes})\n"
+                )
+                self.truncated = True
+            try:
+                handle.write(text)
+                handle.flush()
+            except (OSError, ValueError) as error:
+                self.disabled_reason = f"{type(error).__name__}: {error}"
+                return
+            if not self.truncated:
+                self.written += size
+
+    def close(self) -> None:
+        with self._lock:
+            handle, self._handle = self._handle, None
+        if handle is not None:
+            try:
+                handle.close()
+            except OSError:
+                pass
+
+    def state(self) -> dict[str, Any]:
+        return {
+            "path": self.path.name,
+            "bytes": self.written,
+            "truncated": self.truncated,
+            "disabled": self.disabled_reason,
+        }
+
+
+class LiveRecorder:
+    """A durable, continuously-updated view of what the runner is doing.
+
+    The runner's own stdout is already teed to a file by Pier, so stage and
+    incident lines are echoed there too. That gives a human-readable timeline
+    even when the logs directory itself cannot be written.
+    """
+
+    def __init__(
+        self,
+        logs_dir: Path,
+        *,
+        echo: bool = True,
+        heartbeat_seconds: float = STATUS_HEARTBEAT_SECONDS,
+    ):
+        self.logs_dir = logs_dir
+        self.echo = echo
+        self._lock = threading.RLock()
+        self._start = time.monotonic()
+        self._last_status_write = 0.0
+        self._incident_count = 0
+        self.cli_stream = LiveLog(logs_dir / CLI_STREAM_FILENAME)
+        self.cli_stderr = LiveLog(logs_dir / CLI_STDERR_FILENAME)
+        self.server_stderr = LiveLog(logs_dir / SERVER_STDERR_FILENAME)
+        self.incidents = LiveLog(logs_dir / INCIDENTS_FILENAME)
+        self.events = LiveLog(logs_dir / EVENTS_FILENAME)
+        self._running_tools: dict[tuple[str, str], dict[str, Any]] = {}
+        self._status: dict[str, Any] = {
+            "stage": "starting",
+            "stage_history": [],
+            "started_at": _iso(time.time()),
+            "runner_pid": os.getpid(),
+            "server_started": False,
+            "server_url_known": False,
+            "server_exit_code": None,
+            "cli_started": False,
+            "cli_pid": None,
+            "cli_returncode": None,
+            "root_id": None,
+            "root_candidates": [],
+            "cli_stdout_lines": 0,
+            "cli_stderr_lines": 0,
+            "server_stderr_lines": 0,
+            "last_cli_activity_at": None,
+            "last_server_activity_at": None,
+            "settle_iterations": 0,
+            "sessions_snapshot_count": None,
+            "sessions_snapshot_at": None,
+            "incident_count": 0,
+            "last_incident": None,
+            "last_reported_tool": None,
+            "cli_stream_limitations": CLI_STREAM_LIMITATIONS,
+            "agent_events_seen": 0,
+            "last_agent_activity_at": None,
+            "running_tools": [],
+            "last_tool_started": None,
+            "event_stream_connected": False,
+            # Set once the event feed has dropped: the feed has no replay, so
+            # a tool that finished during the gap stays listed as running.
+            "tool_state_stale": False,
+            "event_stream_gaps": 0,
+        }
+        self._last_cli_activity: float | None = None
+        self._last_server_activity: float | None = None
+        self._last_agent_activity: float | None = None
+        self.stage("starting")
+        # A hung agent stops calling _activity, so without an independent
+        # heartbeat the status file would freeze with its last-known
+        # "seconds_since_cli_activity" of ~0 and imply the agent was busy at
+        # the moment it died. The heartbeat keeps idleness observable.
+        self._stop_heartbeat = threading.Event()
+        self._heartbeat_seconds = heartbeat_seconds
+        self._heartbeat: threading.Thread | None = None
+        if heartbeat_seconds > 0:
+            self._heartbeat = threading.Thread(
+                target=self._heartbeat_loop,
+                name="opencode-v2-status-heartbeat",
+                daemon=True,
+            )
+            self._heartbeat.start()
+
+    def _heartbeat_loop(self) -> None:
+        while not self._stop_heartbeat.wait(self._heartbeat_seconds):
+            with self._lock:
+                self._write_status()
+
+    # -- emission ----------------------------------------------------------
+
+    def _echo(self, text: str) -> None:
+        if not self.echo:
+            return
+        try:
+            print(text, flush=True)
+        except (OSError, ValueError):
+            self.echo = False
+
+    def stage(self, name: str, **fields: Any) -> None:
+        """Record that the runner reached a new stage of execution."""
+        with self._lock:
+            elapsed = round(time.monotonic() - self._start, 3)
+            self._status["stage"] = name
+            history = self._status["stage_history"]
+            history.append({"stage": name, "at": _iso(time.time()), "elapsed": elapsed})
+            del history[:-64]
+            self._status.update(fields)
+            self._write_status()
+        detail = " ".join(f"{key}={value!r}" for key, value in sorted(fields.items()))
+        self._echo(f"[opencode-v2] stage={name} elapsed={elapsed}s {detail}".rstrip())
+
+    def update(self, **fields: Any) -> None:
+        with self._lock:
+            self._status.update(fields)
+            self._write_status()
+
+    def note(self, kind: str, message: str, **fields: Any) -> None:
+        """Persist an error or notable observation at the moment it happens."""
+        with self._lock:
+            self._incident_count += 1
+            record = {
+                "at": _iso(time.time()),
+                "elapsed": round(time.monotonic() - self._start, 3),
+                "stage": self._status.get("stage"),
+                "kind": kind,
+                "message": message,
+            }
+            record.update(fields)
+            self._status["incident_count"] = self._incident_count
+            self._status["last_incident"] = record
+            # default=str mirrors _write_status: this runs on the CLI drain
+            # thread, and a TypeError here would stop draining and stall the
+            # benchmarked CLI on a full pipe.
+            self.incidents.write(
+                json.dumps(record, ensure_ascii=False, default=str) + "\n"
+            )
+            self._write_status()
+        self._echo(f"[opencode-v2] {kind}: {message}")
+
+    # -- streamed activity -------------------------------------------------
+
+    def cli_stdout_line(self, line: str) -> None:
+        self.cli_stream.write(line if line.endswith("\n") else line + "\n")
+        self._activity("cli_stdout_lines", source="cli")
+
+    def cli_stderr_line(self, line: str) -> None:
+        self.cli_stderr.write(line if line.endswith("\n") else line + "\n")
+        self._activity("cli_stderr_lines", source="cli")
+
+    def server_stderr_line(self, line: str) -> None:
+        self.server_stderr.write(line if line.endswith("\n") else line + "\n")
+        self._activity("server_stderr_lines", source="server")
+
+    def observe_event(self, event: dict[str, Any]) -> None:
+        """Note what the CLI is doing right now, without forcing a write.
+
+        The throttled counter update that follows each line publishes this,
+        so describing activity costs nothing beyond the parse the drain
+        thread already performs for root-session capture.
+        """
+        part = event.get("part")
+        part = part if isinstance(part, dict) else {}
+        state = part.get("state")
+        state = state if isinstance(state, dict) else {}
+        described = {
+            "type": event.get("type"),
+            "tool": part.get("tool"),
+            "status": state.get("status"),
+            "sessionID": event.get("sessionID"),
+            "timestamp": event.get("timestamp"),
+        }
+        with self._lock:
+            self._status["last_cli_event"] = {
+                key: value for key, value in described.items() if value is not None
+            }
+            if part.get("tool"):
+                # Named "reported" deliberately: this is the last tool the CLI
+                # told us about, which during a hang is the one *before* the
+                # tool that is actually stuck.
+                self._status["last_reported_tool"] = {
+                    "tool": part.get("tool"),
+                    "status": state.get("status"),
+                    "at": _iso(time.time()),
+                }
+
+    def agent_event(self, payload: str) -> None:
+        """Record one raw server event and update in-flight tool state.
+
+        This is the only place that can see a tool *while it is running*, so
+        it is what makes a hang attributable to a specific command.
+        """
+        self.events.write(payload + "\n")
+        try:
+            event = json.loads(payload)
+        except (json.JSONDecodeError, TypeError):
+            event = None
+        now = time.monotonic()
+        with self._lock:
+            self._status["agent_events_seen"] = (
+                int(self._status.get("agent_events_seen") or 0) + 1
+            )
+            self._last_agent_activity = now
+            self._status["last_agent_activity_at"] = _iso(time.time())
+            if isinstance(event, dict):
+                self._track_tool(event)
+            write_due = now - self._last_status_write >= STATUS_MIN_INTERVAL_SECONDS
+            if write_due:
+                self._write_status()
+        if isinstance(event, dict):
+            self._note_event_error(event)
+
+    def _track_tool(self, event: dict[str, Any]) -> None:
+        """Maintain the set of tools that have started but not finished.
+
+        Caller holds the lock.
+        """
+        event_type = str(event.get("type") or "")
+        if not event_type.startswith("session.tool."):
+            return
+        data = event.get("data")
+        if not isinstance(data, dict):
+            return
+        key = (str(data.get("assistantMessageID") or ""), str(data.get("id") or ""))
+        if event_type == "session.tool.input.started":
+            entry = {
+                "tool": data.get("name"),
+                "sessionID": data.get("sessionID"),
+                "started_at": _iso(time.time()),
+                "started_monotonic": time.monotonic(),
+            }
+            self._running_tools[key] = entry
+            self._status["last_tool_started"] = {
+                k: v for k, v in entry.items() if k != "started_monotonic"
+            }
+        elif event_type == "session.tool.called":
+            entry = self._running_tools.setdefault(
+                key,
+                {
+                    "tool": None,
+                    "sessionID": data.get("sessionID"),
+                    "started_at": _iso(time.time()),
+                    "started_monotonic": time.monotonic(),
+                },
+            )
+            # The arguments are what identify a stuck command.
+            entry["input"] = _truncate(data.get("input"), TOOL_INPUT_PREVIEW_BYTES)
+            self._status["last_tool_started"] = {
+                k: v for k, v in entry.items() if k != "started_monotonic"
+            }
+        elif event_type == "session.tool.progress":
+            entry = self._running_tools.get(key)
+            if entry is not None:
+                entry["last_progress_at"] = _iso(time.time())
+        elif event_type in {"session.tool.success", "session.tool.failed"}:
+            self._running_tools.pop(key, None)
+        self._publish_running_tools()
+
+    def note_event_gap(self, reason: str) -> None:
+        """Record that the event feed dropped, so tool state may be stale.
+
+        The feed is volatile by contract and never replays, so a tool that
+        completed while disconnected keeps ageing in `running_tools`. Callers
+        must not present those entries as definitely still running.
+        """
+        with self._lock:
+            self._status["tool_state_stale"] = True
+            self._status["event_stream_gaps"] = (
+                int(self._status.get("event_stream_gaps") or 0) + 1
+            )
+            for entry in self._running_tools.values():
+                entry["observed_across_stream_gap"] = True
+            self._publish_running_tools()
+            self._write_status()
+        self.note("event-stream-gap", reason)
+
+    def _publish_running_tools(self) -> None:
+        """Caller holds the lock."""
+        now = time.monotonic()
+        self._status["running_tools"] = [
+            {
+                **{
+                    key: value
+                    for key, value in entry.items()
+                    if key != "started_monotonic"
+                },
+                "running_for_seconds": round(now - entry["started_monotonic"], 3),
+            }
+            for entry in self._running_tools.values()
+        ]
+
+    def _note_event_error(self, event: dict[str, Any]) -> None:
+        """Record server-side failures, however v2 spells them.
+
+        Matching the substring "error" in the type name misses OpenCode's
+        canonical failure events (`session.tool.failed`,
+        `session.step.failed`, `session.execution.failed`), which carry the
+        cause in `data.error`. Those are exactly the child-session failures
+        the CLI stream drops, which is why this subscription exists.
+        """
+        event_type = str(event.get("type") or "")
+        data = event.get("data") if isinstance(event.get("data"), dict) else {}
+        failure = data.get("error")
+        is_failure = (
+            "error" in event_type.lower()
+            or event_type.endswith(".failed")
+            or failure not in (None, "", {}, [])
+        )
+        if not is_failure:
+            return
+        self.note(
+            "server-event-error",
+            _truncate(failure if failure not in (None, "", {}, []) else event),
+            event_type=event_type,
+            sessionID=data.get("sessionID"),
+        )
+
+    def _activity(self, counter: str, *, source: str) -> None:
+        """Count a line and refresh status, throttled so a chatty CLI cannot
+        turn every line of output into a status rewrite.
+
+        CLI and server activity are timed separately on purpose. The server
+        logs on its own schedule, so folding it into the CLI's clock would
+        let a chatty server make a hung agent look busy -- destroying the
+        signal that distinguishes "still working" from "stopped".
+        """
+        now = time.monotonic()
+        with self._lock:
+            self._status[counter] = int(self._status.get(counter) or 0) + 1
+            if source == "cli":
+                self._last_cli_activity = now
+                self._status["last_cli_activity_at"] = _iso(time.time())
+            else:
+                self._last_server_activity = now
+                self._status["last_server_activity_at"] = _iso(time.time())
+            if now - self._last_status_write >= STATUS_MIN_INTERVAL_SECONDS:
+                self._write_status()
+
+    # -- snapshots ---------------------------------------------------------
+
+    def write_partial_sessions(self, inspections: list[dict]) -> None:
+        """Preserve the newest full inspection snapshot from the settle loop.
+
+        Collection can legitimately run for minutes; without this, a kill
+        anywhere inside it discards every session record already fetched.
+        """
+        path = self.logs_dir / PARTIAL_SESSIONS_FILENAME
+        temporary = path.with_suffix(path.suffix + ".tmp")
+        try:
+            temporary.write_text(
+                "".join(
+                    json.dumps(item, ensure_ascii=False) + "\n" for item in inspections
+                )
+            )
+            os.replace(temporary, path)
+        except (OSError, TypeError, ValueError) as error:
+            self.note("partial-snapshot-failed", f"{type(error).__name__}: {error}")
+            return
+        with self._lock:
+            self._status["sessions_snapshot_count"] = len(inspections)
+            self._status["sessions_snapshot_at"] = _iso(time.time())
+            self._write_status()
+
+    # -- status file -------------------------------------------------------
+
+    def _write_status(self) -> None:
+        """Replace the status file atomically. Caller holds the lock."""
+        now = time.monotonic()
+        self._last_status_write = now
+        # Refresh derived values *before* copying the status. Otherwise the
+        # written running-tool durations lag a full heartbeat behind, and a
+        # tool stuck for an hour reports a much smaller age.
+        if self._running_tools:
+            self._publish_running_tools()
+        payload = dict(self._status)
+        payload["updated_at"] = _iso(time.time())
+        payload["elapsed_seconds"] = round(now - self._start, 3)
+        payload["seconds_since_cli_activity"] = (
+            round(now - self._last_cli_activity, 3)
+            if self._last_cli_activity is not None
+            else None
+        )
+        payload["seconds_since_server_activity"] = (
+            round(now - self._last_server_activity, 3)
+            if self._last_server_activity is not None
+            else None
+        )
+        # The honest agent-activity clock: unlike the CLI stream this sees
+        # running tools and child sessions, so silence here really does mean
+        # the agent produced nothing.
+        payload["seconds_since_agent_activity"] = (
+            round(now - self._last_agent_activity, 3)
+            if self._last_agent_activity is not None
+            else None
+        )
+        payload["live_logs"] = {
+            "events": self.events.state(),
+            "cli_stream": self.cli_stream.state(),
+            "cli_stderr": self.cli_stderr.state(),
+            "server_stderr": self.server_stderr.state(),
+            "incidents": self.incidents.state(),
+        }
+        path = self.logs_dir / STATUS_FILENAME
+        temporary = path.with_suffix(".json.tmp")
+        try:
+            temporary.write_text(json.dumps(payload, indent=2, default=str) + "\n")
+            os.replace(temporary, path)
+        except (OSError, TypeError, ValueError):
+            # Status is a convenience; the incident and stream logs remain.
+            pass
+
+    def snapshot(self) -> dict[str, Any]:
+        with self._lock:
+            return dict(self._status)
+
+    def close(self) -> None:
+        self._stop_heartbeat.set()
+        if self._heartbeat is not None:
+            self._heartbeat.join(timeout=1)
+        with self._lock:
+            self._write_status()
+        for log in (
+            self.events,
+            self.cli_stream,
+            self.cli_stderr,
+            self.server_stderr,
+            self.incidents,
+        ):
+            log.close()
+
+
+class RecordedErrors(list):
+    """A ``collection_errors`` list that persists each entry as it is added.
+
+    Subclassing the list keeps every existing ``append``/``extend`` call site
+    working unchanged, and makes it impossible to add a collection error that
+    is only visible once ``runner-result.json`` is written.
+    """
+
+    def __init__(self, recorder: LiveRecorder):
+        super().__init__()
+        self._recorder = recorder
+
+    def append(self, item: Any) -> None:
+        super().append(item)
+        self._recorder.note("collection-error", str(item))
+
+    def extend(self, items: Iterable[Any]) -> None:
+        for item in items:
+            self.append(item)
+
+
+class OpenCodeEventStream:
+    """Read-only subscription to the OpenCode server's SSE event feed.
+
+    ``opencode run --format json`` is a presentation stream: it reports a
+    tool only once the tool finishes, and drops every event belonging to a
+    session other than the root (verified in v2.0.8
+    ``packages/cli/src/run/noninteractive.ts``). A tool that hangs therefore
+    never appears there, which is the single most useful fact when
+    diagnosing a timeout.
+
+    Pi, Codex and Claude Code all record tool starts durably
+    (``tool_execution_start``, ``item.started``, ``tool_use``), so this
+    subscription restores the same granularity for OpenCode rather than
+    adding a capability the other adapters lack.
+
+    Benchmark neutrality: this is a single read-only GET. OpenCode publishes
+    to subscribers with a non-blocking offer and simply drops any subscriber
+    that falls behind (``EventFeed.SubscriberOverflow``), so a slow reader
+    here can only break its own stream -- it can never backpressure the bus
+    or slow the agent. The CLI is already a subscriber of the same feed and
+    the encoded payload is shared, so the marginal server cost is one
+    non-blocking queue offer per event.
+    """
+
+    def __init__(self, url: str, password: str, recorder: "LiveRecorder"):
+        self.url = url.rstrip("/") + "/api/event"
+        self.password = password
+        self.recorder = recorder
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._response: Any = None
+        self._lock = threading.Lock()
+
+    def start(self) -> None:
+        self._thread = threading.Thread(
+            target=self._run, name="opencode-v2-events", daemon=True
+        )
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        with self._lock:
+            response, self._response = self._response, None
+        if response is not None:
+            try:
+                response.close()
+            except Exception:
+                pass
+        if self._thread is not None:
+            self._thread.join(timeout=2)
+
+    def _run(self) -> None:
+        """Consume the feed, reconnecting a bounded number of times."""
+        attempts = 0
+        while not self._stop.is_set() and attempts <= EVENT_STREAM_MAX_RECONNECTS:
+            try:
+                self._consume()
+            except Exception as error:
+                if self._stop.is_set():
+                    return
+                # The feed is volatile by contract: a dropped subscriber and
+                # any events missed while disconnected are expected, so this
+                # is recorded rather than treated as a run failure.
+                # A gap means missed events, including terminal tool
+                # results, so flag the in-flight state as unreliable.
+                self.recorder.note_event_gap(
+                    f"event stream dropped ({type(error).__name__}: {error}); "
+                    "events during the gap are lost"
+                )
+            if self._stop.is_set():
+                return
+            attempts += 1
+            self._stop.wait(EVENT_STREAM_RECONNECT_DELAY)
+        if not self._stop.is_set():
+            self.recorder.note(
+                "event-stream-abandoned",
+                f"gave up after {EVENT_STREAM_MAX_RECONNECTS} reconnect attempts",
+            )
+
+    def _discard_oversized_line(self, response: Any, seen: int) -> None:
+        """Drop the remainder of an over-long event, recording only a summary."""
+        while not self._stop.is_set():
+            chunk = response.readline(EVENT_LINE_MAX_BYTES)
+            if not chunk:
+                break
+            seen += len(chunk)
+            if chunk.endswith(b"\n") or seen > EVENT_LINE_DISCARD_MAX_BYTES:
+                break
+        self.recorder.note(
+            "event-line-oversize",
+            f"discarded an event line of at least {seen} bytes "
+            f"(limit {EVENT_LINE_MAX_BYTES})",
+        )
+
+    def _consume(self) -> None:
+        request = urllib.request.Request(
+            self.url,
+            headers={
+                "Authorization": auth_header(self.password),
+                "Accept": "text/event-stream",
+            },
+        )
+        response = urllib.request.urlopen(request)
+        with self._lock:
+            self._response = response
+        # Report connectivity at the boundary: a feed that is connected but
+        # quiet is not the same as one that never attached, and a later
+        # disconnect must not leave the field stuck on true.
+        self.recorder.update(event_stream_connected=True)
+        try:
+            while not self._stop.is_set():
+                # Bounded read: iterating the response would call an
+                # unbounded readline(), so a single event without a newline
+                # could consume arbitrary memory before any cap applies.
+                raw = response.readline(EVENT_LINE_MAX_BYTES + 1)
+                if not raw:
+                    # The feed ended without us asking it to. That is a gap
+                    # like any other -- there is no replay, so a terminal tool
+                    # event may have been lost -- so it must not reconnect
+                    # leaving the in-flight state looking trustworthy.
+                    if not self._stop.is_set():
+                        self.recorder.note_event_gap(
+                            "event stream closed unexpectedly; events during "
+                            "the gap are lost"
+                        )
+                    return
+                if len(raw) > EVENT_LINE_MAX_BYTES:
+                    self._discard_oversized_line(response, len(raw))
+                    continue
+                line = raw.decode("utf-8", "replace").rstrip("\n")
+                if not line.startswith("data:"):
+                    continue  # heartbeat comments and frame separators
+                payload = line[5:].strip()
+                if not payload:
+                    continue
+                self.recorder.agent_event(payload)
+        finally:
+            with self._lock:
+                if self._response is response:
+                    self._response = None
+            self.recorder.update(event_stream_connected=False)
+            try:
+                response.close()
+            except Exception:
+                pass
+
 
 def auth_header(password: str) -> str:
     token = base64.b64encode(f"{AUTH_USERNAME}:{password}".encode()).decode()
@@ -140,11 +870,24 @@ def wait_for_server(process, timeout_seconds: float = READY_TIMEOUT_SECONDS) -> 
 class OpenCodeV2Server:
     """One ``opencode serve --stdio`` process plus its authenticated client."""
 
-    def __init__(self, binary: str, cwd: str, password: str, env: dict[str, str]):
+    def __init__(
+        self,
+        binary: str,
+        cwd: str,
+        password: str,
+        env: dict[str, str],
+        recorder: "LiveRecorder | None" = None,
+    ):
         self.binary = binary
         self.cwd = cwd
         self.password = password
         self.env = env
+        # Optional: when present, server stderr becomes durable as it arrives
+        # instead of only reaching disk through the final runner result.
+        self.recorder = recorder
+        # Invoked with the pid the moment the process exists, so an abrupt
+        # death during readiness still leaves it externally killable.
+        self.on_process_spawned: Any = None
         self.process: subprocess.Popen | None = None
         self.url: str | None = None
         self.server_stderr = ""
@@ -229,6 +972,8 @@ class OpenCodeV2Server:
             text=True,
             start_new_session=True,
         )
+        if self.on_process_spawned is not None:
+            self.on_process_spawned(self.process.pid)
         self._stderr_chunks = []
 
         def drain_stderr() -> None:
@@ -238,6 +983,8 @@ class OpenCodeV2Server:
             try:
                 for line in stream:
                     self._stderr_chunks.append(line)
+                    if self.recorder is not None:
+                        self.recorder.server_stderr_line(line)
             except (OSError, ValueError):
                 pass
 
@@ -414,15 +1161,21 @@ class OpenCodeV2Server:
             if isinstance(info, dict) and info.get("type") == "running"
         }
 
-    def interrupt_session(self, session_id: str) -> None:
+    def interrupt_session(self, session_id: str) -> bool:
+        """Ask the server to abort a session. True only if it accepted.
+
+        A rejected or unreachable interrupt leaves the session running, so
+        callers must not record it as stopped.
+        """
         if not self.url:
-            return
-        http_post(
+            return False
+        status = http_post(
             self._api_url(f"api/session/{session_id}/interrupt"),
             self.password,
             {},
             timeout=self._request_timeout(10.0),
         )
+        return 200 <= status < 300
 
     def wait_session(
         self, session_id: str, timeout: float = SESSION_WAIT_REQUEST_SECONDS
@@ -504,7 +1257,10 @@ class OpenCodeV2Server:
         except OSError:
             pass
         try:
-            process.wait(timeout=3)
+            # Closing stdin is how `serve --stdio` is asked to exit. Give it a
+            # real chance before escalating; this costs nothing when the
+            # server exits promptly.
+            process.wait(timeout=SERVER_STDIN_GRACE_SECONDS)
         except subprocess.TimeoutExpired:
             pass
         # The lease-owning leader may exit while a helper remains in the
@@ -593,12 +1349,19 @@ def dump_jsonl(path: Path, records: list[dict]) -> None:
     )
 
 
+def _write_atomic(path: Path, text: str) -> None:
+    """Replace ``path`` in one step, so no reader sees a half-written file."""
+    temporary = path.with_name(path.name + ".tmp")
+    temporary.write_text(text)
+    os.replace(temporary, path)
+
+
 def _persist_root_candidates(
     path: Path, payload: dict[str, Any], errors: list[str]
 ) -> None:
     """Retain root candidates without interrupting CLI stdout collection."""
     try:
-        path.write_text(json.dumps(payload, indent=2) + "\n")
+        _write_atomic(path, json.dumps(payload, indent=2) + "\n")
     except OSError as error:
         errors.append(f"root candidate persistence: {type(error).__name__}: {error}")
 
@@ -851,6 +1614,52 @@ def _bounded_cli_line(line: str) -> str:
     return encoded[:CLI_CAPTURE_MAX_LINE_BYTES].decode("utf-8", errors="ignore")
 
 
+def _truncate(value: Any, limit: int = 2000) -> str:
+    text = value if isinstance(value, str) else json.dumps(value, default=str)
+    return text if len(text) <= limit else text[:limit] + "...<truncated>"
+
+
+def _note_cli_error(recorder: LiveRecorder, event: dict[str, Any]) -> None:
+    """Persist tool/provider failures the CLI reports, as they are reported.
+
+    Detection is structural rather than a text search: the agent frequently
+    writes code and tests that merely mention errors, and those must not be
+    recorded as failures of the run.
+    """
+    recorder.observe_event(event)
+    event_type = str(event.get("type") or "")
+    session_id = event.get("sessionID")
+    if "error" in event_type.lower():
+        recorder.note(
+            "cli-error-event",
+            _truncate(event.get("error") or event),
+            event_type=event_type,
+            sessionID=session_id,
+        )
+        return
+    if event.get("error"):
+        recorder.note(
+            "cli-error",
+            _truncate(event["error"]),
+            event_type=event_type,
+            sessionID=session_id,
+        )
+        return
+    part = event.get("part")
+    if not isinstance(part, dict):
+        return
+    state = part.get("state")
+    if not isinstance(state, dict):
+        return
+    if str(state.get("status") or "") == "error":
+        recorder.note(
+            "tool-error",
+            _truncate(state.get("error") or state.get("output") or state),
+            tool=part.get("tool"),
+            sessionID=session_id,
+        )
+
+
 def _events(stdout_lines: Iterable[str]) -> list[dict]:
     result: list[dict] = []
     for line in stdout_lines:
@@ -1012,22 +1821,48 @@ def _raise_runner_failure(
     # Observational gaps withhold complete aggregates through runner-result.
 
 
+def _inspect_each(
+    server: OpenCodeV2Server,
+    sessions: list[dict],
+    errors: list[str],
+) -> list[dict]:
+    """Inspect sessions one by one, keeping whatever succeeds.
+
+    These run on the timeout and abort paths, where the evidence is often all
+    that survives; one failing session must not discard the rest.
+    """
+    inspections: list[dict] = []
+    for session in sessions:
+        try:
+            inspections.append(server.inspect_session(session))
+        except Exception as error:
+            session_id = str(session.get("id") or "unknown")
+            errors.append(f"inspect {session_id}: {type(error).__name__}: {error}")
+    return inspections
+
+
 def _collect_tree(
     server: OpenCodeV2Server,
     root_id: str,
     *,
     deadline: float,
     errors: list[str],
+    recorder: LiveRecorder | None = None,
 ) -> tuple[list[dict], bool]:
     """Wait and collect two identical terminal snapshots of the whole tree."""
     previous: tuple | None = None
+    last_persisted: tuple | None = None
     stable = False
     inspections: list[dict] = []
     last_blockers: list[str] = []
     poll_interval = SETTLE_INTERVAL_SECONDS
+    iterations = 0
     server.collection_deadline = deadline
     try:
         while time.monotonic() < deadline:
+            iterations += 1
+            if recorder is not None:
+                recorder.update(settle_iterations=iterations)
             blockers: list[str] = []
             try:
                 sessions = server.collect_descendants(root_id)
@@ -1038,10 +1873,37 @@ def _collect_tree(
                     if not server.wait_session(session_id):
                         blockers.append(f"session.wait failed for {session_id}")
                 active = server.running_session_ids()
-                inspections = [
-                    server.inspect_session(session, active_ids=active)
-                    for session in sessions
-                ]
+                # Inspect one session at a time and keep what succeeds. A
+                # comprehension would discard an already-fetched root the
+                # moment any child request failed, which is the evidence we
+                # most want when collection is interrupted.
+                inspections = []
+                for session in sessions:
+                    try:
+                        inspections.append(
+                            server.inspect_session(session, active_ids=active)
+                        )
+                    except Exception as error:
+                        session_id = str(session.get("id") or "unknown")
+                        message = (
+                            f"inspect {session_id}: {type(error).__name__}: {error}"
+                        )
+                        # A blocker keeps this round non-terminal, but is not
+                        # promoted into collection_errors: a transient failure
+                        # must not permanently invalidate a collection that
+                        # later settles cleanly.
+                        blockers.append(message)
+                        if recorder is not None:
+                            recorder.note(
+                                "collection-exception", message, sessionID=session_id
+                            )
+                # Persist before the terminal checks, so successfully fetched
+                # sessions survive even when a later check raises.
+                if recorder is not None and inspections:
+                    persisted = _snapshot_signature(inspections)
+                    if persisted != last_persisted:
+                        recorder.write_partial_sessions(inspections)
+                        last_persisted = persisted
                 if any(item.get("inbox") is None for item in inspections):
                     blockers.append("session inbox state unavailable")
                 pending_inbox = any(item.get("inbox") for item in inspections)
@@ -1075,7 +1937,11 @@ def _collect_tree(
                     poll_interval = SETTLE_INTERVAL_SECONDS
                 previous = signature
             except Exception as error:  # preserve partial records and retry discovery
-                blockers = [f"collection: {type(error).__name__}: {error}"]
+                message = f"collection: {type(error).__name__}: {error}"
+                blockers = [message]
+                # Durable when observed, rather than only at the deadline.
+                if recorder is not None:
+                    recorder.note("collection-exception", message)
             last_blockers = blockers
             time.sleep(min(poll_interval, max(0.0, deadline - time.monotonic())))
             poll_interval = min(SETTLE_MAX_INTERVAL_SECONDS, poll_interval * 2)
@@ -1099,13 +1965,109 @@ def _collect_tree(
                 str(session.get("id")) for session in sessions if session.get("id")
             )
             server.interrupt_all(known_ids)
-            inspections = [server.inspect_session(session) for session in sessions]
+            inspections = _inspect_each(server, sessions, errors)
+            if recorder is not None:
+                recorder.write_partial_sessions(inspections)
         except Exception as error:
             server.interrupt_all(known_ids)
             errors.append(f"timeout interruption: {type(error).__name__}: {error}")
         finally:
             server.collection_deadline = None
     return inspections, stable
+
+
+def _request_graceful_stop(
+    server: OpenCodeV2Server,
+    recorder: LiveRecorder,
+    errors: list[str],
+    already: set[str] | None = None,
+) -> list[str]:
+    """Ask OpenCode to abort its own work, the way a user pressing Esc would.
+
+    This is the first rung of the shutdown ladder. It stops the model turn and
+    any running tool inside OpenCode, which is both cleaner than a signal and
+    the only way the agent's own session records stay consistent.
+    """
+    already = already or set()
+    stopped: list[str] = []
+    try:
+        discovered = server.collect_sessions()
+    except Exception as error:
+        errors.append(f"interruption discovery: {type(error).__name__}: {error}")
+        return stopped
+    for session in discovered:
+        session_id = str(session.get("id") or "")
+        if not session_id or session_id in already:
+            continue
+        try:
+            accepted = server.interrupt_session(session_id)
+        except Exception as error:
+            errors.append(f"interrupt {session_id}: {type(error).__name__}: {error}")
+            continue
+        if not accepted:
+            # Still running server-side, so leave it eligible for the next
+            # attempt rather than recording it as stopped.
+            errors.append(f"interrupt {session_id}: server rejected the request")
+            continue
+        stopped.append(session_id)
+    if stopped:
+        recorder.note(
+            "sessions-interrupted",
+            "asked OpenCode to stop " + ", ".join(sorted(stopped)),
+        )
+    return stopped
+
+
+def _stop_cli(
+    cli_process: subprocess.Popen,
+    recorder: LiveRecorder,
+    errors: list[str],
+) -> str:
+    """Escalate only as far as the CLI actually requires.
+
+    Returns which rung of the ladder ended the process, so the artifacts
+    record whether OpenCode shut itself down or had to be killed.
+    """
+    # 1. It may already be finishing off the back of the interrupt.
+    try:
+        cli_process.wait(timeout=CLI_INTERRUPT_GRACE_SECONDS)
+        return "exited-after-interrupt"
+    except subprocess.TimeoutExpired:
+        pass
+
+    # 2. Ask the process group to terminate.
+    recorder.note(
+        "cli-escalation",
+        "CLI did not exit after session interrupt; sending SIGTERM",
+    )
+    try:
+        os.killpg(cli_process.pid, signal.SIGTERM)
+    except (ProcessLookupError, PermissionError):
+        try:
+            cli_process.terminate()
+        except OSError:
+            pass
+    try:
+        cli_process.wait(timeout=CLI_SIGTERM_GRACE_SECONDS)
+        return "sigterm"
+    except subprocess.TimeoutExpired:
+        pass
+
+    # 3. Last resort.
+    recorder.note("cli-escalation", "CLI ignored SIGTERM; sending SIGKILL")
+    try:
+        os.killpg(cli_process.pid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError):
+        try:
+            cli_process.kill()
+        except OSError:
+            pass
+    try:
+        cli_process.wait(timeout=CLI_SIGKILL_GRACE_SECONDS)
+        return "sigkill"
+    except subprocess.TimeoutExpired:
+        errors.append("CLI process did not exit after cancellation")
+        return "survived-sigkill"
 
 
 def _preserve_private_state(env: dict[str, str], logs_dir: Path) -> list[str]:
@@ -1162,6 +2124,42 @@ def main() -> None:
 
     logs_dir = Path(args.logs_dir).resolve()
     logs_dir.mkdir(parents=True, exist_ok=True)
+    # Start recording before anything else can fail, so even an immediate
+    # crash leaves a stage behind.
+    recorder = LiveRecorder(logs_dir)
+    # ``key=pid`` lines so a forced teardown can signal each owned process
+    # group by name. The server and CLI are session leaders, so their groups
+    # cover the tools they spawn.
+    #
+    # Every owned process is named up front. An explicit ``none`` means "not
+    # started", which is safe to read as stopped; a *missing* line means the
+    # file was truncated or never finished, which is not. Shutdown depends on
+    # telling those apart, so the file is replaced atomically and never left
+    # half-written.
+    owned_pids: dict[str, str] = {
+        "runner": str(os.getpid()),
+        "server": "none",
+        "cli": "none",
+    }
+    pidfile_lock = threading.Lock()
+
+    def write_pidfile() -> None:
+        path = logs_dir / RUNNER_PIDFILE
+        temporary = path.with_suffix(".pid.tmp")
+        try:
+            with pidfile_lock:
+                temporary.write_text(
+                    "".join(f"{key}={pid}\n" for key, pid in owned_pids.items())
+                )
+                os.replace(temporary, path)
+        except OSError as error:
+            recorder.note("pidfile-failed", f"{type(error).__name__}: {error}")
+
+    def record_pid(key: str, pid: int) -> None:
+        owned_pids[key] = str(pid)
+        write_pidfile()
+
+    write_pidfile()
     work_dir = Path(args.work_dir).resolve()
     instruction = Path(args.instruction_file).read_text()
     binary = resolve_binary(args.binary)
@@ -1197,7 +2195,11 @@ def main() -> None:
         env["OPENCODE_CONFIG"] = os.path.abspath(args.config_file)
 
     server = OpenCodeV2Server(
-        binary=binary, cwd=str(work_dir), password=password, env=env
+        binary=binary,
+        cwd=str(work_dir),
+        password=password,
+        env=env,
+        recorder=recorder,
     )
 
     stdout_lines: deque[str] = deque(maxlen=CLI_CAPTURE_MAX_LINES)
@@ -1205,7 +2207,7 @@ def main() -> None:
     cli_returncode: int | None = None
     server_stderr = ""
     run_error: str | None = None
-    collection_errors: list[str] = []
+    collection_errors: list[str] = RecordedErrors(recorder)
     inspections: list[dict] = []
     interrupted: list[str] = []
     cancelled = False
@@ -1220,15 +2222,41 @@ def main() -> None:
     server_exit_code: int | None = None
     early_root_candidates: set[str] = set()
     early_root_events: deque[dict[str, str]] = deque(maxlen=CLI_CAPTURE_MAX_LINES)
+    event_stream: OpenCodeEventStream | None = None
+
+    # Shutdown must be idempotent. Pier signals the runner when a trial times
+    # out, and that signal can land while the runner is already finalizing --
+    # raising there would abort it partway and lose `runner-result.json`,
+    # which is the opposite of what asking it to stop is for.
+    finalizing = threading.Event()
 
     def handle_termination(signum, _frame):
+        if finalizing.is_set():
+            recorder.note(
+                "termination-signal-ignored",
+                f"signal {signum} arrived while already shutting down",
+            )
+            return
         raise KeyboardInterrupt(f"received signal {signum}")
 
     signal.signal(signal.SIGTERM, handle_termination)
 
     try:
+        recorder.stage("server-starting")
+        # Durable before readiness: a runner that dies mid-startup must still
+        # leave the server killable from outside.
+        server.on_process_spawned = lambda pid: record_pid("server", pid)
         server.start()
         assert server.url is not None
+        recorder.stage(
+            "server-started",
+            server_started=True,
+            server_url_known=True,
+            server_pid=server.process.pid if server.process else None,
+        )
+        # Subscribe before the CLI starts so no agent activity is missed.
+        event_stream = OpenCodeEventStream(server.url, password, recorder)
+        event_stream.start()
         model_spec = args.model
         if model_spec and args.variant and "#" not in model_spec:
             model_spec = f"{model_spec}#{args.variant}"
@@ -1241,6 +2269,7 @@ def main() -> None:
         (logs_dir / "opencode-v2-preflight.json").write_text(
             json.dumps(preflight, indent=2) + "\n"
         )
+        recorder.stage("preflight-ok")
         try:
             before_ids = {
                 str(item.get("id"))
@@ -1296,6 +2325,8 @@ def main() -> None:
                         session_id = (
                             event.get("sessionID") if isinstance(event, dict) else None
                         )
+                        if isinstance(event, dict):
+                            _note_cli_error(recorder, event)
                         if isinstance(session_id, str) and session_id:
                             early_root_events.append({"sessionID": session_id})
                             if (
@@ -1306,6 +2337,9 @@ def main() -> None:
                                 # Persist the CLI-supplied ID while execution
                                 # is in progress. Final collection validates it
                                 # against private server metadata.
+                                recorder.update(
+                                    root_candidates=sorted(early_root_candidates)
+                                )
                                 _persist_root_candidates(
                                     logs_dir / "opencode-v2-root-candidates.json",
                                     {
@@ -1318,6 +2352,12 @@ def main() -> None:
                                     collection_errors,
                                 )
                     destination.append(_bounded_cli_line(line))
+                    # Durable at observation time. The bounded deque above
+                    # still backs the existing cli-events artifact unchanged.
+                    if capture_root:
+                        recorder.cli_stdout_line(line.rstrip("\n"))
+                    else:
+                        recorder.cli_stderr_line(line.rstrip("\n"))
             except (OSError, ValueError):
                 pass
 
@@ -1336,50 +2376,41 @@ def main() -> None:
         )
         stdout_thread.start()
         stderr_thread.start()
+        record_pid("cli", cli_process.pid)
+        recorder.stage("cli-started", cli_started=True, cli_pid=cli_process.pid)
         try:
             cli_returncode = cli_process.wait()
+            recorder.stage("cli-exited", cli_returncode=cli_returncode)
         except BaseException as error:
-            # Cancellation or runner shutdown: kill the CLI, then interrupt
-            # every session the server has discovered before tearing down.
+            # Cancellation or runner shutdown. Ask OpenCode to stop before
+            # reaching for a signal: interrupting the session aborts the turn
+            # and its tools cleanly and lets the CLI exit on its own, so the
+            # agent's own records stay consistent. Signals escalate from there
+            # only if that does not work.
             cancelled = True
-            try:
-                os.killpg(cli_process.pid, signal.SIGTERM)
-            except (ProcessLookupError, PermissionError):
-                cli_process.kill()
-            try:
-                cli_process.wait(timeout=10)
-            except subprocess.TimeoutExpired:
-                try:
-                    os.killpg(cli_process.pid, signal.SIGKILL)
-                except (ProcessLookupError, PermissionError):
-                    try:
-                        cli_process.kill()
-                    except OSError:
-                        pass
-                try:
-                    cli_process.wait(timeout=2)
-                except subprocess.TimeoutExpired:
-                    collection_errors.append(
-                        "CLI process did not exit after cancellation"
-                    )
+            recorder.stage(
+                "cli-cancelled",
+                cancelled=True,
+                cancel_cause=f"{type(error).__name__}: {error}",
+            )
+            interrupted.extend(
+                _request_graceful_stop(server, recorder, collection_errors)
+            )
+            stop_method = _stop_cli(cli_process, recorder, collection_errors)
+            recorder.stage("cli-stopped", cli_stop_method=stop_method)
             stdout_thread.join(timeout=1)
             stderr_thread.join(timeout=1)
             cli_stderr = "".join(stderr_lines)
             events = _events(stdout_lines)
             events.extend(early_root_events)
             dump_jsonl(logs_dir / "opencode-v2-cli-events.jsonl", events)
-            try:
-                discovered = server.collect_sessions()
-            except Exception as discover_error:
-                discovered = []
-                collection_errors.append(
-                    f"interruption discovery: {type(discover_error).__name__}: {discover_error}"
+            # Re-interrupt anything discovered after the CLI went away, so no
+            # late-created child session is left running server-side.
+            interrupted.extend(
+                _request_graceful_stop(
+                    server, recorder, collection_errors, already=set(interrupted)
                 )
-            for session in discovered:
-                session_id = session.get("id")
-                if session_id:
-                    server.interrupt_session(str(session_id))
-                    interrupted.append(str(session_id))
+            )
             raise error
         stdout_thread.join(timeout=2)
         stderr_thread.join(timeout=2)
@@ -1399,7 +2430,8 @@ def main() -> None:
                     "could not resolve an unambiguous newly-created root session"
                 )
             else:
-                (logs_dir / "opencode-v2-root-candidates.json").write_text(
+                _write_atomic(
+                    logs_dir / "opencode-v2-root-candidates.json",
                     json.dumps(
                         {
                             "source": "cli-event",
@@ -1409,14 +2441,17 @@ def main() -> None:
                         },
                         indent=2,
                     )
-                    + "\n"
+                    + "\n",
                 )
+                recorder.stage("collecting", root_id=root_id)
                 inspections, settled = _collect_tree(
                     server,
                     root_id,
                     deadline=time.monotonic() + max(0.1, args.settle_timeout),
                     errors=collection_errors,
+                    recorder=recorder,
                 )
+                recorder.stage("collected", settled=settled)
                 if not settled:
                     collection_errors.append(
                         "session tree did not reach two identical terminal snapshots"
@@ -1429,16 +2464,27 @@ def main() -> None:
         pending_error = error
         run_error = run_error or f"{type(error).__name__}: {error}"
         cancelled = cancelled or isinstance(error, (KeyboardInterrupt, SystemExit))
+        # The abort handler collects a final snapshot before the `finally`
+        # runs, so it is already part of finalization: a second signal must
+        # not cut it short either.
+        finalizing.set()
+        recorder.stage(
+            "aborted",
+            cancelled=cancelled,
+            run_error=run_error,
+        )
+        recorder.note("runner-aborted", run_error)
         # On cancellation, interrupt the entire currently-discovered tree and
         # take one partial snapshot before closing the server.
         try:
+            # Same polite request as the CLI path, skipping anything already
+            # asked to stop so a session is not interrupted twice.
+            interrupted.extend(
+                _request_graceful_stop(
+                    server, recorder, collection_errors, already=set(interrupted)
+                )
+            )
             discovered = server.collect_sessions()
-            discovered_ids = {
-                str(item.get("id")) for item in discovered if item.get("id")
-            }
-            for session_id in sorted(discovered_ids):
-                server.interrupt_session(session_id)
-                interrupted.append(session_id)
             if root_id is None:
                 root_id = _root_id(
                     events,
@@ -1452,17 +2498,28 @@ def main() -> None:
                     root_id,
                     deadline=time.monotonic() + 5,
                     errors=collection_errors,
+                    recorder=recorder,
                 )
             else:
-                inspections = [server.inspect_session(item) for item in discovered]
+                inspections = _inspect_each(server, discovered, collection_errors)
         except Exception as cleanup_error:
             collection_errors.append(
                 f"partial collection: {type(cleanup_error).__name__}: {cleanup_error}"
             )
     finally:
+        finalizing.set()
+        recorder.stage("shutting-down")
+        if event_stream is not None:
+            try:
+                event_stream.stop()
+            except Exception as error:
+                collection_errors.append(
+                    f"event stream shutdown: {type(error).__name__}: {error}"
+                )
         process = server.process
         if process is not None:
             server_exit_code = process.poll()
+            recorder.update(server_exit_code=server_exit_code)
             if server_exit_code is not None:
                 collection_errors.append(
                     "OpenCode server exited unexpectedly before owned shutdown "
@@ -1483,13 +2540,18 @@ def main() -> None:
                     f"private state preservation: {type(error).__name__}: {error}"
                 )
 
+    # Written atomically: a half-written final dump would otherwise be
+    # preferred over the intact partial snapshot, which defeats the point of
+    # keeping the snapshot at all.
     sessions_dump = logs_dir / "opencode-v2-sessions.jsonl"
-    sessions_dump.write_text(
+    sessions_temporary = sessions_dump.with_suffix(".jsonl.tmp")
+    sessions_temporary.write_text(
         "".join(
             json.dumps(inspection, ensure_ascii=False) + "\n"
             for inspection in inspections
         )
     )
+    os.replace(sessions_temporary, sessions_dump)
     dump_jsonl(logs_dir / "opencode-v2-raw-pages.jsonl", server.raw_pages)
 
     try:
@@ -1504,6 +2566,23 @@ def main() -> None:
     except (OSError, subprocess.SubprocessError) as error:
         binary_version = f"unavailable: {type(error).__name__}: {error}"
 
+    collection_complete = _collection_complete(
+        settled=settled,
+        errors=collection_errors,
+        root_id=root_id,
+        server_exit_code=server_exit_code,
+    )
+    # Reach the terminal stage *before* snapshotting, so the manifest's
+    # embedded record reports how the run actually ended rather than freezing
+    # on the teardown stage that happened to be current.
+    recorder.stage(
+        "finalizing",
+        root_id=root_id,
+        cli_returncode=cli_returncode,
+        session_count=len(inspections),
+        collection_complete=collection_complete,
+    )
+
     result = {
         "instruction_file": args.instruction_file,
         "binary": binary,
@@ -1517,12 +2596,7 @@ def main() -> None:
         "run_error": run_error,
         "cancelled": cancelled,
         "root_id": root_id,
-        "collection_complete": _collection_complete(
-            settled=settled,
-            errors=collection_errors,
-            root_id=root_id,
-            server_exit_code=server_exit_code,
-        ),
+        "collection_complete": collection_complete,
         "collection_errors": collection_errors,
         "discovered_session_ids": [
             str(item.get("session", {}).get("id")) for item in inspections
@@ -1532,12 +2606,21 @@ def main() -> None:
         "raw_pages_dropped": server.raw_pages_dropped,
         "raw_pages_deduplicated": server.raw_pages_deduplicated,
         "raw_pages_oversize": server.raw_pages_oversize,
+        "agent_events_seen": recorder.snapshot().get("agent_events_seen"),
         "resolved_model_sha256": (preflight or {}).get("resolved_model_sha256"),
         "private_state_artifacts": private_state_artifacts,
         "session_count": len(inspections),
         "message_count": sum(len(inspection["messages"]) for inspection in inspections),
+        # A pointer to the write-through evidence, so a reader that only has
+        # runner-result.json knows the live record exists and how far it got.
+        "live_status": recorder.snapshot(),
     }
-    (logs_dir / "runner-result.json").write_text(json.dumps(result, indent=2))
+    _write_atomic(
+        logs_dir / "runner-result.json", json.dumps(result, indent=2, default=str)
+    )
+    # Only now is the manifest genuinely on disk.
+    recorder.stage("finished", runner_result_written=True)
+    recorder.close()
 
     _raise_runner_failure(pending_error, run_error)
 

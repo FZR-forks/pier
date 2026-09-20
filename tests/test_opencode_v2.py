@@ -1,12 +1,16 @@
 """Focused tests for the OpenCode V2 (opencode-v2) Pier agent."""
 
+import asyncio
 import copy
 import json
 import logging
 import os
+import shlex
+import shutil
 import signal
 import subprocess
 import time
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -43,6 +47,15 @@ class FakeEnvironment:
 
     async def exec(self, **kwargs: Any) -> ExecResult:
         self.exec_calls.append(kwargs)
+        if "/proc/$pid/stat" in kwargs.get("command", ""):
+            # Model a container where the run has finished: everything the
+            # runner owned is gone. Returning nothing would read as UNKNOWN,
+            # which the adapter correctly refuses to treat as stopped.
+            return ExecResult(
+                return_code=0,
+                stdout=" ".join(f"{key}=GONE" for key in OpenCodeV2._OWNED_PROCESSES),
+                stderr="",
+            )
         return ExecResult(return_code=0, stdout="", stderr="")
 
     async def download_file(self, remote: str, local: Path) -> None:
@@ -3396,3 +3409,2204 @@ def test_install_spec_rejects_unsafe_version(tmp_path: Path):
 def test_version_command_uses_remote_binary(tmp_path: Path):
     agent = make_agent(tmp_path)
     assert str(agent._REMOTE_BINARY.as_posix()) in agent.get_version_command()
+
+
+# ---------------------------------------------------------------------------
+# Write-through observability
+#
+# The point of these artifacts is that they survive a runner that never
+# reaches its finalization path, so the tests below interrupt execution rather
+# than letting it complete.
+# ---------------------------------------------------------------------------
+
+
+def test_live_log_is_capped_and_records_its_own_truncation(tmp_path: Path):
+    log = runner_module.LiveLog(tmp_path / "live.log", max_bytes=64)
+    log.write("a" * 40 + "\n")
+    log.write("b" * 40 + "\n")
+    log.write("c" * 40 + "\n")
+    log.close()
+    text = (tmp_path / "live.log").read_text()
+    assert text.startswith("a" * 40)
+    assert "truncated" in text
+    assert "c" * 40 not in text
+
+
+def test_live_log_never_raises_when_its_file_is_unusable(tmp_path: Path):
+    # The drain threads that feed these logs are what keep the benchmarked
+    # CLI's pipes empty, so a broken log must degrade to silence.
+    log = runner_module.LiveLog(tmp_path / "missing-dir" / "live.log")
+    log.write("ignored\n")
+    assert log.disabled_reason is not None
+    log.write("still ignored\n")
+    log.close()
+
+
+def test_recorder_persists_stage_and_incidents_immediately(tmp_path: Path):
+    recorder = runner_module.LiveRecorder(tmp_path, echo=False)
+    recorder.stage("cli-started", cli_pid=42)
+    recorder.note("tool-error", "provider returned HTTP 529", tool="bash")
+
+    status = json.loads((tmp_path / runner_module.STATUS_FILENAME).read_text())
+    assert status["stage"] == "cli-started"
+    assert status["cli_pid"] == 42
+    assert [entry["stage"] for entry in status["stage_history"]] == [
+        "starting",
+        "cli-started",
+    ]
+    incidents = [
+        json.loads(line)
+        for line in (tmp_path / runner_module.INCIDENTS_FILENAME)
+        .read_text()
+        .splitlines()
+    ]
+    assert incidents[0]["kind"] == "tool-error"
+    assert incidents[0]["tool"] == "bash"
+    assert status["last_incident"]["message"] == "provider returned HTTP 529"
+    recorder.close()
+
+
+def test_recorded_errors_persist_every_collection_error(tmp_path: Path):
+    recorder = runner_module.LiveRecorder(tmp_path, echo=False)
+    errors = runner_module.RecordedErrors(recorder)
+    errors.append("first")
+    errors.extend(["second", "third"])
+    recorder.close()
+
+    assert list(errors) == ["first", "second", "third"]
+    incidents = [
+        json.loads(line)
+        for line in (tmp_path / runner_module.INCIDENTS_FILENAME)
+        .read_text()
+        .splitlines()
+    ]
+    assert [item["message"] for item in incidents] == ["first", "second", "third"]
+    assert all(item["kind"] == "collection-error" for item in incidents)
+
+
+def test_cli_error_detection_is_structural_not_textual(tmp_path: Path):
+    recorder = runner_module.LiveRecorder(tmp_path, echo=False)
+    # The agent routinely writes code and tests that mention errors. Those
+    # must not be recorded as failures of the run.
+    runner_module._note_cli_error(
+        recorder,
+        {
+            "type": "tool_use",
+            "sessionID": "ses_1",
+            "part": {
+                "type": "tool",
+                "tool": "write",
+                "state": {
+                    "status": "completed",
+                    "input": {"content": "it('raises an error', ...)"},
+                },
+            },
+        },
+    )
+    assert recorder.snapshot()["incident_count"] == 0
+    assert recorder.snapshot()["last_reported_tool"]["tool"] == "write"
+
+    runner_module._note_cli_error(
+        recorder,
+        {
+            "type": "tool_use",
+            "sessionID": "ses_1",
+            "part": {
+                "type": "tool",
+                "tool": "bash",
+                "state": {"status": "error", "error": "exit 127"},
+            },
+        },
+    )
+    status = recorder.snapshot()
+    assert status["incident_count"] == 1
+    assert status["last_incident"]["kind"] == "tool-error"
+    assert status["last_incident"]["message"] == "exit 127"
+    recorder.close()
+
+
+def test_settle_loop_persists_each_changed_snapshot(tmp_path: Path, monkeypatch):
+    """A kill inside collection must not discard what was already fetched."""
+    recorder = runner_module.LiveRecorder(tmp_path, echo=False)
+    sessions = [{"id": "ses_root", "parentID": None}]
+    monkeypatch.setattr(
+        runner_module.OpenCodeV2Server,
+        "collect_descendants",
+        lambda self, root_id: sessions,
+    )
+    monkeypatch.setattr(
+        runner_module.OpenCodeV2Server, "wait_session", lambda self, sid: True
+    )
+    monkeypatch.setattr(
+        runner_module.OpenCodeV2Server, "running_session_ids", lambda self: {"ses_root"}
+    )
+    monkeypatch.setattr(
+        runner_module.OpenCodeV2Server,
+        "inspect_session",
+        lambda self, session, active_ids=None: {
+            "session": session,
+            "messages": [{"id": "msg_1", "type": "assistant", "time": {}}],
+            "active": {"type": "running"},
+            "inbox": [],
+        },
+    )
+    monkeypatch.setattr(runner_module.time, "sleep", lambda _seconds: None)
+    server = runner_module.OpenCodeV2Server(
+        binary="x", cwd=str(tmp_path), password="p", env={}
+    )
+    server.url = "http://127.0.0.1:1"
+
+    errors: list[str] = []
+    runner_module._collect_tree(
+        server,
+        "ses_root",
+        deadline=time.monotonic() + 0.2,
+        errors=errors,
+        recorder=recorder,
+    )
+    recorder.close()
+
+    partial = tmp_path / runner_module.PARTIAL_SESSIONS_FILENAME
+    records = [json.loads(line) for line in partial.read_text().splitlines()]
+    assert records[0]["session"]["id"] == "ses_root"
+    status = json.loads((tmp_path / runner_module.STATUS_FILENAME).read_text())
+    assert status["sessions_snapshot_count"] == 1
+    # The heartbeat distinguishes "still collecting" from "died immediately".
+    assert status["settle_iterations"] >= 1
+
+
+_FAKE_OPENCODE = '''#!/usr/bin/env python3
+"""Minimal OpenCode stand-in: serves the API, then hangs mid-task."""
+import json, sys, threading, time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import urlparse
+
+SID = "ses_fake0000000000000000000"
+
+
+class H(BaseHTTPRequestHandler):
+    def log_message(self, *a):
+        pass
+
+    def _json(self, payload, status=200):
+        body = json.dumps(payload).encode()
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self):
+        path = urlparse(self.path).path
+        if path == "/api/event":
+            # The real server always serves this and holds it open. Without
+            # it the runner reconnects on a tight loop, which is both slow
+            # and nothing like production.
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.end_headers()
+            while True:
+                time.sleep(0.2)
+                try:
+                    self.wfile.write(b": heartbeat\\n\\n")
+                    self.wfile.flush()
+                except Exception:
+                    return
+        if path == "/api/model":
+            return self._json({"data": [{"providerID": "fake", "id": "model",
+                                         "variants": [], "body": {}, "limit": {}}]})
+        if path in ("/api/agent", "/api/session"):
+            return self._json({"data": [], "cursor": {}})
+        if path == "/api/session/active":
+            return self._json({"data": {}})
+        return self._json({"data": {}})
+
+    def do_POST(self):
+        self._json({"data": True})
+
+
+def serve():
+    httpd = ThreadingHTTPServer(("127.0.0.1", 0), H)
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    print(json.dumps({"url": "http://127.0.0.1:%d" % httpd.server_address[1]}),
+          flush=True)
+    print("fake server: listening", file=sys.stderr, flush=True)
+    sys.stdin.read()
+
+
+def run():
+    for n in range(10000):
+        status = "error" if n == 3 else "completed"
+        print(json.dumps({
+            "type": "tool_use", "timestamp": int(time.time() * 1000),
+            "sessionID": SID,
+            "part": {"type": "tool", "tool": "bash", "sessionID": SID,
+                     "state": {"status": status,
+                               "error": "provider returned HTTP 529"
+                               if status == "error" else None}}}), flush=True)
+        time.sleep(0.02)
+        if n > 20:
+            while True:  # the agent hangs without ever exiting
+                time.sleep(3600)
+
+
+if "serve" in sys.argv:
+    serve()
+elif "run" in sys.argv:
+    run()
+elif "--version" in sys.argv:
+    print("fake 0.0.1")
+'''
+
+
+def test_killed_runner_still_explains_what_opencode_was_doing(tmp_path: Path):
+    """SIGKILL the runner mid-task: the evidence must already be on disk.
+
+    This is the failure that motivated write-through observability. The
+    runner gets no chance to clean up, so none of ``runner-result.json``,
+    ``opencode-v2-sessions.jsonl`` or ``opencode-v2-cli-events.jsonl`` can
+    exist, and everything below comes from the live record alone.
+    """
+    binary = tmp_path / "fake-opencode"
+    binary.write_text(_FAKE_OPENCODE)
+    binary.chmod(0o755)
+    logs_dir = tmp_path / "logs"
+    logs_dir.mkdir()
+    work_dir = tmp_path / "work"
+    work_dir.mkdir()
+    instruction = tmp_path / "instruction.txt"
+    instruction.write_text("do the task")
+
+    runner_path = Path(runner_module.__file__)
+    process = subprocess.Popen(
+        [
+            "python3",
+            str(runner_path),
+            "--instruction-file",
+            str(instruction),
+            "--logs-dir",
+            str(logs_dir),
+            "--work-dir",
+            str(work_dir),
+            "--binary",
+            str(binary),
+            "--model",
+            "fake/model",
+        ],
+        env={**os.environ, "HOME": str(tmp_path)},
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        start_new_session=True,
+    )
+    status_path = logs_dir / runner_module.STATUS_FILENAME
+
+    def read_status() -> dict[str, Any]:
+        try:
+            return json.loads(status_path.read_text())
+        except (json.JSONDecodeError, OSError, FileNotFoundError):
+            return {}
+
+    try:
+        # Let the agent work, then go quiet, then let the heartbeat observe
+        # that it has gone quiet.
+        deadline = time.monotonic() + 20
+        while time.monotonic() < deadline:
+            if (read_status().get("cli_stdout_lines") or 0) >= 10:
+                break
+            time.sleep(0.05)
+        assert (read_status().get("cli_stdout_lines") or 0) >= 10, (
+            "fake OpenCode never produced enough activity"
+        )
+        idle_deadline = time.monotonic() + 20
+        while time.monotonic() < idle_deadline:
+            if (read_status().get("seconds_since_cli_activity") or 0) >= 3:
+                break
+            time.sleep(0.2)
+    finally:
+        os.killpg(process.pid, signal.SIGKILL)
+        process.wait(timeout=30)
+        try:
+            subprocess.run(["pkill", "-9", "-f", str(binary)], check=False)
+        except OSError:
+            # check=False covers a non-zero exit, not a missing pkill.
+            pass
+
+    # The runner never finalized, so its end-of-run artifacts cannot exist.
+    assert not (logs_dir / "runner-result.json").exists()
+    assert not (logs_dir / "opencode-v2-sessions.jsonl").exists()
+    assert not (logs_dir / "opencode-v2-cli-events.jsonl").exists()
+
+    status = json.loads(status_path.read_text())
+    # ... at approximately what stage did execution stop?
+    assert status["stage"] == "cli-started"
+    assert status["server_started"] is True
+    assert status["cli_started"] is True
+    assert status["cli_returncode"] is None
+    # ... which session was involved?
+    assert status["root_candidates"] == ["ses_fake0000000000000000000"]
+    # ... was it still producing output, or had activity stopped?
+    # The agent hung rather than exiting, so the heartbeat must keep reporting
+    # a growing silence instead of freezing at "busy right now".
+    assert status["cli_stdout_lines"] >= 10
+    assert status["last_cli_activity_at"]
+    assert status["seconds_since_cli_activity"] >= 3
+    # ... what was it doing most recently?
+    assert status["last_reported_tool"]["tool"] == "bash"
+    # ... was there a visible failure?
+    assert status["last_incident"]["kind"] == "tool-error"
+
+    stream = (logs_dir / runner_module.CLI_STREAM_FILENAME).read_text().splitlines()
+    assert len(stream) >= 10
+    assert json.loads(stream[-1])["part"]["tool"] == "bash"
+
+    incidents = (logs_dir / runner_module.INCIDENTS_FILENAME).read_text()
+    assert "provider returned HTTP 529" in incidents
+    # Server-side diagnostics are durable from the moment they are emitted.
+    assert (
+        "fake server: listening"
+        in (logs_dir / runner_module.SERVER_STDERR_FILENAME).read_text()
+    )
+
+    # Pier already tees the runner's own stdout, so the timeline survives even
+    # if the logs directory itself is lost.
+    timeline = process.stdout.read()
+    assert "stage=server-started" in timeline
+    assert "stage=cli-started" in timeline
+
+
+def test_stub_trajectory_reports_the_live_evidence(tmp_path: Path):
+    """A killed run must not collapse to a generic 'no records' trajectory."""
+    runner_dir = tmp_path / "opencode-v2"
+    runner_dir.mkdir()
+    (runner_dir / "opencode-v2-status.json").write_text(
+        json.dumps(
+            {
+                "stage": "cli-started",
+                "elapsed_seconds": 9000.0,
+                "root_candidates": ["ses_abc"],
+                "cli_started": True,
+                "server_started": True,
+                "cli_stdout_lines": 412,
+                "seconds_since_cli_activity": 1802.5,
+                "last_reported_tool": {"tool": "bash", "status": "running"},
+            }
+        )
+    )
+    (runner_dir / "opencode-v2-incidents.jsonl").write_text(
+        json.dumps({"kind": "tool-error", "message": "exit 127"}) + "\n"
+    )
+    (runner_dir / "opencode-v2-cli-stream.jsonl").write_text(
+        '{"type": "tool_use"}\n' * 5
+    )
+
+    make_agent(tmp_path).populate_context_post_run(AgentContext())
+
+    trajectory = json.loads((tmp_path / "trajectory.json").read_text())
+    # The CLI named a candidate but nothing ever confirmed it was the root, so
+    # it must not become the run's identity -- it could be a subagent.
+    assert trajectory.get("session_id") is None
+    message = trajectory["steps"][0]["message"]
+    assert "'cli-started'" in message
+    assert "9000.0s" in message
+    # ... but it is still reported, explicitly as unvalidated.
+    assert "never confirmed" in message
+    assert "ses_abc" in message
+    assert "bash" in message
+    assert "412 output line(s)" in message
+    assert "1802.5s" in message
+    assert "exit 127" in message
+    extra = trajectory["steps"][0]["extra"]
+    assert extra["live_evidence"]["cli_stream_lines"] == 5
+    assert "tool-error: exit 127" in extra["collection_errors"]
+    assert trajectory["final_metrics"]["extra"]["collection_incomplete"] is True
+
+
+def test_partial_snapshot_becomes_a_real_but_incomplete_trajectory(tmp_path: Path):
+    """Collection that was interrupted still yields real steps, never a stub."""
+    runner_dir = tmp_path / "opencode-v2"
+    runner_dir.mkdir()
+    (runner_dir / "opencode-v2-status.json").write_text(
+        json.dumps({"stage": "collecting", "root_id": "ses_partial"})
+    )
+    (runner_dir / "opencode-v2-sessions.partial.jsonl").write_text(
+        json.dumps(
+            {
+                "session": {"id": "ses_partial", "parentID": None},
+                "messages": [
+                    {
+                        "id": "msg_1",
+                        "type": "assistant",
+                        "time": {"completed": None},
+                        "content": [
+                            {
+                                "type": "tool",
+                                "id": "t1",
+                                "tool": "bash",
+                                "state": {"status": "running"},
+                            }
+                        ],
+                    }
+                ],
+                "active": {"type": "running"},
+                "inbox": [],
+            }
+        )
+        + "\n"
+    )
+
+    make_agent(tmp_path).populate_context_post_run(AgentContext())
+
+    trajectory = json.loads((tmp_path / "trajectory.json").read_text())
+    assert trajectory["trajectory_id"] == "ses_partial"
+    assert trajectory["steps"], "partial records must produce real steps"
+    extra = trajectory["final_metrics"]["extra"]
+    # Real steps, but never presented as a complete or costed collection.
+    assert extra["collection_incomplete"] is True
+    assert extra["metrics_complete"] is False
+    assert extra["tree_cost_complete"] is False
+    assert "total_prompt_tokens" not in trajectory["final_metrics"]
+
+
+def test_completed_collection_ignores_any_partial_snapshot(tmp_path: Path):
+    """The live snapshot must never override a genuinely finished collection."""
+    inspection = {
+        "session": {"id": "ses_real", "parentID": None},
+        "messages": [],
+        "active": None,
+        "inbox": [],
+    }
+    write_inspections(tmp_path, [inspection])
+    (tmp_path / "opencode-v2" / "opencode-v2-sessions.partial.jsonl").write_text(
+        json.dumps({"session": {"id": "ses_stale"}, "messages": []}) + "\n"
+    )
+
+    make_agent(tmp_path).populate_context_post_run(AgentContext())
+
+    trajectory = json.loads((tmp_path / "trajectory.json").read_text())
+    assert trajectory["trajectory_id"] == "ses_real"
+
+
+def test_only_a_validated_root_becomes_the_trajectory_identity(tmp_path: Path):
+    """An unvalidated CLI candidate may name a subagent, never the run."""
+    runner_dir = tmp_path / "opencode-v2"
+    runner_dir.mkdir()
+    (runner_dir / "opencode-v2-status.json").write_text(
+        json.dumps({"stage": "cli-started", "root_candidates": ["ses_a", "ses_b"]})
+    )
+    make_agent(tmp_path).populate_context_post_run(AgentContext())
+    trajectory = json.loads((tmp_path / "trajectory.json").read_text())
+    assert trajectory.get("session_id") is None
+    assert trajectory.get("trajectory_id") is None
+    assert "never confirmed" in trajectory["steps"][0]["message"]
+
+    # Once the runner has confirmed the root against server metadata, adopting
+    # it is safe even though no manifest was ever written.
+    (runner_dir / "opencode-v2-root-candidates.json").write_text(
+        json.dumps(
+            {
+                "candidate_session_ids": ["ses_a", "ses_b"],
+                "root_id": "ses_b",
+                "validated": True,
+            }
+        )
+    )
+    make_agent(tmp_path).populate_context_post_run(AgentContext())
+    trajectory = json.loads((tmp_path / "trajectory.json").read_text())
+    assert trajectory["session_id"] == "ses_b"
+    assert "in session ses_b" in trajectory["steps"][0]["message"]
+
+
+def test_server_chatter_does_not_mask_a_silent_cli(tmp_path: Path):
+    """A chatty server must not make a hung agent look like it is working."""
+    recorder = runner_module.LiveRecorder(tmp_path, echo=False, heartbeat_seconds=0)
+    recorder.cli_stdout_line('{"type": "tool_use"}')
+    time.sleep(0.2)
+    # The CLI has gone quiet; only the server is still logging.
+    for _ in range(5):
+        recorder.server_stderr_line("server: still here")
+    recorder.close()
+
+    status = json.loads((tmp_path / runner_module.STATUS_FILENAME).read_text())
+    assert status["cli_stdout_lines"] == 1
+    assert status["server_stderr_lines"] == 5
+    # The CLI clock keeps running even though the server just spoke.
+    assert status["seconds_since_cli_activity"] >= 0.2
+    assert status["seconds_since_server_activity"] < 0.2
+
+
+def test_final_session_dump_is_written_atomically(tmp_path: Path):
+    """A truncated final dump must never shadow the intact partial snapshot."""
+    source = Path(runner_module.__file__).read_text()
+    dump = source[source.index("sessions_dump = logs_dir") :]
+    dump = dump[: dump.index("dump_jsonl(")]
+    assert "os.replace(sessions_temporary, sessions_dump)" in dump
+    assert ".jsonl.tmp" in dump
+
+
+def test_incident_records_survive_unserializable_values(tmp_path: Path):
+    """note() runs on the drain thread, so it must never raise."""
+    recorder = runner_module.LiveRecorder(tmp_path, echo=False, heartbeat_seconds=0)
+    recorder.note("odd", "message", payload=object())
+    recorder.close()
+    incidents = (tmp_path / runner_module.INCIDENTS_FILENAME).read_text().splitlines()
+    assert json.loads(incidents[0])["kind"] == "odd"
+
+
+def test_degraded_download_fetches_every_live_artifact(tmp_path: Path):
+    """The per-file fallback must preserve the same evidence as download_dir.
+
+    ``FakeEnvironment`` has no ``download_dir``, so this drives the real
+    degraded path rather than asserting on constants.
+    """
+    import asyncio
+
+    environment = FakeEnvironment()
+    agent = make_agent(tmp_path)
+    asyncio.run(agent._collect_runner_artifacts(environment))
+
+    fetched = {Path(remote).name for remote, _ in environment.downloads}
+    for name in (
+        runner_module.STATUS_FILENAME,
+        runner_module.INCIDENTS_FILENAME,
+        runner_module.CLI_STREAM_FILENAME,
+        runner_module.PARTIAL_SESSIONS_FILENAME,
+        runner_module.CLI_STDERR_FILENAME,
+        runner_module.SERVER_STDERR_FILENAME,
+        runner_module.EVENTS_FILENAME,
+    ):
+        assert name in fetched, f"{name} would be lost when download_dir is absent"
+
+
+def test_manifest_records_how_the_run_ended_not_the_teardown_stage(tmp_path: Path):
+    """The manifest's embedded snapshot must reflect the run's outcome.
+
+    ``runner-result.json`` is snapshotted from the live recorder, so the
+    terminal stage has to be reached before the snapshot is taken. Otherwise
+    even a clean run embeds evidence claiming it stopped during shutdown.
+    """
+    source = Path(runner_module.__file__).read_text()
+    finalization = source[
+        source.index("    collection_complete = _collection_complete(") :
+    ]
+
+    snapshot_at = finalization.index('"live_status": recorder.snapshot()')
+    finalizing_at = finalization.index('recorder.stage(\n        "finalizing"')
+    written_at = finalization.index('logs_dir / "runner-result.json"')
+    finished_at = finalization.index('recorder.stage("finished"')
+
+    # Terminal outcome is recorded before the snapshot is taken ...
+    assert finalizing_at < snapshot_at
+    # ... and "finished" is only claimed once the manifest is really on disk.
+    assert written_at < finished_at
+
+
+def test_child_failure_preserves_the_root_inspection_and_records_why(
+    tmp_path: Path, monkeypatch
+):
+    """A failing child must not discard a successfully fetched root.
+
+    Reproduces the reviewer's injection: the root inspects cleanly, the child
+    raises, and the runner is interrupted before the settle deadline.
+    """
+    recorder = runner_module.LiveRecorder(tmp_path, echo=False, heartbeat_seconds=0)
+    sessions = [
+        {"id": "ses_root", "parentID": None},
+        {"id": "ses_child", "parentID": "ses_root"},
+    ]
+
+    def inspect(self, session, active_ids=None):
+        if str(session.get("id")) == "ses_child":
+            raise TimeoutError("child message page timed out")
+        return {
+            "session": session,
+            "messages": [{"id": "msg_1", "type": "assistant", "time": {}}],
+            "active": None,
+            "inbox": [],
+        }
+
+    monkeypatch.setattr(
+        runner_module.OpenCodeV2Server,
+        "collect_descendants",
+        lambda self, root_id: sessions,
+    )
+    monkeypatch.setattr(
+        runner_module.OpenCodeV2Server, "wait_session", lambda self, sid: True
+    )
+    monkeypatch.setattr(
+        runner_module.OpenCodeV2Server, "running_session_ids", lambda self: set()
+    )
+    monkeypatch.setattr(runner_module.OpenCodeV2Server, "inspect_session", inspect)
+    monkeypatch.setattr(runner_module.time, "sleep", lambda _seconds: None)
+    server = runner_module.OpenCodeV2Server(
+        binary="x", cwd=str(tmp_path), password="p", env={}
+    )
+    server.url = "http://127.0.0.1:1"
+
+    errors = runner_module.RecordedErrors(recorder)
+    runner_module._collect_tree(
+        server,
+        "ses_root",
+        deadline=time.monotonic() + 0.2,
+        errors=errors,
+        recorder=recorder,
+    )
+    recorder.close()
+
+    # The root we did fetch is preserved ...
+    partial = tmp_path / runner_module.PARTIAL_SESSIONS_FILENAME
+    records = [json.loads(line) for line in partial.read_text().splitlines()]
+    assert [item["session"]["id"] for item in records] == ["ses_root"]
+
+    # ... and the specific child failure is durable, not held until the
+    # settlement deadline.
+    incidents = [
+        json.loads(line)
+        for line in (tmp_path / runner_module.INCIDENTS_FILENAME)
+        .read_text()
+        .splitlines()
+    ]
+    child = [item for item in incidents if item["kind"] == "collection-exception"]
+    assert child, "the child failure was never recorded"
+    assert "child message page timed out" in child[0]["message"]
+    assert child[0]["sessionID"] == "ses_child"
+
+
+def test_transient_collection_failure_does_not_invalidate_a_clean_settle(
+    tmp_path: Path, monkeypatch
+):
+    """Recoverable incidents stay diagnostic, never collection_errors."""
+    recorder = runner_module.LiveRecorder(tmp_path, echo=False, heartbeat_seconds=0)
+    sessions = [{"id": "ses_root", "parentID": None}]
+    calls = {"n": 0}
+
+    def inspect(self, session, active_ids=None):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise TimeoutError("transient")
+        return {
+            "session": session,
+            "messages": [],
+            "active": None,
+            "inbox": [
+                *(),
+            ],
+        }
+
+    monkeypatch.setattr(
+        runner_module.OpenCodeV2Server,
+        "collect_descendants",
+        lambda self, root_id: sessions,
+    )
+    monkeypatch.setattr(
+        runner_module.OpenCodeV2Server, "wait_session", lambda self, sid: True
+    )
+    monkeypatch.setattr(
+        runner_module.OpenCodeV2Server, "running_session_ids", lambda self: set()
+    )
+    monkeypatch.setattr(runner_module.OpenCodeV2Server, "inspect_session", inspect)
+    monkeypatch.setattr(runner_module.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(
+        runner_module,
+        "_sessions_without_terminal_outcome",
+        lambda inspections: [],
+    )
+    server = runner_module.OpenCodeV2Server(
+        binary="x", cwd=str(tmp_path), password="p", env={}
+    )
+    server.url = "http://127.0.0.1:1"
+
+    errors = runner_module.RecordedErrors(recorder)
+    _, settled = runner_module._collect_tree(
+        server,
+        "ses_root",
+        deadline=time.monotonic() + 5,
+        errors=errors,
+        recorder=recorder,
+    )
+    recorder.close()
+
+    assert settled, "a transient failure must not prevent settling"
+    # The incident is recorded for diagnosis ...
+    assert any(
+        item["kind"] == "collection-exception"
+        for item in (
+            json.loads(line)
+            for line in (tmp_path / runner_module.INCIDENTS_FILENAME)
+            .read_text()
+            .splitlines()
+        )
+    )
+    # ... but does not mark the completed collection incomplete.
+    assert list(errors) == []
+
+
+# ---------------------------------------------------------------------------
+# Server event capture
+#
+# `opencode run --format json` reports a tool only once it finishes and drops
+# non-root sessions, so the CLI stream cannot show a hang. Pi, Codex and
+# Claude Code all record tool starts; these tests cover the subscription that
+# restores the same granularity.
+# ---------------------------------------------------------------------------
+
+
+def _tool_event(kind: str, *, session: str, message: str, ident: str, **data: Any):
+    return json.dumps(
+        {
+            "type": f"session.tool.{kind}",
+            "data": {
+                "sessionID": session,
+                "assistantMessageID": message,
+                "id": ident,
+                **data,
+            },
+        }
+    )
+
+
+def test_running_tools_are_visible_while_they_run(tmp_path: Path):
+    recorder = runner_module.LiveRecorder(tmp_path, echo=False, heartbeat_seconds=0)
+    recorder.agent_event(
+        _tool_event(
+            "input.started", session="ses_root", message="m1", ident="t1", name="bash"
+        )
+    )
+    recorder.agent_event(
+        _tool_event(
+            "called",
+            session="ses_root",
+            message="m1",
+            ident="t1",
+            input={"command": "go test ./..."},
+        )
+    )
+    status = recorder.snapshot()
+    running = status["running_tools"]
+    assert [item["tool"] for item in running] == ["bash"]
+    # The arguments are what identify which command is stuck.
+    assert "go test ./..." in running[0]["input"]
+    assert status["last_tool_started"]["tool"] == "bash"
+
+    # ... and it disappears once it finishes.
+    recorder.agent_event(
+        _tool_event("success", session="ses_root", message="m1", ident="t1")
+    )
+    assert recorder.snapshot()["running_tools"] == []
+    recorder.close()
+
+
+def test_child_session_activity_is_captured(tmp_path: Path):
+    """The CLI drops non-root sessions; the event feed must not."""
+    recorder = runner_module.LiveRecorder(tmp_path, echo=False, heartbeat_seconds=0)
+    recorder.agent_event(
+        _tool_event(
+            "input.started", session="ses_child", message="mc", ident="c1", name="grep"
+        )
+    )
+    running = recorder.snapshot()["running_tools"]
+    assert running[0]["sessionID"] == "ses_child"
+    recorder.close()
+
+
+def test_running_tool_age_is_not_a_heartbeat_stale(tmp_path: Path):
+    """A tool stuck for hours must not report the age it had one write ago."""
+    recorder = runner_module.LiveRecorder(tmp_path, echo=False, heartbeat_seconds=0)
+    recorder.agent_event(
+        _tool_event(
+            "input.started", session="ses_root", message="m1", ident="t1", name="bash"
+        )
+    )
+    time.sleep(0.3)
+    recorder.close()  # forces a final status write
+
+    status = json.loads((tmp_path / runner_module.STATUS_FILENAME).read_text())
+    assert status["running_tools"][0]["running_for_seconds"] >= 0.3
+
+
+def test_agent_activity_clock_is_independent_of_the_cli(tmp_path: Path):
+    recorder = runner_module.LiveRecorder(tmp_path, echo=False, heartbeat_seconds=0)
+    recorder.cli_stdout_line('{"type": "tool_use"}')
+    recorder.agent_event('{"type": "session.idle", "data": {}}')
+    time.sleep(0.2)
+    recorder.cli_stdout_line('{"type": "tool_use"}')
+    recorder.close()
+    status = json.loads((tmp_path / runner_module.STATUS_FILENAME).read_text())
+    # The CLI just spoke, but the agent feed has been quiet.
+    assert status["seconds_since_cli_activity"] < 0.2
+    assert status["seconds_since_agent_activity"] >= 0.2
+
+
+def test_event_stream_errors_become_incidents(tmp_path: Path):
+    recorder = runner_module.LiveRecorder(tmp_path, echo=False, heartbeat_seconds=0)
+    recorder.agent_event(
+        json.dumps(
+            {"type": "session.error", "data": {"error": "provider refused: 529"}}
+        )
+    )
+    recorder.close()
+    incidents = [
+        json.loads(line)
+        for line in (tmp_path / runner_module.INCIDENTS_FILENAME)
+        .read_text()
+        .splitlines()
+    ]
+    assert any(
+        item["kind"] == "server-event-error" and "529" in item["message"]
+        for item in incidents
+    )
+
+
+def test_raw_events_are_durable(tmp_path: Path):
+    recorder = runner_module.LiveRecorder(tmp_path, echo=False, heartbeat_seconds=0)
+    recorder.agent_event('{"type": "session.tool.progress", "data": {}}')
+    recorder.close()
+    written = (tmp_path / runner_module.EVENTS_FILENAME).read_text().splitlines()
+    assert json.loads(written[0])["type"] == "session.tool.progress"
+
+
+def test_hanging_tool_is_named_in_the_trajectory(tmp_path: Path):
+    """End to end: the stub must name the command that is actually stuck."""
+    runner_dir = tmp_path / "opencode-v2"
+    runner_dir.mkdir()
+    (runner_dir / "opencode-v2-status.json").write_text(
+        json.dumps(
+            {
+                "stage": "cli-started",
+                "root_id": "ses_root",
+                "cli_stdout_lines": 1,
+                "seconds_since_cli_activity": 1800.0,
+                "seconds_since_agent_activity": 1799.0,
+                "last_reported_tool": {"tool": "read", "status": "completed"},
+                "running_tools": [
+                    {
+                        "tool": "bash",
+                        "sessionID": "ses_root",
+                        "running_for_seconds": 1799.0,
+                        "input": '{"command": "go test ./..."}',
+                    },
+                    {
+                        "tool": "grep",
+                        "sessionID": "ses_kid",
+                        "running_for_seconds": 1805.0,
+                    },
+                ],
+            }
+        )
+    )
+
+    make_agent(tmp_path).populate_context_post_run(AgentContext())
+    message = json.loads((tmp_path / "trajectory.json").read_text())["steps"][0][
+        "message"
+    ]
+
+    # The stuck command, with its arguments and how long it had been stuck.
+    assert "'bash' for 1799.0s" in message
+    assert "go test ./..." in message
+    # The child session's work, which the CLI stream never shows.
+    assert "'grep'" in message
+    assert "in child session ses_kid" in message
+    # The completed tool is still reported, but no longer as "what it was doing".
+    assert "last tool the CLI reported was 'read'" in message
+
+
+_FAKE_HANGING_OPENCODE = '''#!/usr/bin/env python3
+"""OpenCode stand-in that hangs *inside* a tool, and serves a real SSE feed."""
+import json, sys, threading, time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import urlparse
+
+SID = "ses_hang00000000000000000000"
+CHILD = "ses_child0000000000000000000"
+subs = []
+
+
+def sse(event):
+    for q in list(subs):
+        try:
+            q.write(("data: " + json.dumps(event) + "\\n\\n").encode())
+            q.flush()
+        except Exception:
+            subs.remove(q)
+
+
+class H(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
+    def log_message(self, *a):
+        pass
+
+    def _json(self, payload):
+        body = json.dumps(payload).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self):
+        path = urlparse(self.path).path
+        if path == "/api/event":
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.end_headers()
+            subs.append(self.wfile)
+            while True:
+                time.sleep(0.2)
+                try:
+                    self.wfile.write(b": heartbeat\\n\\n")
+                    self.wfile.flush()
+                except Exception:
+                    return
+        if path == "/api/model":
+            return self._json({"data": [{"providerID": "fake", "id": "model",
+                                         "variants": [], "body": {}, "limit": {}}]})
+        if path in ("/api/agent", "/api/session"):
+            return self._json({"data": [], "cursor": {}})
+        if path == "/api/session/active":
+            return self._json({"data": {}})
+        return self._json({"data": {}})
+
+    def do_POST(self):
+        self._json({"data": True})
+
+
+def serve():
+    httpd = ThreadingHTTPServer(("127.0.0.1", 0), H)
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    print(json.dumps({"url": "http://127.0.0.1:%d" % httpd.server_address[1]}), flush=True)
+    print("hang-server: ready", file=sys.stderr, flush=True)
+
+    def script():
+        time.sleep(1.0)
+        sse({"type": "session.tool.input.started", "data": {
+            "sessionID": SID, "assistantMessageID": "m1", "id": "t1", "name": "read"}})
+        sse({"type": "session.tool.success", "data": {
+            "sessionID": SID, "assistantMessageID": "m1", "id": "t1"}})
+        # A child doing work: filtered out of the root CLI stream entirely.
+        sse({"type": "session.tool.input.started", "data": {
+            "sessionID": CHILD, "assistantMessageID": "mc", "id": "c1", "name": "grep"}})
+        # The tool that never returns.
+        sse({"type": "session.tool.input.started", "data": {
+            "sessionID": SID, "assistantMessageID": "m2", "id": "t2", "name": "bash"}})
+        sse({"type": "session.tool.called", "data": {
+            "sessionID": SID, "assistantMessageID": "m2", "id": "t2",
+            "input": {"command": "go test ./... -run TestEverything"}}})
+
+    threading.Thread(target=script, daemon=True).start()
+    sys.stdin.read()
+
+
+def run():
+    time.sleep(1.2)
+    # The CLI reports only the completed tool, then falls silent forever.
+    print(json.dumps({"type": "tool_use", "timestamp": int(time.time() * 1000),
+                      "sessionID": SID,
+                      "part": {"type": "tool", "tool": "read", "sessionID": SID,
+                               "state": {"status": "completed"}}}), flush=True)
+    while True:
+        time.sleep(3600)
+
+
+if "serve" in sys.argv:
+    serve()
+elif "run" in sys.argv:
+    run()
+elif "--version" in sys.argv:
+    print("fake-hang 0.0.1")
+'''
+
+
+def test_killed_runner_identifies_the_tool_that_was_actually_stuck(tmp_path: Path):
+    """The reviewer's scenario, end to end against a real SSE feed.
+
+    A command starts and never returns while a child session is also working.
+    The CLI stream shows only the earlier completed tool, so the event
+    subscription is the only thing that can attribute the hang.
+    """
+    binary = tmp_path / "fake-hang"
+    binary.write_text(_FAKE_HANGING_OPENCODE)
+    binary.chmod(0o755)
+    logs_dir = tmp_path / "logs"
+    logs_dir.mkdir()
+    work_dir = tmp_path / "work"
+    work_dir.mkdir()
+    instruction = tmp_path / "instruction.txt"
+    instruction.write_text("do the task")
+
+    process = subprocess.Popen(
+        [
+            "python3",
+            str(Path(runner_module.__file__)),
+            "--instruction-file",
+            str(instruction),
+            "--logs-dir",
+            str(logs_dir),
+            "--work-dir",
+            str(work_dir),
+            "--binary",
+            str(binary),
+            "--model",
+            "fake/model",
+        ],
+        env={**os.environ, "HOME": str(tmp_path)},
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    status_path = logs_dir / runner_module.STATUS_FILENAME
+    try:
+        deadline = time.monotonic() + 20
+        while time.monotonic() < deadline:
+            try:
+                running = json.loads(status_path.read_text()).get("running_tools") or []
+            except (OSError, json.JSONDecodeError):
+                running = []
+            if any(item.get("tool") == "bash" for item in running):
+                break
+            time.sleep(0.1)
+        time.sleep(1.5)  # let the hang age
+    finally:
+        os.killpg(process.pid, signal.SIGKILL)
+        process.wait(timeout=30)
+        try:
+            subprocess.run(["pkill", "-9", "-f", str(binary)], check=False)
+        except OSError:
+            pass
+
+    status = json.loads(status_path.read_text())
+
+    # The CLI stream on its own points at the wrong tool.
+    assert status["last_reported_tool"]["tool"] == "read"
+
+    # The event feed names the command that is actually stuck ...
+    running = {item["tool"]: item for item in status["running_tools"]}
+    assert "bash" in running, f"stuck tool not captured: {status['running_tools']}"
+    assert "go test ./... -run TestEverything" in running["bash"]["input"]
+    # ... and the child session's work, which the CLI filters out.
+    assert "grep" in running
+    assert running["grep"]["sessionID"] == "ses_child0000000000000000000"
+
+    # Raw events are durable even though the runner never finalized.
+    assert not (logs_dir / "runner-result.json").exists()
+    events = (logs_dir / runner_module.EVENTS_FILENAME).read_text().splitlines()
+    assert any("session.tool.called" in line for line in events)
+
+
+# ---------------------------------------------------------------------------
+# Termination
+#
+# An agent timeout cancels the exec host-side, and killing a
+# `docker compose exec` client does not signal the process inside the
+# container. These cover stopping OpenCode without killing it unnecessarily.
+# ---------------------------------------------------------------------------
+
+
+class _FakeProc:
+    """A Popen stand-in that exits after a given number of wait() calls."""
+
+    def __init__(self, exits_after: int | None):
+        self.pid = 4242
+        self._waits = 0
+        self._exits_after = exits_after
+        self.signals: list[int] = []
+
+    def wait(self, timeout=None):
+        self._waits += 1
+        if self._exits_after is not None and self._waits >= self._exits_after:
+            return 0
+        raise subprocess.TimeoutExpired("cli", timeout or 0)
+
+
+def _stop_cli_with(monkeypatch, tmp_path, exits_after):
+    recorder = runner_module.LiveRecorder(tmp_path, echo=False, heartbeat_seconds=0)
+    proc = _FakeProc(exits_after)
+    monkeypatch.setattr(
+        runner_module.os, "killpg", lambda pid, sig: proc.signals.append(sig)
+    )
+    monkeypatch.setattr(runner_module, "CLI_INTERRUPT_GRACE_SECONDS", 0.01)
+    monkeypatch.setattr(runner_module, "CLI_SIGTERM_GRACE_SECONDS", 0.01)
+    monkeypatch.setattr(runner_module, "CLI_SIGKILL_GRACE_SECONDS", 0.01)
+    errors: list[str] = []
+    method = runner_module._stop_cli(proc, recorder, errors)
+    recorder.close()
+    return method, proc.signals, errors
+
+
+def test_cli_that_stops_on_interrupt_is_never_signalled(tmp_path, monkeypatch):
+    """The polite route: OpenCode ends the turn itself, we send no signal."""
+    method, signals, errors = _stop_cli_with(monkeypatch, tmp_path, exits_after=1)
+    assert method == "exited-after-interrupt"
+    assert signals == [], "a cooperating CLI must not be signalled"
+    assert errors == []
+
+
+def test_cli_is_escalated_only_as_far_as_needed(tmp_path, monkeypatch):
+    method, signals, _ = _stop_cli_with(monkeypatch, tmp_path, exits_after=2)
+    assert method == "sigterm"
+    assert signals == [signal.SIGTERM], "must not reach SIGKILL when SIGTERM works"
+
+    method, signals, _ = _stop_cli_with(monkeypatch, tmp_path, exits_after=3)
+    assert method == "sigkill"
+    assert signals == [signal.SIGTERM, signal.SIGKILL]
+
+    method, signals, errors = _stop_cli_with(monkeypatch, tmp_path, exits_after=None)
+    assert method == "survived-sigkill"
+    assert errors == ["CLI process did not exit after cancellation"]
+
+
+def test_sessions_are_interrupted_before_any_signal(tmp_path, monkeypatch):
+    """OpenCode must be asked to stop before the CLI is touched."""
+    order: list[str] = []
+    recorder = runner_module.LiveRecorder(tmp_path, echo=False, heartbeat_seconds=0)
+
+    class Server(runner_module.OpenCodeV2Server):
+        def collect_sessions(self, parent_id=None):
+            return [{"id": "ses_a"}, {"id": "ses_b"}]
+
+        def interrupt_session(self, session_id):
+            order.append(f"interrupt:{session_id}")
+            return True
+
+    server = Server(binary="x", cwd=str(tmp_path), password="p", env={})
+    errors: list[str] = []
+    stopped = runner_module._request_graceful_stop(server, recorder, errors)
+    recorder.close()
+
+    assert stopped == ["ses_a", "ses_b"]
+    assert order == ["interrupt:ses_a", "interrupt:ses_b"]
+    # Already-interrupted sessions are not asked twice.
+    assert (
+        runner_module._request_graceful_stop(
+            server, recorder, errors, already={"ses_a", "ses_b"}
+        )
+        == []
+    )
+
+
+class _ScriptedEnvironment(FakeEnvironment):
+    """Answers owned-process liveness probes from a scripted sequence.
+
+    Each answer is the state every recorded process reports, or a mapping
+    for the cases where they differ.
+    """
+
+    def __init__(self, answers: list[Any]):
+        super().__init__()
+        self._answers = list(answers)
+
+    async def exec(self, **kwargs: Any) -> ExecResult:
+        self.exec_calls.append(kwargs)
+        command = kwargs.get("command", "")
+        if "/proc/$pid/stat" in command:
+            answer = self._answers.pop(0) if self._answers else "GONE"
+            if isinstance(answer, str):
+                answer = {key: answer for key in OpenCodeV2._OWNED_PROCESSES}
+            rendered = " ".join(f"{k}={v}" for k, v in answer.items())
+            return ExecResult(return_code=0, stdout=rendered, stderr="")
+        return ExecResult(return_code=0, stdout="", stderr="")
+
+    def signals_sent(self) -> list[str]:
+        sent = []
+        for call in self.exec_calls:
+            command = call.get("command", "")
+            if "pgrep -f" in command:
+                sent.append("SWEEP")
+            elif "kill -TERM" in command:
+                sent.append("TERM")
+            elif "kill -KILL" in command:
+                sent.append("KILL")
+        return sent
+
+
+def test_finished_runner_is_left_alone(tmp_path: Path):
+    """The normal path must not signal anything."""
+    import asyncio
+
+    environment = _ScriptedEnvironment(["GONE"])
+    asyncio.run(make_agent(tmp_path)._ensure_runner_stopped(environment))
+    assert environment.signals_sent() == []
+
+
+def test_timed_out_runner_is_asked_to_stop_and_not_killed(tmp_path: Path):
+    """SIGTERM reaches the runner's graceful path; SIGKILL is not needed."""
+    import asyncio
+
+    agent = make_agent(tmp_path)
+    agent._RUNNER_STOP_POLL_SECONDS = 0.01
+    environment = _ScriptedEnvironment(["RUNNING", "GONE"])
+    asyncio.run(agent._ensure_runner_stopped(environment))
+    assert environment.signals_sent() == ["TERM"]
+
+
+def test_runner_that_ignores_sigterm_is_killed(tmp_path: Path):
+    """A runner that ignores SIGTERM is killed, along with what it owned."""
+    import asyncio
+
+    agent = make_agent(tmp_path)
+    agent._RUNNER_STOP_POLL_SECONDS = 0.01
+    agent._RUNNER_STOP_GRACE_SECONDS = 0.05
+    environment = _ScriptedEnvironment(["RUNNING"] * 80)
+
+    asyncio.run(agent._ensure_runner_stopped(environment))
+
+    commands = [call.get("command", "") for call in environment.exec_calls]
+    assert any("kill -TERM" in command for command in commands)
+    # Each recorded process group, then the binary sweep as a backstop.
+    assert sum('kill -KILL -"$pid"' in command for command in commands) == 3
+    assert any("pgrep -f" in command for command in commands)
+
+
+_FAKE_POLITE_OPENCODE = '''#!/usr/bin/env python3
+"""OpenCode stand-in whose CLI exits when its session is interrupted."""
+import json, os, sys, threading, time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import urlparse
+
+SID = "ses_polite00000000000000000"
+FLAG = os.environ["POLITE_FLAG"]
+
+
+class H(BaseHTTPRequestHandler):
+    def log_message(self, *a):
+        pass
+
+    def _json(self, payload):
+        body = json.dumps(payload).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self):
+        path = urlparse(self.path).path
+        if path == "/api/event":
+            # The real server always serves this and holds it open. Without
+            # it the runner reconnects on a tight loop, which is both slow
+            # and nothing like production.
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.end_headers()
+            while True:
+                time.sleep(0.2)
+                try:
+                    self.wfile.write(b": heartbeat\\n\\n")
+                    self.wfile.flush()
+                except Exception:
+                    return
+        if path == "/api/model":
+            return self._json({"data": [{"providerID": "fake", "id": "model",
+                                         "variants": [], "body": {}, "limit": {}}]})
+        if path == "/api/agent":
+            return self._json({"data": []})
+        if path == "/api/session":
+            return self._json({"data": [{"id": SID, "parentID": None}], "cursor": {}})
+        if path == "/api/session/active":
+            return self._json({"data": {}})
+        return self._json({"data": {}})
+
+    def do_POST(self):
+        if self.path.endswith("/interrupt"):
+            open(FLAG, "w").close()
+        self._json({"data": True})
+
+
+def serve():
+    httpd = ThreadingHTTPServer(("127.0.0.1", 0), H)
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    print(json.dumps({"url": "http://127.0.0.1:%d" % httpd.server_address[1]}), flush=True)
+    sys.stdin.read()
+
+
+def run():
+    while not os.path.exists(FLAG):
+        time.sleep(0.05)
+    sys.exit(0)
+
+
+if "serve" in sys.argv:
+    serve()
+elif "run" in sys.argv:
+    run()
+elif "--version" in sys.argv:
+    print("fake-polite 0.0.1")
+'''
+
+
+def test_timeout_shutdown_stops_opencode_without_killing_it(tmp_path: Path):
+    """End to end: SIGTERM to the runner stops OpenCode the polite way.
+
+    This is the timeout case. The runner interrupts the session, the CLI
+    exits on its own, the server is closed down, and the evidence is written
+    -- with no signal ever sent to an OpenCode process.
+    """
+    binary = tmp_path / "fake-polite"
+    binary.write_text(_FAKE_POLITE_OPENCODE)
+    binary.chmod(0o755)
+    logs_dir = tmp_path / "logs"
+    logs_dir.mkdir()
+    work_dir = tmp_path / "work"
+    work_dir.mkdir()
+    instruction = tmp_path / "instruction.txt"
+    instruction.write_text("do the task")
+
+    process = subprocess.Popen(
+        [
+            "python3",
+            str(Path(runner_module.__file__)),
+            "--instruction-file",
+            str(instruction),
+            "--logs-dir",
+            str(logs_dir),
+            "--work-dir",
+            str(work_dir),
+            "--binary",
+            str(binary),
+            "--model",
+            "fake/model",
+        ],
+        env={
+            **os.environ,
+            "HOME": str(tmp_path),
+            "POLITE_FLAG": str(tmp_path / "flag"),
+        },
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    pidfile = logs_dir / runner_module.RUNNER_PIDFILE
+    try:
+        deadline = time.monotonic() + 20
+        while time.monotonic() < deadline and not pidfile.exists():
+            time.sleep(0.05)
+        assert pidfile.exists(), "the runner never recorded its pid"
+        # Wait until OpenCode is actually up before asking it to stop.
+        while time.monotonic() < deadline:
+            try:
+                if json.loads(
+                    (logs_dir / runner_module.STATUS_FILENAME).read_text()
+                ).get("cli_started"):
+                    break
+            except (OSError, json.JSONDecodeError):
+                pass
+            time.sleep(0.05)
+
+        # Exactly what the adapter does when the agent times out.
+        pids = dict(
+            line.split("=", 1) for line in pidfile.read_text().split() if "=" in line
+        )
+        os.kill(int(pids["runner"]), signal.SIGTERM)
+        process.wait(timeout=30)
+    finally:
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            pass
+        try:
+            subprocess.run(["pkill", "-9", "-f", str(binary)], check=False)
+        except OSError:
+            pass
+
+    result = json.loads((logs_dir / "runner-result.json").read_text())
+    assert result["cancelled"] is True
+    # The session was asked to stop, and that alone was enough.
+    assert result["interrupted_sessions"] == ["ses_polite00000000000000000"]
+    assert result["live_status"]["cli_stop_method"] == "exited-after-interrupt"
+    # Evidence still reached disk through the graceful path.
+    assert (logs_dir / runner_module.STATUS_FILENAME).exists()
+
+    # Nothing OpenCode owned is left behind.
+    survivors = subprocess.run(
+        ["pgrep", "-f", str(binary)], capture_output=True, text=True
+    ).stdout.split()
+    assert not survivors, f"OpenCode processes survived shutdown: {survivors}"
+
+
+def test_rejected_interrupt_is_not_recorded_as_stopped(tmp_path):
+    """A refused interrupt leaves the session running, so it must retry."""
+    recorder = runner_module.LiveRecorder(tmp_path, echo=False, heartbeat_seconds=0)
+    attempts: list[str] = []
+
+    class Server(runner_module.OpenCodeV2Server):
+        def collect_sessions(self, parent_id=None):
+            return [{"id": "ses_ok"}, {"id": "ses_refused"}]
+
+        def interrupt_session(self, session_id):
+            attempts.append(session_id)
+            return session_id == "ses_ok"
+
+    server = Server(binary="x", cwd=str(tmp_path), password="p", env={})
+    errors: list[str] = []
+    stopped = runner_module._request_graceful_stop(server, recorder, errors)
+    assert stopped == ["ses_ok"]
+    assert any("ses_refused" in item for item in errors)
+
+    # The refused session is still eligible, so a later pass retries it.
+    runner_module._request_graceful_stop(server, recorder, errors, already=set(stopped))
+    recorder.close()
+    assert attempts == ["ses_ok", "ses_refused", "ses_refused"]
+
+
+def test_interrupt_session_reports_whether_the_server_accepted(tmp_path, monkeypatch):
+    server = runner_module.OpenCodeV2Server(
+        binary="x", cwd=str(tmp_path), password="p", env={}
+    )
+    server.url = "http://127.0.0.1:1"
+    for status, expected in (
+        (200, True),
+        (204, True),
+        (409, False),
+        (500, False),
+        (0, False),
+    ):
+        monkeypatch.setattr(runner_module, "http_post", lambda *a, _s=status, **k: _s)
+        assert server.interrupt_session("ses_1") is expected
+
+
+def test_failed_inspection_keeps_the_other_sessions(tmp_path):
+    """Timeout and abort paths must not discard a whole batch."""
+
+    class Server(runner_module.OpenCodeV2Server):
+        def inspect_session(self, session, active_ids=None):
+            if session["id"] == "ses_bad":
+                raise TimeoutError("page timed out")
+            return {"session": session, "messages": []}
+
+    server = Server(binary="x", cwd=str(tmp_path), password="p", env={})
+    errors: list[str] = []
+    kept = runner_module._inspect_each(
+        server, [{"id": "ses_a"}, {"id": "ses_bad"}, {"id": "ses_b"}], errors
+    )
+    assert [item["session"]["id"] for item in kept] == ["ses_a", "ses_b"]
+    assert any("ses_bad" in item for item in errors)
+
+
+def test_oversized_event_line_is_discarded_not_buffered(tmp_path):
+    """One newline-less event must not be read into memory unbounded."""
+    import io
+
+    recorder = runner_module.LiveRecorder(tmp_path, echo=False, heartbeat_seconds=0)
+    stream = OpenCodeEventStreamProbe(recorder)
+    huge = b"data: " + b"x" * (runner_module.EVENT_LINE_MAX_BYTES * 2) + b"\n"
+    good = b'data: {"type": "session.idle", "data": {}}\n'
+    stream.feed(io.BytesIO(huge + good))
+    recorder.close()
+
+    # The oversized frame is summarised, not stored ...
+    incidents = (tmp_path / runner_module.INCIDENTS_FILENAME).read_text()
+    assert "event-line-oversize" in incidents
+    events = (tmp_path / runner_module.EVENTS_FILENAME).read_text()
+    assert "xxxx" not in events
+    # ... and the following well-formed event is still processed.
+    assert "session.idle" in events
+
+
+class OpenCodeEventStreamProbe(runner_module.OpenCodeEventStream):
+    """Drives the SSE read loop against an in-memory response."""
+
+    def __init__(self, recorder):
+        super().__init__("http://127.0.0.1:1", "p", recorder)
+
+    def feed(self, response):
+        import urllib.request
+
+        original = urllib.request.urlopen
+        urllib.request.urlopen = lambda *a, **k: response
+        try:
+            self._consume()
+        finally:
+            urllib.request.urlopen = original
+
+
+def test_partial_snapshot_without_a_confirmed_root_is_not_adopted(tmp_path: Path):
+    """An orphaned child must never inherit the run's identity.
+
+    A snapshot taken mid-collection often holds a child whose parent was not
+    fetched. With no confirmed root, graph inference would crown that child.
+    """
+    runner_dir = tmp_path / "opencode-v2"
+    runner_dir.mkdir()
+    (runner_dir / "opencode-v2-status.json").write_text(
+        json.dumps({"stage": "collecting", "root_candidates": ["ses_parent"]})
+    )
+    (runner_dir / "opencode-v2-sessions.partial.jsonl").write_text(
+        json.dumps(
+            {
+                "session": {"id": "ses_orphan", "parentID": "ses_parent"},
+                "messages": [],
+                "active": None,
+                "inbox": [],
+            }
+        )
+        + "\n"
+    )
+
+    make_agent(tmp_path).populate_context_post_run(AgentContext())
+
+    trajectory = json.loads((tmp_path / "trajectory.json").read_text())
+    assert trajectory.get("trajectory_id") is None
+    assert trajectory.get("session_id") is None
+    # The evidence is still reported, just not as a trajectory identity.
+    assert trajectory["steps"][0]["extra"]["collection_gap"] is True
+
+
+def test_partial_snapshot_is_adopted_when_the_root_is_present(tmp_path: Path):
+    runner_dir = tmp_path / "opencode-v2"
+    runner_dir.mkdir()
+    (runner_dir / "opencode-v2-status.json").write_text(
+        json.dumps({"stage": "collecting", "root_id": "ses_root"})
+    )
+    (runner_dir / "opencode-v2-sessions.partial.jsonl").write_text(
+        "".join(
+            json.dumps(record) + "\n"
+            for record in (
+                {
+                    "session": {"id": "ses_root", "parentID": None},
+                    "messages": [],
+                    "active": None,
+                    "inbox": [],
+                },
+                {
+                    "session": {"id": "ses_kid", "parentID": "ses_root"},
+                    "messages": [],
+                    "active": None,
+                    "inbox": [],
+                },
+            )
+        )
+    )
+
+    make_agent(tmp_path).populate_context_post_run(AgentContext())
+
+    trajectory = json.loads((tmp_path / "trajectory.json").read_text())
+    assert trajectory["trajectory_id"] == "ses_root"
+    assert trajectory["final_metrics"]["extra"]["collection_incomplete"] is True
+
+
+class _LocalShellEnvironment(FakeEnvironment):
+    """Runs the adapter's commands through a real shell.
+
+    The mocked environments only record command strings, so a command that is
+    syntactically fine but semantically wrong (reading the whole pidfile
+    instead of one entry) passes them. This executes what the adapter
+    actually generates.
+    """
+
+    async def exec(self, **kwargs: Any) -> ExecResult:
+        self.exec_calls.append(kwargs)
+        completed = subprocess.run(
+            ["bash", "-c", kwargs.get("command", "")],
+            capture_output=True,
+            text=True,
+        )
+        return ExecResult(
+            return_code=completed.returncode,
+            stdout=completed.stdout,
+            stderr=completed.stderr,
+        )
+
+
+def _pidfile_agent(tmp_path: Path, pidfile: Path):
+    agent = make_agent(tmp_path)
+    agent._RUNNER_PIDFILE = pidfile
+    # Keep the last-resort sweep from matching anything on this machine.
+    agent._REMOTE_BINARY = Path(f"/nonexistent/opencode-{uuid.uuid4().hex}")
+    agent._RUNNER_STOP_POLL_SECONDS = 0.05
+    return agent
+
+
+def test_shutdown_targets_the_runner_entry_of_a_multi_entry_pidfile(tmp_path: Path):
+    """The graceful SIGTERM must reach the runner, not the whole pidfile.
+
+    Regression: the pidfile records runner, server and CLI, and reading it
+    whole makes `$pid` a multi-line string that no signal can target. The
+    grace period then expires and shutdown escalates to a forced kill,
+    destroying the very evidence the graceful path exists to preserve.
+    """
+    import asyncio
+
+    victim = subprocess.Popen(["sleep", "300"])
+    # Distinct, already-reaped entries: the runner line must be the one
+    # selected, and nothing else should need cleaning up.
+    reaped = []
+    for _ in range(2):
+        done = subprocess.Popen(["true"])
+        done.wait(timeout=10)
+        reaped.append(done.pid)
+    pidfile = tmp_path / "runner.pid"
+    pidfile.write_text(f"runner={victim.pid}\nserver={reaped[0]}\ncli={reaped[1]}\n")
+    try:
+        agent = _pidfile_agent(tmp_path, pidfile)
+        environment = _LocalShellEnvironment()
+
+        states = asyncio.run(agent._owned_states(environment))
+        assert states["runner"] == "RUNNING"
+
+        asyncio.run(agent._ensure_runner_stopped(environment))
+
+        # The graceful SIGTERM actually landed on the runner ...
+        assert victim.poll() is not None, "graceful SIGTERM never reached the runner"
+        assert victim.returncode == -signal.SIGTERM
+        # ... so the forced path was never needed.
+        assert not any(
+            "kill -KILL" in call.get("command", "") for call in environment.exec_calls
+        ), "escalated to a forced kill despite a working graceful stop"
+    finally:
+        try:
+            victim.kill()
+            victim.wait(timeout=10)
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+
+
+def test_processes_outliving_a_dead_runner_are_cleaned_up(tmp_path: Path):
+    """A gone runner does not mean OpenCode is gone.
+
+    The server and CLI run in their own sessions, so they survive a runner
+    that was killed or crashed before its cleanup ran. Reporting shutdown
+    complete there would let a tool keep writing while the task is graded.
+    """
+    import asyncio
+
+    # The runner is already gone; its server and CLI are not.
+    dead = subprocess.Popen(["true"])
+    dead.wait(timeout=10)
+    survivors = [
+        subprocess.Popen(["sleep", "300"], start_new_session=True) for _ in range(2)
+    ]
+    pidfile = tmp_path / "runner.pid"
+    pidfile.write_text(
+        f"runner={dead.pid}\nserver={survivors[0].pid}\ncli={survivors[1].pid}\n"
+    )
+    try:
+        agent = _pidfile_agent(tmp_path, pidfile)
+        environment = _LocalShellEnvironment()
+
+        states = asyncio.run(agent._owned_states(environment))
+        assert states["runner"] == "GONE"
+        assert states["server"] == "RUNNING" and states["cli"] == "RUNNING"
+
+        asyncio.run(agent._ensure_runner_stopped(environment))
+
+        for index, survivor in enumerate(survivors):
+            try:
+                survivor.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                raise AssertionError(
+                    f"process {index} outlived the runner and was left running"
+                )
+        assert agent._all_stopped(asyncio.run(agent._owned_states(environment)))
+    finally:
+        for survivor in survivors:
+            try:
+                survivor.kill()
+                survivor.wait(timeout=10)
+            except (OSError, subprocess.TimeoutExpired):
+                pass
+
+
+def test_liveness_probe_reports_real_process_states(tmp_path: Path):
+    """The probe is shell; exercise it against real running/dead processes."""
+    import asyncio
+
+    alive = subprocess.Popen(["sleep", "300"])
+    pidfile = tmp_path / "runner.pid"
+    pidfile.write_text(f"runner={alive.pid}\nserver=none\ncli=none\n")
+    agent = _pidfile_agent(tmp_path, pidfile)
+    environment = _LocalShellEnvironment()
+    try:
+        assert asyncio.run(agent._owned_states(environment))["runner"] == "RUNNING"
+    finally:
+        alive.kill()
+        alive.wait(timeout=10)
+    states = asyncio.run(agent._owned_states(environment))
+    assert states["runner"] == "GONE"
+    # `none` is the runner saying it never started these.
+    assert states["server"] == "GONE" and states["cli"] == "GONE"
+    assert agent._all_stopped(states)
+
+    # Nothing recorded means nothing to stop.
+    pidfile.write_text("")
+    assert agent._all_stopped(asyncio.run(agent._owned_states(environment)))
+    pidfile.unlink()
+    assert agent._all_stopped(asyncio.run(agent._owned_states(environment)))
+
+
+def test_forced_stop_signals_each_recorded_process_group(tmp_path: Path):
+    """The forced path must reach the CLI's group, where the tools live."""
+    import asyncio
+
+    # Each process leads its own group, like the runner's server and CLI.
+    leaders = [
+        subprocess.Popen(["sleep", "300"], start_new_session=True) for _ in range(3)
+    ]
+    pidfile = tmp_path / "runner.pid"
+    pidfile.write_text(
+        f"runner={leaders[0].pid}\nserver={leaders[1].pid}\ncli={leaders[2].pid}\n"
+    )
+    try:
+        agent = _pidfile_agent(tmp_path, pidfile)
+        asyncio.run(agent._force_stop(_LocalShellEnvironment(), None))
+        # Poll rather than a single bounded wait: signal delivery and reaping
+        # are asynchronous, and under load a slow kill is not a survival.
+        deadline = time.monotonic() + 30
+        for index, leader in enumerate(leaders):
+            while time.monotonic() < deadline and leader.poll() is None:
+                time.sleep(0.1)
+            assert leader.poll() is not None, (
+                f"pidfile entry {index} survived the forced stop"
+            )
+            assert leader.returncode == -signal.SIGKILL
+    finally:
+        for leader in leaders:
+            try:
+                leader.kill()
+                leader.wait(timeout=10)
+            except (OSError, subprocess.TimeoutExpired):
+                pass
+
+
+def test_termination_during_finalization_does_not_abort_it(tmp_path: Path):
+    """A stop request must never destroy the evidence it exists to preserve.
+
+    Pier signals the runner on timeout, and that signal can land while the
+    runner is already finalizing. Raising there would abort the write of
+    `runner-result.json` partway.
+    """
+    binary = tmp_path / "fake-polite"
+    binary.write_text(_FAKE_POLITE_OPENCODE)
+    binary.chmod(0o755)
+    logs_dir = tmp_path / "logs"
+    logs_dir.mkdir()
+    work_dir = tmp_path / "work"
+    work_dir.mkdir()
+    instruction = tmp_path / "instruction.txt"
+    instruction.write_text("do the task")
+
+    process = subprocess.Popen(
+        [
+            "python3",
+            str(Path(runner_module.__file__)),
+            "--instruction-file",
+            str(instruction),
+            "--logs-dir",
+            str(logs_dir),
+            "--work-dir",
+            str(work_dir),
+            "--binary",
+            str(binary),
+            "--model",
+            "fake/model",
+        ],
+        env={
+            **os.environ,
+            "HOME": str(tmp_path),
+            "POLITE_FLAG": str(tmp_path / "flag"),
+        },
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    status_path = logs_dir / runner_module.STATUS_FILENAME
+    pidfile = logs_dir / runner_module.RUNNER_PIDFILE
+    try:
+        deadline = time.monotonic() + 20
+        while time.monotonic() < deadline and not pidfile.exists():
+            time.sleep(0.05)
+        pid = int(
+            dict(
+                line.split("=", 1)
+                for line in pidfile.read_text().split()
+                if "=" in line
+            )["runner"]
+        )
+        # First signal: starts the graceful shutdown.
+        os.kill(pid, signal.SIGTERM)
+        # Wait until it is finalizing, then signal again -- the case a timeout
+        # produces when the runner was already winding down.
+        while time.monotonic() < deadline:
+            try:
+                if json.loads(status_path.read_text()).get("stage") in {
+                    "shutting-down",
+                    "finalizing",
+                    "finished",
+                }:
+                    break
+            except (OSError, json.JSONDecodeError):
+                pass
+            time.sleep(0.02)
+        for _ in range(3):
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except ProcessLookupError:
+                break
+            time.sleep(0.05)
+        process.wait(timeout=30)
+    finally:
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            pass
+        try:
+            subprocess.run(["pkill", "-9", "-f", str(binary)], check=False)
+        except OSError:
+            pass
+
+    # Finalization completed despite the extra signals.
+    result = json.loads((logs_dir / "runner-result.json").read_text())
+    assert result["cancelled"] is True
+    assert json.loads(status_path.read_text())["stage"] == "finished"
+
+
+def test_stream_gap_marks_tool_state_as_unreliable(tmp_path: Path):
+    """The event feed never replays, so a gap invalidates in-flight state."""
+    recorder = runner_module.LiveRecorder(tmp_path, echo=False, heartbeat_seconds=0)
+    recorder.agent_event(
+        _tool_event(
+            "input.started", session="ses_root", message="m1", ident="t1", name="bash"
+        )
+    )
+    assert recorder.snapshot()["tool_state_stale"] is False
+
+    recorder.note_event_gap("event stream dropped")
+    status = recorder.snapshot()
+    assert status["tool_state_stale"] is True
+    assert status["event_stream_gaps"] == 1
+    # The entry survives as evidence but is flagged, not presented as fact.
+    assert status["running_tools"][0]["observed_across_stream_gap"] is True
+    recorder.close()
+    incidents = (tmp_path / runner_module.INCIDENTS_FILENAME).read_text()
+    assert "event-stream-gap" in incidents
+
+
+def test_canonical_failure_events_become_incidents(tmp_path: Path):
+    """v2 spells failures `*.failed`, not `*error*`."""
+    recorder = runner_module.LiveRecorder(tmp_path, echo=False, heartbeat_seconds=0)
+    for event_type, detail in (
+        ("session.tool.failed", "exit 2"),
+        ("session.step.failed", "provider 529"),
+        ("session.execution.failed", "aborted"),
+    ):
+        recorder.agent_event(
+            json.dumps(
+                {
+                    "type": event_type,
+                    "data": {"sessionID": "ses_kid", "error": detail},
+                }
+            )
+        )
+    recorder.close()
+    incidents = [
+        json.loads(line)
+        for line in (tmp_path / runner_module.INCIDENTS_FILENAME)
+        .read_text()
+        .splitlines()
+    ]
+    failures = [item for item in incidents if item["kind"] == "server-event-error"]
+    assert len(failures) == 3
+    assert {item["message"] for item in failures} == {
+        "exit 2",
+        "provider 529",
+        "aborted",
+    }
+    # Child-session attribution is kept: this is what the CLI stream drops.
+    assert all(item["sessionID"] == "ses_kid" for item in failures)
+
+
+def test_uncertain_tool_state_is_not_reported_as_fact(tmp_path: Path):
+    """After a stream gap the narrative must stop asserting tools are stuck."""
+    runner_dir = tmp_path / "opencode-v2"
+    runner_dir.mkdir()
+    (runner_dir / "opencode-v2-status.json").write_text(
+        json.dumps(
+            {
+                "stage": "cli-started",
+                "root_id": "ses_root",
+                "tool_state_stale": True,
+                "event_stream_gaps": 2,
+                "running_tools": [
+                    {
+                        "tool": "bash",
+                        "sessionID": "ses_root",
+                        "running_for_seconds": 900.0,
+                        "observed_across_stream_gap": True,
+                    }
+                ],
+            }
+        )
+    )
+
+    make_agent(tmp_path).populate_context_post_run(AgentContext())
+    message = json.loads((tmp_path / "trajectory.json").read_text())["steps"][0][
+        "message"
+    ]
+    assert "bash" in message
+    # Hedged, because the terminal event may simply have been missed.
+    assert "may have completed" in message or "unconfirmed" in message
+
+
+_FAKE_DETACHING_OPENCODE = '''#!/usr/bin/env python3
+"""OpenCode stand-in that spawns a detached shell tool, like v2.0.8 does."""
+import json, os, subprocess, sys, threading, time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import urlparse
+
+SID = "ses_detach0000000000000000"
+MARKER = os.environ["TOOL_MARKER"]
+
+
+class H(BaseHTTPRequestHandler):
+    def log_message(self, *a):
+        pass
+
+    def _json(self, payload):
+        body = json.dumps(payload).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self):
+        path = urlparse(self.path).path
+        if path == "/api/event":
+            # The real server always serves this and holds it open. Without
+            # it the runner reconnects on a tight loop, which is both slow
+            # and nothing like production.
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.end_headers()
+            while True:
+                time.sleep(0.2)
+                try:
+                    self.wfile.write(b": heartbeat\\n\\n")
+                    self.wfile.flush()
+                except Exception:
+                    return
+        if path == "/api/model":
+            return self._json({"data": [{"providerID": "fake", "id": "model",
+                                         "variants": [], "body": {}, "limit": {}}]})
+        if path in ("/api/agent", "/api/session"):
+            return self._json({"data": [], "cursor": {}})
+        if path == "/api/session/active":
+            return self._json({"data": {}})
+        return self._json({"data": {}})
+
+    def do_POST(self):
+        self._json({"data": True})
+
+
+def serve():
+    httpd = ThreadingHTTPServer(("127.0.0.1", 0), H)
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    print(json.dumps({"url": "http://127.0.0.1:%d" % httpd.server_address[1]}),
+          flush=True)
+    # A detached tool, in its own session, that mutates the workspace later.
+    subprocess.Popen(
+        [
+            "sh",
+            "-c",
+            f"touch {MARKER}.started; "
+            f"while [ ! -f {MARKER}.trigger ]; do sleep 0.05; done; "
+            f"echo mutated > {MARKER}",
+        ],
+        start_new_session=True,
+        cwd=os.getcwd(),
+    )
+    sys.stdin.read()
+
+
+def run():
+    while True:
+        time.sleep(3600)
+
+
+if "serve" in sys.argv:
+    serve()
+elif "run" in sys.argv:
+    run()
+elif "--version" in sys.argv:
+    print("fake-detach 0.0.1")
+'''
+
+
+class _LocalRunEnvironment(FakeEnvironment):
+    """Runs the adapter's real commands locally, in a temporary workspace."""
+
+    def __init__(self, workdir: Path):
+        super().__init__()
+        self.workdir = workdir
+
+    async def exec(self, **kwargs: Any) -> ExecResult:
+        self.exec_calls.append(kwargs)
+        command = kwargs.get("command", "")
+        if command.strip().endswith("pwd"):
+            return ExecResult(return_code=0, stdout=str(self.workdir) + "\n", stderr="")
+        # The runner launch, the shutdown probes and the shutdown signals are
+        # executed for real; stubbing the signals would let the test "pass"
+        # the graceful path without ever delivering SIGTERM. The
+        # container-provisioning commands around them are not what this test
+        # is about and cannot run outside a trial image.
+        interesting = (
+            "opencode_v2_runner.py" in command
+            or "/proc/" in command
+            or "kill -TERM" in command
+            or "kill -KILL" in command
+            or "pgrep -f" in command
+        )
+        if not interesting:
+            return ExecResult(return_code=0, stdout="", stderr="")
+        # Genuinely async, like the docker exec it stands in for. A blocking
+        # subprocess.run here would pin the event loop, so `asyncio.wait_for`
+        # could never interrupt it and the cancellation under test would not
+        # actually happen.
+        process = await asyncio.create_subprocess_exec(
+            "bash",
+            "-c",
+            command,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            cwd=str(self.workdir),
+            # Without this the requested env is dropped and the fake binary
+            # dies on a missing variable the moment it starts.
+            env={**os.environ, **(kwargs.get("env") or {})},
+        )
+        out, err = await process.communicate()
+        return ExecResult(
+            return_code=process.returncode,
+            stdout=out.decode(errors="replace"),
+            stderr=err.decode(errors="replace"),
+        )
+
+    async def upload_file(self, source: Path | str, target: str) -> None:
+        Path(target).parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy(str(source), target)
+        self.uploads.append((str(source), target, ""))
+
+
+def test_cancellation_mid_run_stops_the_recorded_processes(tmp_path: Path):
+    """Cancel a live runner the way an agent timeout does, then clean up.
+
+    The contract this asserts is the one the adapter actually provides:
+    the recorded runner, server and CLI are stopped, and the live evidence
+    survives. It deliberately does *not* assert that OpenCode's detached
+    shell commands are gone -- v2.0.8 spawns those in their own session, so
+    only OpenCode interrupting itself during graceful shutdown stops them,
+    and claiming otherwise here would be a false guarantee.
+    """
+    workdir = tmp_path / "work"
+    workdir.mkdir()
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    marker = workdir / "tool-marker"
+
+    binary = tmp_path / "opencode-v2-bin"
+    binary.write_text(_FAKE_DETACHING_OPENCODE)
+    binary.chmod(0o755)
+    instruction = logs / "instruction.txt"
+    instruction.write_text("do the task\n")
+    runner_path = tmp_path / "opencode_v2_runner.py"
+    shutil.copy(runner_module.__file__, runner_path)
+
+    agent = make_agent(tmp_path)
+    agent._RUNNER_PIDFILE = logs / runner_module.RUNNER_PIDFILE
+    agent._REMOTE_BINARY = binary
+    agent._RUNNER_STOP_POLL_SECONDS = 0.2
+    agent._RUNNER_STOP_GRACE_SECONDS = 15
+    environment = _LocalRunEnvironment(workdir)
+
+    async def drive() -> None:
+        """The shape of `run()`: await the agent, always stop it afterwards."""
+        try:
+            await environment.exec(
+                command=(
+                    f"python3 {shlex.quote(str(runner_path))} "
+                    f"--instruction-file {shlex.quote(str(instruction))} "
+                    f"--logs-dir {shlex.quote(str(logs))} "
+                    f"--work-dir {shlex.quote(str(workdir))} "
+                    f"--binary {shlex.quote(str(binary))} --model fake/model"
+                ),
+                env={"TOOL_MARKER": str(marker)},
+            )
+        finally:
+            await agent._ensure_runner_stopped(environment)
+
+    async def main() -> None:
+        task = asyncio.ensure_future(drive())
+        started = Path(str(marker) + ".started")
+        deadline = time.monotonic() + 60
+        while time.monotonic() < deadline and not started.exists():
+            if task.done():
+                await task
+                raise AssertionError("the runner exited before OpenCode started")
+            await asyncio.sleep(0.1)
+        if not started.exists():
+            task.cancel()
+            raise AssertionError("OpenCode never started")
+        with pytest.raises(asyncio.TimeoutError):
+            await asyncio.wait_for(task, timeout=0.1)
+
+    try:
+        asyncio.run(main())
+
+        # Assert before cleaning up: the teardown below would otherwise kill
+        # the very processes these assertions are about.
+        leftovers = subprocess.run(
+            ["pgrep", "-f", str(binary)], capture_output=True, text=True
+        ).stdout.split()
+        assert not leftovers, f"recorded OpenCode processes survived: {leftovers}"
+
+        states = asyncio.run(agent._owned_states(environment))
+        assert agent._all_stopped(states), states
+
+        status = logs / runner_module.STATUS_FILENAME
+        assert status.exists(), "no live evidence survived the cancellation"
+        assert json.loads(status.read_text()).get("stage")
+    finally:
+        subprocess.run(["pkill", "-9", "-f", str(binary)], check=False)
+        subprocess.run(["pkill", "-9", "-f", str(marker)], check=False)
+
+
+def test_fake_opencode_sources_are_valid_python():
+    """The fakes are source strings, so a typo in them is invisible.
+
+    A broken fake does not fail loudly: its server simply never reports
+    ready, and the runner waits out its full readiness timeout. That turns a
+    one-character mistake into minutes of unexplained suite runtime.
+    """
+    import ast
+
+    for name, source in (
+        ("_FAKE_OPENCODE", _FAKE_OPENCODE),
+        ("_FAKE_HANGING_OPENCODE", _FAKE_HANGING_OPENCODE),
+        ("_FAKE_POLITE_OPENCODE", _FAKE_POLITE_OPENCODE),
+        ("_FAKE_DETACHING_OPENCODE", _FAKE_DETACHING_OPENCODE),
+    ):
+        ast.parse(source)  # raises SyntaxError with the offending line
+        # The real server always serves this; without it the runner
+        # reconnects on a tight loop.
+        assert "/api/event" in source, name
+
+
+def test_a_reaped_and_a_zombie_runner_both_count_as_stopped(tmp_path: Path):
+    """A finished runner must not be killed just because nobody reaped it.
+
+    Container PID 1 frequently does not reap, and `kill -0` succeeds for
+    zombies, so a liveness check based on that alone would escalate on every
+    clean run.
+    """
+    import asyncio
+
+    alive = subprocess.Popen(["sleep", "300"])
+    pidfile = tmp_path / "runner.pid"
+    pidfile.write_text(f"runner={alive.pid}\nserver=none\ncli=none\n")
+    agent = _pidfile_agent(tmp_path, pidfile)
+    environment = _LocalShellEnvironment()
+    try:
+        assert asyncio.run(agent._owned_states(environment))["runner"] == "RUNNING"
+    finally:
+        alive.kill()
+        alive.wait(timeout=10)
+    states = asyncio.run(agent._owned_states(environment))
+    assert agent._all_stopped(states)

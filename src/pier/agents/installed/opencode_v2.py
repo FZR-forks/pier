@@ -18,12 +18,15 @@ The persisted messages are converted into one ATIF trajectory per unique
 session, nested by their real ``parentID``.
 """
 
+import asyncio
 import copy
 import ipaddress
 import json
+import os
 import re
 import shlex
 import tempfile
+import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -133,6 +136,37 @@ def _env_template_values(config: dict[str, Any]) -> dict[str, str]:
     return values
 
 
+def _session_suffix(session_id: Any, validated_root: Any) -> str:
+    """Describe which session a tool belongs to, without guessing.
+
+    Only call a session a *child* when the root has actually been confirmed;
+    otherwise the root itself would be mislabelled as a child.
+    """
+    if not session_id:
+        return ""
+    if not validated_root:
+        return f" in session {session_id}"
+    if str(session_id) == str(validated_root):
+        return ""
+    return f" in child session {session_id}"
+
+
+# Descendant closure plus workspace-cwd sweep, in two single-pass scans.
+# A shell loop per pid would spawn thousands of processes and take long
+# enough that a short-lived tool can finish its work before being reached.
+
+
+_BINARY_SWEEP_SCRIPT = r"""
+pgid() { sed 's/.*) //' "/proc/$1/stat" 2>/dev/null | cut -d' ' -f3; }
+mine=$(pgid $$)
+for victim in $(pgrep -f "$PATTERN" 2>/dev/null); do
+  [ "$(pgid "$victim")" = "$mine" ] && continue
+  kill -KILL "$victim" 2>/dev/null
+done
+true
+"""
+
+
 class OpenCodeV2(BaseInstalledAgent):
     """OpenCode V2 agent, driven through its own server process."""
 
@@ -146,6 +180,27 @@ class OpenCodeV2(BaseInstalledAgent):
     _RUNNER_OUTPUT = _RUNNER_LOG_DIR / "runner-result.json"
     _SESSIONS_OUTPUT = _RUNNER_LOG_DIR / "opencode-v2-sessions.jsonl"
     _CLI_EVENTS_OUTPUT = _RUNNER_LOG_DIR / "opencode-v2-cli-events.jsonl"
+    # Write-through evidence: present even when the runner never reached its
+    # finalization path, which is exactly when diagnosis matters most.
+    _STATUS_OUTPUT = _RUNNER_LOG_DIR / "opencode-v2-status.json"
+    _INCIDENTS_OUTPUT = _RUNNER_LOG_DIR / "opencode-v2-incidents.jsonl"
+    _CLI_STREAM_OUTPUT = _RUNNER_LOG_DIR / "opencode-v2-cli-stream.jsonl"
+    _PARTIAL_SESSIONS_OUTPUT = _RUNNER_LOG_DIR / "opencode-v2-sessions.partial.jsonl"
+    _CLI_STDERR_OUTPUT = _RUNNER_LOG_DIR / "opencode-v2-cli-stderr.log"
+    _SERVER_STDERR_OUTPUT = _RUNNER_LOG_DIR / "opencode-v2-server-stderr.log"
+    _EVENTS_OUTPUT = _RUNNER_LOG_DIR / "opencode-v2-events.jsonl"
+    _RUNNER_PIDFILE = _RUNNER_LOG_DIR / "opencode-v2-runner.pid"
+    _ROOT_CANDIDATES_OUTPUT = _RUNNER_LOG_DIR / "opencode-v2-root-candidates.json"
+    # How long the runner is given to shut itself down after SIGTERM. Its own
+    # graceful path is bounded (interrupt, short collection, server stop), so
+    # this only has to be comfortably larger than that.
+    _RUNNER_STOP_GRACE_SECONDS = float(
+        os.environ.get("PIER_OPENCODE_V2_RUNNER_STOP_GRACE", "90")
+    )
+    _RUNNER_STOP_POLL_SECONDS = 2.0
+    # Set once the workspace path is known, so the teardown can find detached
+    # tools by their working directory.
+    _shutdown_failure: str | None = None
     _INSTRUCTION_PATH = _RUNNER_LOG_DIR / "instruction.txt"
 
     # These values define the adapter's private process/config boundary.  A
@@ -1238,6 +1293,15 @@ class OpenCodeV2(BaseInstalledAgent):
                 env=env,
             )
         finally:
+            # A timed-out agent is cancelled host-side, and killing a
+            # `docker compose exec` client does not signal the process inside
+            # the container. Without this the runner, the OpenCode server and
+            # the agent's tools keep running while Pier collects artifacts and
+            # grades the task. Stop them before anything is read.
+            try:
+                await self._ensure_runner_stopped(environment, env)
+            except Exception:
+                self.logger.exception("OpenCode V2 runner shutdown failed")
             # Preserve the primary execution error even when artifact
             # collection fails; the runner keeps its JSONL evidence on disk
             # precisely so a failed run can still be graded.
@@ -1253,6 +1317,181 @@ class OpenCodeV2(BaseInstalledAgent):
             'mkdir -p "$OPENCODE_CONFIG_DIR/skills" && '
             f"cp -r {shlex.quote(self.skills_dir)}/* "
             '"$OPENCODE_CONFIG_DIR/skills/" 2>/dev/null || true'
+        )
+
+    async def _probe(
+        self,
+        environment: BaseEnvironment,
+        command: str,
+        env: dict[str, str] | None = None,
+    ) -> str:
+        """Run a short shell probe that always succeeds, returning its stdout."""
+        result = await self.exec_as_agent(
+            environment,
+            # Newline-delimited rather than `{ cmd ; }`: these commands are
+            # multi-line scripts, and a trailing `;` on its own line is a
+            # shell syntax error.
+            command=f"{{\n{command}\n}} 2>/dev/null || true",
+            env=env,
+            timeout_sec=30,
+        )
+        return (getattr(result, "stdout", "") or "").strip()
+
+    async def _signal(
+        self,
+        environment: BaseEnvironment,
+        command: str,
+        env: dict[str, str] | None,
+    ) -> None:
+        """Deliver a signal; a failed exec must not end the shutdown ladder."""
+        try:
+            await self._probe(environment, command, env)
+        except Exception:
+            self.logger.debug("OpenCode V2 shutdown signal could not be delivered")
+
+    _OWNED_PROCESSES = ("runner", "server", "cli")
+
+    def _pid_expr(self, key: str) -> str:
+        """Shell that sets ``$pid`` to one entry of the ``key=pid`` pidfile.
+
+        The pidfile records the runner, server and CLI, so every consumer has
+        to select its own line; reading the file whole yields all three.
+        """
+        pidfile = shlex.quote(self._RUNNER_PIDFILE.as_posix())
+        return f"pid=$(sed -n 's/^{key}=//p' {pidfile} 2>/dev/null | head -n 1)"
+
+    async def _owned_states(
+        self, environment: BaseEnvironment, env: dict[str, str] | None = None
+    ) -> dict[str, str]:
+        """State of each process the runner recorded: GONE or RUNNING.
+
+        A process that has exited stays visible as a zombie until something
+        reaps it, and container PID 1 often does not, so this reads the
+        process state rather than using `kill -0`, which succeeds for
+        zombies.
+
+        A probe that cannot be read reports UNKNOWN rather than GONE. This
+        adapter exists to stop the run flying blind, so "I could not tell"
+        must not be recorded as "it definitely stopped". Shutdown stays
+        best-effort and bounded either way; UNKNOWN just means the cleanup
+        runs and the uncertainty is logged.
+        """
+        checks = "; ".join(
+            f"{{ {self._pid_expr(key)}; "
+            f'if [ -z "$pid" ] || [ "$pid" = "none" ]; then echo "{key}=GONE"; '
+            'elif [ -r "/proc/$pid/stat" ]; then '
+            "  state=$(sed 's/.*) //' \"/proc/$pid/stat\" | cut -d' ' -f1); "
+            f'  if [ "$state" = "Z" ]; then echo "{key}=GONE"; '
+            f'  else echo "{key}=RUNNING"; fi; '
+            f'elif kill -0 "$pid" 2>/dev/null; then echo "{key}=RUNNING"; '
+            f'else echo "{key}=GONE"; fi; }}'
+            for key in self._OWNED_PROCESSES
+        )
+        try:
+            answer = await self._probe(environment, checks, env)
+        except Exception:
+            self.logger.debug("Could not probe the OpenCode V2 processes")
+            return {key: "UNKNOWN" for key in self._OWNED_PROCESSES}
+        reported = dict(
+            line.split("=", 1)
+            for line in answer.split()
+            if "=" in line and line.split("=", 1)[1] in {"GONE", "RUNNING"}
+        )
+        return {key: reported.get(key, "UNKNOWN") for key in self._OWNED_PROCESSES}
+
+    @staticmethod
+    def _all_stopped(states: dict[str, str]) -> bool:
+        return all(state == "GONE" for state in states.values())
+
+    @staticmethod
+    def _still_alive(states: dict[str, str]) -> list[str]:
+        return sorted(key for key, state in states.items() if state != "GONE")
+
+    async def _ensure_runner_stopped(
+        self, environment: BaseEnvironment, env: dict[str, str] | None = None
+    ) -> None:
+        """Stop the runner, escalating only as far as it takes.
+
+        A timed-out agent is cancelled host-side, and killing a
+        `docker compose exec` client does not signal the process inside the
+        container, so without this the runner and OpenCode keep going while
+        Pier collects artifacts.
+
+        SIGTERM reaches the runner's own handler, which interrupts the
+        OpenCode sessions, lets the CLI exit, collects what evidence it can
+        and shuts the server down cleanly. Only a runner that ignores that is
+        killed.
+        """
+        states = await self._owned_states(environment, env)
+        if self._all_stopped(states):
+            return  # the normal path: it already exited on its own
+
+        if states.get("runner") == "GONE":
+            # Nothing left to ask politely: the runner that would interrupt
+            # the sessions has already exited, so signalling its pid and
+            # waiting out the grace period would achieve nothing.
+            self.logger.warning(
+                "OpenCode V2 runner has exited but %s remain; cleaning up",
+                ", ".join(self._still_alive(states)),
+            )
+        else:
+            self.logger.warning(
+                "OpenCode V2 is still running (%s); requesting graceful shutdown",
+                ", ".join(self._still_alive(states)),
+            )
+            await self._signal(
+                environment,
+                f'{self._pid_expr("runner")}; [ -n "$pid" ] && kill -TERM "$pid"',
+                env,
+            )
+
+            deadline = time.monotonic() + self._RUNNER_STOP_GRACE_SECONDS
+            while time.monotonic() < deadline:
+                await asyncio.sleep(self._RUNNER_STOP_POLL_SECONDS)
+                if self._all_stopped(await self._owned_states(environment, env)):
+                    self.logger.info("OpenCode V2 shut down gracefully")
+                    return
+            self.logger.warning("OpenCode V2 ignored SIGTERM; killing it")
+        await self._force_stop(environment, env)
+
+        states = await self._owned_states(environment, env)
+        if not self._all_stopped(states):
+            self.logger.error(
+                "OpenCode V2 could not be confirmed stopped (%s)",
+                ", ".join(self._still_alive(states)),
+            )
+
+    async def _force_stop(
+        self, environment: BaseEnvironment, env: dict[str, str] | None
+    ) -> None:
+        """Kill the recorded processes and the groups they lead.
+
+        This covers the runner, the server, the CLI, and anything still
+        running the OpenCode binary. It deliberately does *not* claim to
+        reach every shell command OpenCode started: v2.0.8 spawns those with
+        `detached: true` (`packages/core/src/shell.ts`), giving each its own
+        group and session, so no signal aimed at the recorded processes finds
+        them. Interrupting the sessions during graceful shutdown is what asks
+        OpenCode to stop its own tools; this is the fallback for a runner
+        that will not cooperate.
+        """
+        for key in ("cli", "server", "runner"):
+            await self._signal(
+                environment,
+                f"{self._pid_expr(key)}; "
+                'if [ -n "$pid" ] && [ "$pid" != "none" ]; then '
+                '  kill -KILL -"$pid" 2>/dev/null || kill -KILL "$pid" 2>/dev/null; '
+                "fi",
+                env,
+            )
+        # Anything that escaped still runs the OpenCode binary itself. This
+        # cannot be a plain `pkill -f`: the probe shell's own command line
+        # contains the pattern, so pkill would match and kill itself.
+        await self._signal(
+            environment,
+            f"PATTERN={shlex.quote(self._REMOTE_BINARY.as_posix())}; "
+            + _BINARY_SWEEP_SCRIPT,
+            env,
         )
 
     async def _collect_runner_artifacts(self, environment: BaseEnvironment) -> None:
@@ -1274,6 +1513,38 @@ class OpenCodeV2(BaseInstalledAgent):
             (
                 self._CLI_EVENTS_OUTPUT,
                 self.logs_dir / "opencode-v2" / "opencode-v2-cli-events.jsonl",
+            ),
+            (
+                self._STATUS_OUTPUT,
+                self.logs_dir / "opencode-v2" / "opencode-v2-status.json",
+            ),
+            (
+                self._INCIDENTS_OUTPUT,
+                self.logs_dir / "opencode-v2" / "opencode-v2-incidents.jsonl",
+            ),
+            (
+                self._CLI_STREAM_OUTPUT,
+                self.logs_dir / "opencode-v2" / "opencode-v2-cli-stream.jsonl",
+            ),
+            (
+                self._PARTIAL_SESSIONS_OUTPUT,
+                self.logs_dir / "opencode-v2" / "opencode-v2-sessions.partial.jsonl",
+            ),
+            (
+                self._CLI_STDERR_OUTPUT,
+                self.logs_dir / "opencode-v2" / "opencode-v2-cli-stderr.log",
+            ),
+            (
+                self._SERVER_STDERR_OUTPUT,
+                self.logs_dir / "opencode-v2" / "opencode-v2-server-stderr.log",
+            ),
+            (
+                self._EVENTS_OUTPUT,
+                self.logs_dir / "opencode-v2" / "opencode-v2-events.jsonl",
+            ),
+            (
+                self._ROOT_CANDIDATES_OUTPUT,
+                self.logs_dir / "opencode-v2" / "opencode-v2-root-candidates.json",
             ),
         ):
             try:
@@ -2340,6 +2611,167 @@ class OpenCodeV2(BaseInstalledAgent):
                 "OpenCode V2 model restriction failed: " + "; ".join(mismatches[:10])
             )
 
+    def _live_evidence(self) -> dict[str, Any]:
+        """Summarize the runner's write-through record of the run.
+
+        Unlike ``runner-result.json`` these files are written as execution
+        proceeds, so they survive a runner that was killed, hung, or timed
+        out before it could finalize anything.
+        """
+        base = self.logs_dir / "opencode-v2"
+        status = self._read_json(base / "opencode-v2-status.json") or {}
+        incidents = self._read_jsonl(base / "opencode-v2-incidents.jsonl")
+        evidence: dict[str, Any] = {}
+        # The runner only publishes ``root_id`` once it has confirmed the root
+        # against server metadata, and only stamps the candidates file as
+        # validated at the same point. ``root_candidates`` on its own is what
+        # the CLI claimed and may name a subagent, so it stays diagnostic.
+        candidates_file = (
+            self._read_json(base / "opencode-v2-root-candidates.json") or {}
+        )
+        if candidates_file.get("validated") is True and candidates_file.get("root_id"):
+            evidence["validated_root_id"] = str(candidates_file["root_id"])
+        if status.get("root_id"):
+            evidence["validated_root_id"] = str(status["root_id"])
+        if status:
+            for key in (
+                "stage",
+                "stage_history",
+                "root_id",
+                "root_candidates",
+                "cli_started",
+                "cli_returncode",
+                "server_started",
+                "server_exit_code",
+                "cli_stdout_lines",
+                "cli_stderr_lines",
+                "server_stderr_lines",
+                "last_cli_activity_at",
+                "seconds_since_cli_activity",
+                "last_cli_event",
+                "last_reported_tool",
+                "cli_stream_limitations",
+                "agent_events_seen",
+                "last_agent_activity_at",
+                "seconds_since_agent_activity",
+                "running_tools",
+                "last_tool_started",
+                "event_stream_connected",
+                "tool_state_stale",
+                "event_stream_gaps",
+                "elapsed_seconds",
+                "updated_at",
+            ):
+                if status.get(key) is not None:
+                    evidence[key] = status[key]
+        if incidents:
+            evidence["incident_count"] = len(incidents)
+            evidence["last_incidents"] = incidents[-10:]
+        stream = base / "opencode-v2-cli-stream.jsonl"
+        if stream.exists():
+            try:
+                lines = stream.read_text(errors="replace").splitlines()
+            except OSError:
+                lines = []
+            if lines:
+                evidence["cli_stream_lines"] = len(lines)
+                evidence["cli_stream_tail"] = [line[:2000] for line in lines[-5:]]
+        return evidence
+
+    @staticmethod
+    def _describe_live_evidence(evidence: dict[str, Any]) -> str:
+        """One human-readable sentence answering 'where did this stop?'."""
+        if not evidence:
+            return (
+                "OpenCode left no collectible session records and no live "
+                "runner evidence."
+            )
+        parts = [
+            f"OpenCode stopped at runner stage {evidence.get('stage', 'unknown')!r}"
+        ]
+        if evidence.get("elapsed_seconds") is not None:
+            parts.append(f"after {evidence['elapsed_seconds']}s")
+        if evidence.get("validated_root_id"):
+            parts.append(f"in session {evidence['validated_root_id']}")
+        sentence = " ".join(parts) + "."
+        candidates = evidence.get("root_candidates") or []
+        if not evidence.get("validated_root_id") and candidates:
+            # Reported, but never treated as the run's identity.
+            sentence += (
+                " The root session was never confirmed; the CLI named "
+                f"{', '.join(str(item) for item in candidates[:5])} "
+                "as unvalidated candidate(s)."
+            )
+        running = [
+            item
+            for item in (evidence.get("running_tools") or [])
+            if isinstance(item, dict)
+        ]
+        if running:
+            # The single most useful fact for a hang: what had started but
+            # never finished, and for how long.
+            described = "; ".join(
+                f"{item.get('tool')!r} for {item.get('running_for_seconds')}s"
+                + (f" ({item.get('input')})" if item.get("input") else "")
+                + _session_suffix(
+                    item.get("sessionID"), evidence.get("validated_root_id")
+                )
+                for item in running[:5]
+            )
+            if evidence.get("tool_state_stale"):
+                # The event feed has no replay, so a tool that finished while
+                # the stream was down still looks unfinished here. Report it,
+                # but do not let a timeout be blamed on a command that may
+                # already have completed.
+                sentence += (
+                    f" Tool(s) with no recorded completion: {described}."
+                    " The event stream dropped during the run, so these may"
+                    " have completed unobserved and their durations are"
+                    " unconfirmed."
+                )
+            else:
+                sentence += f" Unfinished tool(s) at that point: {described}."
+        tool = evidence.get("last_reported_tool")
+        if isinstance(tool, dict) and tool.get("tool"):
+            # "reported", not "running": the CLI only emits a tool once it
+            # finishes, so a stuck tool never appears here.
+            sentence += (
+                f" The last tool the CLI reported was {tool['tool']!r}"
+                f" ({tool.get('status', 'unknown')}); a tool still running"
+                " would not appear."
+            )
+        if evidence.get("cli_stdout_lines"):
+            sentence += (
+                f" The CLI produced {evidence['cli_stdout_lines']} output line(s)"
+            )
+            idle = evidence.get("seconds_since_cli_activity")
+            if idle is not None:
+                sentence += f", last seen {idle}s before the record ends"
+            sentence += "."
+            if isinstance(idle, (int, float)) and idle >= 60:
+                agent_idle = evidence.get("seconds_since_agent_activity")
+                if isinstance(agent_idle, (int, float)):
+                    # The event feed sees running tools and child sessions, so
+                    # its silence is meaningful where the CLI's is not.
+                    sentence += (
+                        f" The server event feed last saw activity {agent_idle}s"
+                        " before the record ends."
+                    )
+                else:
+                    sentence += (
+                        " CLI silence does not by itself prove the agent"
+                        " stopped: a long-running tool and any child-session"
+                        " work are both invisible in this stream."
+                    )
+        incidents = evidence.get("last_incidents") or []
+        if incidents:
+            last = incidents[-1]
+            sentence += (
+                f" Most recent incident: {last.get('kind')}: "
+                f"{str(last.get('message'))[:300]}"
+            )
+        return sentence
+
     def populate_context_post_run(self, context: AgentContext) -> None:
         """Convert the runner's recorded sessions into ATIF trajectories."""
         runner_result = self._read_json(
@@ -2348,6 +2780,43 @@ class OpenCodeV2(BaseInstalledAgent):
         inspections = self._read_jsonl(
             self.logs_dir / "opencode-v2" / "opencode-v2-sessions.jsonl"
         )
+        partial_sessions_used = False
+        live_evidence: dict[str, Any] | None = None
+        if not inspections:
+            # The final dump only exists if the runner finished collecting.
+            # The settle loop persists each snapshot it builds, so an
+            # interrupted run can still be reconstructed from real records
+            # instead of collapsing to a stub.
+            partial = self._read_jsonl(
+                self.logs_dir / "opencode-v2" / "opencode-v2-sessions.partial.jsonl"
+            )
+            if partial:
+                # Only adopt the partial snapshot when a confirmed root is
+                # actually in it. Otherwise root selection would fall back to
+                # graph inference and could crown an orphaned child -- a
+                # snapshot taken mid-collection often holds a child whose
+                # parent was not fetched -- giving the run the wrong identity.
+                live_evidence = self._live_evidence()
+                validated_root = live_evidence.get("validated_root_id")
+                snapshot_ids = {
+                    str((record.get("session") or {}).get("id"))
+                    for record in partial
+                    if isinstance(record.get("session"), dict)
+                }
+                if validated_root and str(validated_root) in snapshot_ids:
+                    self.logger.warning(
+                        "Using %d partial OpenCode V2 session snapshot record(s); "
+                        "the runner did not finish collection",
+                        len(partial),
+                    )
+                    inspections = partial
+                    partial_sessions_used = True
+                else:
+                    self.logger.warning(
+                        "Ignoring %d partial OpenCode V2 session record(s): no "
+                        "confirmed root session is present in them",
+                        len(partial),
+                    )
         valid_inspections = [
             record
             for record in inspections
@@ -2360,6 +2829,10 @@ class OpenCodeV2(BaseInstalledAgent):
             )
         inspections = valid_inspections
         if not inspections:
+            # Only read now: the CLI stream can be large and a successful
+            # collection never looks at it.
+            if live_evidence is None:
+                live_evidence = self._live_evidence()
             raw_collection_errors = (runner_result or {}).get("collection_errors")
             collection_errors = [
                 str(error)
@@ -2375,6 +2848,10 @@ class OpenCodeV2(BaseInstalledAgent):
                     if runner_result is None
                     else "no collectible session records"
                 ]
+            for incident in live_evidence.get("last_incidents") or []:
+                rendered = f"{incident.get('kind')}: {incident.get('message')}"
+                if rendered not in collection_errors:
+                    collection_errors.append(rendered)
             self.logger.error(
                 "No OpenCode V2 session inspections found: %s",
                 "; ".join(collection_errors),
@@ -2384,6 +2861,12 @@ class OpenCodeV2(BaseInstalledAgent):
                 if runner_result and runner_result.get("root_id")
                 else None
             )
+            if recorded_root_id is None:
+                # The runner confirms the root against server metadata well
+                # before the manifest exists, so that confirmed value is safe
+                # to adopt. An unvalidated CLI candidate is not: it can name a
+                # subagent and would misattribute the whole trajectory.
+                recorded_root_id = live_evidence.get("validated_root_id") or None
             stub = Trajectory(
                 schema_version="ATIF-v1.7",
                 session_id=recorded_root_id,
@@ -2397,12 +2880,15 @@ class OpenCodeV2(BaseInstalledAgent):
                     Step(
                         step_id=1,
                         source="system",
-                        message=(
-                            "OpenCode completed without collectible session records."
-                        ),
+                        message=self._describe_live_evidence(live_evidence),
                         extra={
                             "collection_gap": True,
                             "collection_errors": collection_errors,
+                            **(
+                                {"live_evidence": live_evidence}
+                                if live_evidence
+                                else {}
+                            ),
                         },
                     )
                 ],
@@ -2414,6 +2900,7 @@ class OpenCodeV2(BaseInstalledAgent):
                         "tree_cost_complete": False,
                         "collection_incomplete": True,
                         "collection_errors": collection_errors,
+                        **({"live_evidence": live_evidence} if live_evidence else {}),
                     },
                 ),
             )
@@ -2446,7 +2933,9 @@ class OpenCodeV2(BaseInstalledAgent):
             if runner_result and runner_result.get("root_id")
             else None
         )
-        root = self._select_root(trajectories, recorded_root_id)
+        if partial_sessions_used and not recorded_root_id:
+            recorded_root_id = str((live_evidence or {}).get("validated_root_id") or "")
+        root = self._select_root(trajectories, recorded_root_id or None)
         if root is None:
             self._raise_model_restriction_failure(restriction_mismatches)
             return
@@ -2477,7 +2966,8 @@ class OpenCodeV2(BaseInstalledAgent):
         # pages, children, and shutdown diagnostics were collected. Preserve
         # the partial trajectory but withhold its aggregate totals.
         if (
-            runner_result is None
+            partial_sessions_used
+            or runner_result is None
             or runner_result.get("collection_complete") is not True
             or (discovered_ids and discovered_ids != converted_ids)
             or not attachment_complete
