@@ -4559,9 +4559,13 @@ def test_sessions_are_interrupted_before_any_signal(tmp_path, monkeypatch):
 
 
 class _ScriptedEnvironment(FakeEnvironment):
-    """Answers runner liveness probes from a scripted sequence."""
+    """Answers owned-process liveness probes from a scripted sequence.
 
-    def __init__(self, answers: list[str]):
+    Each answer is the state every recorded process reports, or a mapping
+    for the cases where they differ.
+    """
+
+    def __init__(self, answers: list[Any]):
         super().__init__()
         self._answers = list(answers)
 
@@ -4570,7 +4574,10 @@ class _ScriptedEnvironment(FakeEnvironment):
         command = kwargs.get("command", "")
         if "/proc/$pid/stat" in command:
             answer = self._answers.pop(0) if self._answers else "GONE"
-            return ExecResult(return_code=0, stdout=answer, stderr="")
+            if isinstance(answer, str):
+                answer = {key: answer for key in OpenCodeV2._OWNED_PROCESSES}
+            rendered = " ".join(f"{k}={v}" for k, v in answer.items())
+            return ExecResult(return_code=0, stdout=rendered, stderr="")
         return ExecResult(return_code=0, stdout="", stderr="")
 
     def signals_sent(self) -> list[str]:
@@ -4645,9 +4652,12 @@ def test_exited_runner_awaiting_reaping_is_not_killed(tmp_path: Path):
                 # Emulate the real shell against a zombie's stat line.
                 stat = "4242 (python3) Z 1 4242 4242 0 -1 4194560 0 0"
                 state = stat.split(") ")[-1].split()[0]
+                verdict = "GONE" if state == "Z" else "RUNNING"
                 return ExecResult(
                     return_code=0,
-                    stdout="GONE" if state == "Z" else "RUNNING",
+                    stdout=" ".join(
+                        f"{key}={verdict}" for key in OpenCodeV2._OWNED_PROCESSES
+                    ),
                     stderr="",
                 )
             return ExecResult(return_code=0, stdout="", stderr="")
@@ -4990,7 +5000,11 @@ def test_probe_failure_does_not_end_the_shutdown(tmp_path: Path):
             if "/proc/$pid/stat" in command:
                 calls["n"] += 1
                 if calls["n"] == 1:
-                    return ExecResult(return_code=0, stdout="RUNNING", stderr="")
+                    return ExecResult(
+                        return_code=0,
+                        stdout="runner=RUNNING server=RUNNING cli=RUNNING",
+                        stderr="",
+                    )
                 raise RuntimeError("docker exec failed")
             return ExecResult(return_code=0, stdout="", stderr="")
 
@@ -5047,17 +5061,21 @@ def test_shutdown_targets_the_runner_entry_of_a_multi_entry_pidfile(tmp_path: Pa
     import asyncio
 
     victim = subprocess.Popen(["sleep", "300"])
-    decoys = [subprocess.Popen(["sleep", "300"]) for _ in range(2)]
+    # Distinct, already-reaped entries: the runner line must be the one
+    # selected, and nothing else should need cleaning up.
+    reaped = []
+    for _ in range(2):
+        done = subprocess.Popen(["true"])
+        done.wait(timeout=10)
+        reaped.append(done.pid)
     pidfile = tmp_path / "runner.pid"
-    pidfile.write_text(
-        f"runner={victim.pid}\nserver={decoys[0].pid}\ncli={decoys[1].pid}\n"
-    )
+    pidfile.write_text(f"runner={victim.pid}\nserver={reaped[0]}\ncli={reaped[1]}\n")
     try:
         agent = _pidfile_agent(tmp_path, pidfile)
         environment = _LocalShellEnvironment()
 
-        # The liveness probe reads only the runner entry.
-        assert asyncio.run(agent._runner_is_running(environment)) is True
+        states = asyncio.run(agent._owned_states(environment))
+        assert states["runner"] == "RUNNING"
 
         asyncio.run(agent._ensure_runner_stopped(environment))
 
@@ -5069,10 +5087,55 @@ def test_shutdown_targets_the_runner_entry_of_a_multi_entry_pidfile(tmp_path: Pa
             "kill -KILL" in call.get("command", "") for call in environment.exec_calls
         ), "escalated to a forced kill despite a working graceful stop"
     finally:
-        for process in (victim, *decoys):
+        try:
+            victim.kill()
+            victim.wait(timeout=10)
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+
+
+def test_processes_outliving_a_dead_runner_are_cleaned_up(tmp_path: Path):
+    """A gone runner does not mean OpenCode is gone.
+
+    The server and CLI run in their own sessions, so they survive a runner
+    that was killed or crashed before its cleanup ran. Reporting shutdown
+    complete there would let a tool keep writing while the task is graded.
+    """
+    import asyncio
+
+    # The runner is already gone; its server and CLI are not.
+    dead = subprocess.Popen(["true"])
+    dead.wait(timeout=10)
+    survivors = [
+        subprocess.Popen(["sleep", "300"], start_new_session=True) for _ in range(2)
+    ]
+    pidfile = tmp_path / "runner.pid"
+    pidfile.write_text(
+        f"runner={dead.pid}\nserver={survivors[0].pid}\ncli={survivors[1].pid}\n"
+    )
+    try:
+        agent = _pidfile_agent(tmp_path, pidfile)
+        environment = _LocalShellEnvironment()
+
+        states = asyncio.run(agent._owned_states(environment))
+        assert states["runner"] == "GONE"
+        assert states["server"] == "RUNNING" and states["cli"] == "RUNNING"
+
+        asyncio.run(agent._ensure_runner_stopped(environment))
+
+        for index, survivor in enumerate(survivors):
             try:
-                process.kill()
-                process.wait(timeout=10)
+                survivor.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                raise AssertionError(
+                    f"process {index} outlived the runner and was left running"
+                )
+        assert agent._all_stopped(asyncio.run(agent._owned_states(environment)))
+    finally:
+        for survivor in survivors:
+            try:
+                survivor.kill()
+                survivor.wait(timeout=10)
             except (OSError, subprocess.TimeoutExpired):
                 pass
 
@@ -5087,18 +5150,18 @@ def test_liveness_probe_reports_real_process_states(tmp_path: Path):
     agent = _pidfile_agent(tmp_path, pidfile)
     environment = _LocalShellEnvironment()
     try:
-        assert asyncio.run(agent._runner_is_running(environment)) is True
+        assert asyncio.run(agent._owned_states(environment))["runner"] == "RUNNING"
     finally:
         alive.kill()
         alive.wait(timeout=10)
     # Reaped: the pid is gone entirely.
-    assert asyncio.run(agent._runner_is_running(environment)) is False
+    assert asyncio.run(agent._owned_states(environment))["runner"] == "GONE"
 
-    # An empty or absent pidfile is not a running runner.
+    # An empty or absent pidfile is not a running process.
     pidfile.write_text("")
-    assert asyncio.run(agent._runner_is_running(environment)) is False
+    assert agent._all_stopped(asyncio.run(agent._owned_states(environment)))
     pidfile.unlink()
-    assert asyncio.run(agent._runner_is_running(environment)) is False
+    assert agent._all_stopped(asyncio.run(agent._owned_states(environment)))
 
 
 def test_forced_stop_signals_each_recorded_process_group(tmp_path: Path):
@@ -5271,9 +5334,12 @@ def test_unreachable_environment_stops_probing_but_a_hiccup_does_not(tmp_path: P
                 calls["n"] += 1
                 if calls["n"] == 2:
                     raise RuntimeError("transient")
+                verdict = "RUNNING" if calls["n"] < 4 else "GONE"
                 return ExecResult(
                     return_code=0,
-                    stdout="RUNNING" if calls["n"] < 4 else "GONE",
+                    stdout=" ".join(
+                        f"{key}={verdict}" for key in OpenCodeV2._OWNED_PROCESSES
+                    ),
                     stderr="",
                 )
             return ExecResult(return_code=0, stdout="", stderr="")

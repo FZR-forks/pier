@@ -2386,6 +2386,10 @@ def main() -> None:
         pending_error = error
         run_error = run_error or f"{type(error).__name__}: {error}"
         cancelled = cancelled or isinstance(error, (KeyboardInterrupt, SystemExit))
+        # The abort handler collects a final snapshot before the `finally`
+        # runs, so it is already part of finalization: a second signal must
+        # not cut it short either.
+        finalizing.set()
         recorder.stage(
             "aborted",
             cancelled=cancelled,

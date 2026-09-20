@@ -174,6 +174,7 @@ class OpenCodeV2(BaseInstalledAgent):
     _SERVER_STDERR_OUTPUT = _RUNNER_LOG_DIR / "opencode-v2-server-stderr.log"
     _EVENTS_OUTPUT = _RUNNER_LOG_DIR / "opencode-v2-events.jsonl"
     _RUNNER_PIDFILE = _RUNNER_LOG_DIR / "opencode-v2-runner.pid"
+    _ROOT_CANDIDATES_OUTPUT = _RUNNER_LOG_DIR / "opencode-v2-root-candidates.json"
     # How long the runner is given to shut itself down after SIGTERM. Its own
     # graceful path is bounded (interrupt, short collection, server stop), so
     # this only has to be comfortably larger than that.
@@ -1329,22 +1330,7 @@ class OpenCodeV2(BaseInstalledAgent):
         except Exception:
             self.logger.debug("OpenCode V2 shutdown signal could not be delivered")
 
-    async def _runner_state(
-        self, environment: BaseEnvironment, env: dict[str, str] | None = None
-    ) -> str:
-        """``GONE``, ``RUNNING``, or ``UNKNOWN`` when the probe itself failed.
-
-        ``UNKNOWN`` deliberately is not ``GONE``: a transient exec failure
-        must not end the shutdown and let collection start under a live
-        runner.
-        """
-        try:
-            return (
-                "RUNNING" if await self._runner_is_running(environment, env) else "GONE"
-            )
-        except Exception:
-            self.logger.debug("Could not probe the OpenCode V2 runner")
-            return "UNKNOWN"
+    _OWNED_PROCESSES = ("runner", "server", "cli")
 
     def _pid_expr(self, key: str) -> str:
         """Shell that sets ``$pid`` to one entry of the ``key=pid`` pidfile.
@@ -1355,102 +1341,143 @@ class OpenCodeV2(BaseInstalledAgent):
         pidfile = shlex.quote(self._RUNNER_PIDFILE.as_posix())
         return f"pid=$(sed -n 's/^{key}=//p' {pidfile} 2>/dev/null | head -n 1)"
 
-    async def _runner_is_running(
+    async def _owned_states(
         self, environment: BaseEnvironment, env: dict[str, str] | None = None
-    ) -> bool:
-        # Signalling a recorded PID avoids matching the probe's own command
+    ) -> dict[str, str]:
+        """State of every process the runner owned: GONE, RUNNING or UNKNOWN.
+
+        Checking the runner alone is not enough. The server and CLI are
+        started in their own sessions, so they outlive a runner that is
+        killed or crashes before its cleanup runs; declaring shutdown
+        complete on the runner's pid alone would let a tool keep writing to
+        the workspace while the task is graded.
+
+        ``UNKNOWN`` means the probe itself failed and deliberately is not
+        ``GONE``: an unreadable probe is not evidence that anything stopped.
+        """
+        # Signalling recorded PIDs avoids matching the probe's own command
         # line, which any `pgrep -f` over the runner path would do.
         #
-        # A runner that has exited stays visible as a zombie until something
+        # A process that has exited stays visible as a zombie until something
         # reaps it, and container PID 1 frequently does not. `kill -0`
         # succeeds for zombies, so checking only that would report a cleanly
-        # finished runner as still running and escalate to SIGKILL for no
-        # reason. Read the process state and treat Z as gone.
-        answer = await self._probe(
-            environment,
-            f"{self._pid_expr('runner')}; "
-            'if [ -z "$pid" ]; then echo GONE; '
+        # finished runner as still running and escalate for no reason. Read
+        # the process state and treat Z as gone.
+        checks = "; ".join(
+            f"{{ {self._pid_expr(key)}; "
+            f'if [ -z "$pid" ]; then echo "{key}=GONE"; '
             'elif [ -r "/proc/$pid/stat" ]; then '
             "  state=$(sed 's/.*) //' \"/proc/$pid/stat\" | cut -d' ' -f1); "
-            '  if [ "$state" = "Z" ]; then echo GONE; else echo RUNNING; fi; '
-            'elif kill -0 "$pid" 2>/dev/null; then echo RUNNING; '
-            "else echo GONE; fi",
-            env,
+            f'  if [ "$state" = "Z" ]; then echo "{key}=GONE"; '
+            f'  else echo "{key}=RUNNING"; fi; '
+            f'elif kill -0 "$pid" 2>/dev/null; then echo "{key}=RUNNING"; '
+            f'else echo "{key}=GONE"; fi; }}'
+            for key in self._OWNED_PROCESSES
         )
-        return answer.endswith("RUNNING")
+        try:
+            answer = await self._probe(environment, checks, env)
+        except Exception:
+            self.logger.debug("Could not probe the OpenCode V2 processes")
+            return {key: "UNKNOWN" for key in self._OWNED_PROCESSES}
+        reported = dict(
+            line.split("=", 1)
+            for line in answer.split()
+            if "=" in line and line.split("=", 1)[1] in {"GONE", "RUNNING"}
+        )
+        if not reported:
+            return {key: "UNKNOWN" for key in self._OWNED_PROCESSES}
+        return {key: reported.get(key, "UNKNOWN") for key in self._OWNED_PROCESSES}
+
+    @staticmethod
+    def _all_stopped(states: dict[str, str]) -> bool:
+        return all(state == "GONE" for state in states.values())
+
+    @staticmethod
+    def _still_alive(states: dict[str, str]) -> list[str]:
+        return sorted(key for key, state in states.items() if state == "RUNNING")
 
     async def _ensure_runner_stopped(
         self, environment: BaseEnvironment, env: dict[str, str] | None = None
     ) -> None:
-        """Stop the runner without killing OpenCode unless it is necessary.
+        """Stop OpenCode without killing it unless that is necessary.
 
         The ladder is deliberate. SIGTERM reaches the runner's own handler,
         which interrupts the OpenCode sessions, lets the CLI exit, collects
         what evidence it can and shuts the server down cleanly. Only a runner
         that ignores that is killed, and only then is a stray OpenCode process
         swept up.
-        """
-        state = await self._runner_state(environment, env)
-        if state == "GONE":
-            return  # the normal path: it already exited on its own
 
-        if state == "RUNNING":
+        Completion means every owned process is gone, not just the runner.
+        """
+        states = await self._owned_states(environment, env)
+        if self._all_stopped(states):
+            return  # the normal path: everything already exited on its own
+
+        if states.get("runner") == "RUNNING":
             self.logger.warning(
                 "OpenCode V2 runner is still running; requesting graceful shutdown"
             )
+            await self._signal(
+                environment,
+                f'{self._pid_expr("runner")}; [ -n "$pid" ] && kill -TERM "$pid"',
+                env,
+            )
+
+            # An unreadable probe is not evidence of a stopped runner, so keep
+            # retrying inside the grace period rather than assuming success.
+            deadline = time.monotonic() + self._RUNNER_STOP_GRACE_SECONDS
+            unknown_streak = 0
+            while time.monotonic() < deadline:
+                await asyncio.sleep(self._RUNNER_STOP_POLL_SECONDS)
+                states = await self._owned_states(environment, env)
+                if self._all_stopped(states):
+                    self.logger.info("OpenCode V2 shut down gracefully")
+                    return
+                if not all(state == "UNKNOWN" for state in states.values()):
+                    unknown_streak = 0
+                    continue
+                # Further polling will not help, but stop short of assuming
+                # anything is gone: still run the forced teardown below, which
+                # is harmless against a dead container and correct if the
+                # container is alive and only the probe is not.
+                unknown_streak += 1
+                if unknown_streak >= self._RUNNER_PROBE_MAX_UNKNOWN:
+                    self.logger.warning(
+                        "OpenCode V2 environment unreadable after %d probes; "
+                        "skipping the remaining grace period",
+                        unknown_streak,
+                    )
+                    break
+        elif states.get("runner") == "GONE":
+            # The runner is gone but did not take everything with it. Its
+            # cleanup cannot run now, so go straight to the forced teardown
+            # rather than signalling a dead pid.
+            self.logger.warning(
+                "OpenCode V2 runner has exited but %s still running; cleaning up",
+                ", ".join(self._still_alive(states)) or "processes are",
+            )
         else:
             self.logger.warning(
-                "Could not confirm whether the OpenCode V2 runner stopped; "
+                "Could not confirm whether OpenCode V2 stopped; "
                 "requesting graceful shutdown anyway"
             )
-        await self._signal(
-            environment,
-            f'{self._pid_expr("runner")}; [ -n "$pid" ] && kill -TERM "$pid"',
-            env,
-        )
+            await self._signal(
+                environment,
+                f'{self._pid_expr("runner")}; [ -n "$pid" ] && kill -TERM "$pid"',
+                env,
+            )
 
-        # An unreadable probe is not evidence of a stopped runner, so keep
-        # retrying inside the grace period rather than assuming success.
-        deadline = time.monotonic() + self._RUNNER_STOP_GRACE_SECONDS
-        unknown_streak = 0
-        while time.monotonic() < deadline:
-            await asyncio.sleep(self._RUNNER_STOP_POLL_SECONDS)
-            state = await self._runner_state(environment, env)
-            if state == "GONE":
-                self.logger.info("OpenCode V2 runner shut down gracefully")
-                return
-            if state != "UNKNOWN":
-                unknown_streak = 0
-                continue
-            # A single unreadable probe is a hiccup and must not be mistaken
-            # for a stopped runner. A sustained run of them means the
-            # environment is gone -- and a runner cannot outlive its own
-            # container, so there is nothing left to signal or to wait for.
-            unknown_streak += 1
-            if unknown_streak >= self._RUNNER_PROBE_MAX_UNKNOWN:
-                # Further polling will not help, but stop short of assuming
-                # the runner is gone: still run the forced teardown below,
-                # which is harmless against a dead container and correct if
-                # the container is actually alive and only the probe is not.
-                self.logger.warning(
-                    "OpenCode V2 environment unreadable after %d probes; "
-                    "skipping the remaining grace period",
-                    unknown_streak,
-                )
-                break
-
-        self.logger.warning(
-            "OpenCode V2 runner did not stop within %.0fs; forcing termination",
-            self._RUNNER_STOP_GRACE_SECONDS,
-        )
+        self.logger.warning("Forcing termination of the OpenCode V2 processes")
         await self._force_stop(environment, env)
 
-        if await self._runner_state(environment, env) != "GONE":
+        states = await self._owned_states(environment, env)
+        if not self._all_stopped(states):
             # Say so loudly: whatever is collected next was taken while
             # OpenCode could still be writing.
             self.logger.error(
-                "OpenCode V2 could not be confirmed stopped; artifacts may be "
-                "collected while it is still running"
+                "OpenCode V2 could not be confirmed stopped (%s); artifacts may "
+                "be collected while it is still running",
+                ", ".join(f"{k}={v}" for k, v in sorted(states.items())),
             )
 
     async def _force_stop(
@@ -1538,6 +1565,10 @@ class OpenCodeV2(BaseInstalledAgent):
             (
                 self._EVENTS_OUTPUT,
                 self.logs_dir / "opencode-v2" / "opencode-v2-events.jsonl",
+            ),
+            (
+                self._ROOT_CANDIDATES_OUTPUT,
+                self.logs_dir / "opencode-v2" / "opencode-v2-root-candidates.json",
             ),
         ):
             try:
