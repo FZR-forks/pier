@@ -2003,6 +2003,23 @@ def main() -> None:
     except (OSError, subprocess.SubprocessError) as error:
         binary_version = f"unavailable: {type(error).__name__}: {error}"
 
+    collection_complete = _collection_complete(
+        settled=settled,
+        errors=collection_errors,
+        root_id=root_id,
+        server_exit_code=server_exit_code,
+    )
+    # Reach the terminal stage *before* snapshotting, so the manifest's
+    # embedded record reports how the run actually ended rather than freezing
+    # on the teardown stage that happened to be current.
+    recorder.stage(
+        "finalizing",
+        root_id=root_id,
+        cli_returncode=cli_returncode,
+        session_count=len(inspections),
+        collection_complete=collection_complete,
+    )
+
     result = {
         "instruction_file": args.instruction_file,
         "binary": binary,
@@ -2016,12 +2033,7 @@ def main() -> None:
         "run_error": run_error,
         "cancelled": cancelled,
         "root_id": root_id,
-        "collection_complete": _collection_complete(
-            settled=settled,
-            errors=collection_errors,
-            root_id=root_id,
-            server_exit_code=server_exit_code,
-        ),
+        "collection_complete": collection_complete,
         "collection_errors": collection_errors,
         "discovered_session_ids": [
             str(item.get("session", {}).get("id")) for item in inspections
@@ -2042,13 +2054,8 @@ def main() -> None:
     (logs_dir / "runner-result.json").write_text(
         json.dumps(result, indent=2, default=str)
     )
-    recorder.stage(
-        "finished",
-        root_id=root_id,
-        cli_returncode=cli_returncode,
-        session_count=len(inspections),
-        collection_complete=result["collection_complete"],
-    )
+    # Only now is the manifest genuinely on disk.
+    recorder.stage("finished", runner_result_written=True)
     recorder.close()
 
     _raise_runner_failure(pending_error, run_error)

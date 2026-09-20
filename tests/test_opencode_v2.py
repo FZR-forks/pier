@@ -3945,3 +3945,26 @@ def test_degraded_download_fetches_every_live_artifact(tmp_path: Path):
         runner_module.SERVER_STDERR_FILENAME,
     ):
         assert name in fetched, f"{name} would be lost when download_dir is absent"
+
+
+def test_manifest_records_how_the_run_ended_not_the_teardown_stage(tmp_path: Path):
+    """The manifest's embedded snapshot must reflect the run's outcome.
+
+    ``runner-result.json`` is snapshotted from the live recorder, so the
+    terminal stage has to be reached before the snapshot is taken. Otherwise
+    even a clean run embeds evidence claiming it stopped during shutdown.
+    """
+    source = Path(runner_module.__file__).read_text()
+    finalization = source[
+        source.index("    collection_complete = _collection_complete(") :
+    ]
+
+    snapshot_at = finalization.index('"live_status": recorder.snapshot()')
+    finalizing_at = finalization.index('recorder.stage(\n        "finalizing"')
+    written_at = finalization.index('(logs_dir / "runner-result.json").write_text')
+    finished_at = finalization.index('recorder.stage("finished"')
+
+    # Terminal outcome is recorded before the snapshot is taken ...
+    assert finalizing_at < snapshot_at
+    # ... and "finished" is only claimed once the manifest is really on disk.
+    assert written_at < finished_at
