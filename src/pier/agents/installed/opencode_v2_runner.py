@@ -59,6 +59,13 @@ CLI_STREAM_FILENAME = "opencode-v2-cli-stream.jsonl"
 CLI_STDERR_FILENAME = "opencode-v2-cli-stderr.log"
 SERVER_STDERR_FILENAME = "opencode-v2-server-stderr.log"
 PARTIAL_SESSIONS_FILENAME = "opencode-v2-sessions.partial.jsonl"
+EVENTS_FILENAME = "opencode-v2-events.jsonl"
+
+# Cap on how much of a tool's input we keep in the live status. The full
+# argument list is already in the durable event log.
+TOOL_INPUT_PREVIEW_BYTES = 2048
+EVENT_STREAM_RECONNECT_DELAY = 1.0
+EVENT_STREAM_MAX_RECONNECTS = 20
 
 LIVE_LOG_MAX_BYTES = 64 * 1024 * 1024
 # What `opencode run --format json` can and cannot tell us. This is a
@@ -188,6 +195,8 @@ class LiveRecorder:
         self.cli_stderr = LiveLog(logs_dir / CLI_STDERR_FILENAME)
         self.server_stderr = LiveLog(logs_dir / SERVER_STDERR_FILENAME)
         self.incidents = LiveLog(logs_dir / INCIDENTS_FILENAME)
+        self.events = LiveLog(logs_dir / EVENTS_FILENAME)
+        self._running_tools: dict[tuple[str, str], dict[str, Any]] = {}
         self._status: dict[str, Any] = {
             "stage": "starting",
             "stage_history": [],
@@ -213,9 +222,15 @@ class LiveRecorder:
             "last_incident": None,
             "last_reported_tool": None,
             "cli_stream_limitations": CLI_STREAM_LIMITATIONS,
+            "agent_events_seen": 0,
+            "last_agent_activity_at": None,
+            "running_tools": [],
+            "last_tool_started": None,
+            "event_stream_connected": False,
         }
         self._last_cli_activity: float | None = None
         self._last_server_activity: float | None = None
+        self._last_agent_activity: float | None = None
         self.stage("starting")
         # A hung agent stops calling _activity, so without an independent
         # heartbeat the status file would freeze with its last-known
@@ -334,6 +349,105 @@ class LiveRecorder:
                     "at": _iso(time.time()),
                 }
 
+    def agent_event(self, payload: str) -> None:
+        """Record one raw server event and update in-flight tool state.
+
+        This is the only place that can see a tool *while it is running*, so
+        it is what makes a hang attributable to a specific command.
+        """
+        self.events.write(payload + "\n")
+        try:
+            event = json.loads(payload)
+        except (json.JSONDecodeError, TypeError):
+            event = None
+        now = time.monotonic()
+        with self._lock:
+            self._status["agent_events_seen"] = (
+                int(self._status.get("agent_events_seen") or 0) + 1
+            )
+            self._last_agent_activity = now
+            self._status["last_agent_activity_at"] = _iso(time.time())
+            self._status["event_stream_connected"] = True
+            if isinstance(event, dict):
+                self._track_tool(event)
+            write_due = now - self._last_status_write >= STATUS_MIN_INTERVAL_SECONDS
+            if write_due:
+                self._write_status()
+        if isinstance(event, dict):
+            self._note_event_error(event)
+
+    def _track_tool(self, event: dict[str, Any]) -> None:
+        """Maintain the set of tools that have started but not finished.
+
+        Caller holds the lock.
+        """
+        event_type = str(event.get("type") or "")
+        if not event_type.startswith("session.tool."):
+            return
+        data = event.get("data")
+        if not isinstance(data, dict):
+            return
+        key = (str(data.get("assistantMessageID") or ""), str(data.get("id") or ""))
+        if event_type == "session.tool.input.started":
+            entry = {
+                "tool": data.get("name"),
+                "sessionID": data.get("sessionID"),
+                "started_at": _iso(time.time()),
+                "started_monotonic": time.monotonic(),
+            }
+            self._running_tools[key] = entry
+            self._status["last_tool_started"] = {
+                k: v for k, v in entry.items() if k != "started_monotonic"
+            }
+        elif event_type == "session.tool.called":
+            entry = self._running_tools.setdefault(
+                key,
+                {
+                    "tool": None,
+                    "sessionID": data.get("sessionID"),
+                    "started_at": _iso(time.time()),
+                    "started_monotonic": time.monotonic(),
+                },
+            )
+            # The arguments are what identify a stuck command.
+            entry["input"] = _truncate(data.get("input"), TOOL_INPUT_PREVIEW_BYTES)
+            self._status["last_tool_started"] = {
+                k: v for k, v in entry.items() if k != "started_monotonic"
+            }
+        elif event_type == "session.tool.progress":
+            entry = self._running_tools.get(key)
+            if entry is not None:
+                entry["last_progress_at"] = _iso(time.time())
+        elif event_type in {"session.tool.success", "session.tool.failed"}:
+            self._running_tools.pop(key, None)
+        self._publish_running_tools()
+
+    def _publish_running_tools(self) -> None:
+        """Caller holds the lock."""
+        now = time.monotonic()
+        self._status["running_tools"] = [
+            {
+                **{
+                    key: value
+                    for key, value in entry.items()
+                    if key != "started_monotonic"
+                },
+                "running_for_seconds": round(now - entry["started_monotonic"], 3),
+            }
+            for entry in self._running_tools.values()
+        ]
+
+    def _note_event_error(self, event: dict[str, Any]) -> None:
+        event_type = str(event.get("type") or "")
+        if "error" not in event_type.lower():
+            return
+        data = event.get("data")
+        self.note(
+            "server-event-error",
+            _truncate((data or {}).get("error") if isinstance(data, dict) else event),
+            event_type=event_type,
+        )
+
     def _activity(self, counter: str, *, source: str) -> None:
         """Count a line and refresh status, throttled so a chatty CLI cannot
         turn every line of output into a status rewrite.
@@ -386,6 +500,11 @@ class LiveRecorder:
         """Replace the status file atomically. Caller holds the lock."""
         now = time.monotonic()
         self._last_status_write = now
+        # Refresh derived values *before* copying the status. Otherwise the
+        # written running-tool durations lag a full heartbeat behind, and a
+        # tool stuck for an hour reports a much smaller age.
+        if self._running_tools:
+            self._publish_running_tools()
         payload = dict(self._status)
         payload["updated_at"] = _iso(time.time())
         payload["elapsed_seconds"] = round(now - self._start, 3)
@@ -399,7 +518,16 @@ class LiveRecorder:
             if self._last_server_activity is not None
             else None
         )
+        # The honest agent-activity clock: unlike the CLI stream this sees
+        # running tools and child sessions, so silence here really does mean
+        # the agent produced nothing.
+        payload["seconds_since_agent_activity"] = (
+            round(now - self._last_agent_activity, 3)
+            if self._last_agent_activity is not None
+            else None
+        )
         payload["live_logs"] = {
+            "events": self.events.state(),
             "cli_stream": self.cli_stream.state(),
             "cli_stderr": self.cli_stderr.state(),
             "server_stderr": self.server_stderr.state(),
@@ -425,6 +553,7 @@ class LiveRecorder:
         with self._lock:
             self._write_status()
         for log in (
+            self.events,
             self.cli_stream,
             self.cli_stderr,
             self.server_stderr,
@@ -452,6 +581,116 @@ class RecordedErrors(list):
     def extend(self, items: Iterable[Any]) -> None:
         for item in items:
             self.append(item)
+
+
+class OpenCodeEventStream:
+    """Read-only subscription to the OpenCode server's SSE event feed.
+
+    ``opencode run --format json`` is a presentation stream: it reports a
+    tool only once the tool finishes, and drops every event belonging to a
+    session other than the root (verified in v2.0.8
+    ``packages/cli/src/run/noninteractive.ts``). A tool that hangs therefore
+    never appears there, which is the single most useful fact when
+    diagnosing a timeout.
+
+    Pi, Codex and Claude Code all record tool starts durably
+    (``tool_execution_start``, ``item.started``, ``tool_use``), so this
+    subscription restores the same granularity for OpenCode rather than
+    adding a capability the other adapters lack.
+
+    Benchmark neutrality: this is a single read-only GET. OpenCode publishes
+    to subscribers with a non-blocking offer and simply drops any subscriber
+    that falls behind (``EventFeed.SubscriberOverflow``), so a slow reader
+    here can only break its own stream -- it can never backpressure the bus
+    or slow the agent. The CLI is already a subscriber of the same feed and
+    the encoded payload is shared, so the marginal server cost is one
+    non-blocking queue offer per event.
+    """
+
+    def __init__(self, url: str, password: str, recorder: "LiveRecorder"):
+        self.url = url.rstrip("/") + "/api/event"
+        self.password = password
+        self.recorder = recorder
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._response: Any = None
+        self._lock = threading.Lock()
+
+    def start(self) -> None:
+        self._thread = threading.Thread(
+            target=self._run, name="opencode-v2-events", daemon=True
+        )
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        with self._lock:
+            response, self._response = self._response, None
+        if response is not None:
+            try:
+                response.close()
+            except Exception:
+                pass
+        if self._thread is not None:
+            self._thread.join(timeout=2)
+
+    def _run(self) -> None:
+        """Consume the feed, reconnecting a bounded number of times."""
+        attempts = 0
+        while not self._stop.is_set() and attempts <= EVENT_STREAM_MAX_RECONNECTS:
+            try:
+                self._consume()
+            except Exception as error:
+                if self._stop.is_set():
+                    return
+                # The feed is volatile by contract: a dropped subscriber and
+                # any events missed while disconnected are expected, so this
+                # is recorded rather than treated as a run failure.
+                self.recorder.note(
+                    "event-stream-disconnected",
+                    f"{type(error).__name__}: {error}",
+                    reconnect_attempt=attempts + 1,
+                )
+            if self._stop.is_set():
+                return
+            attempts += 1
+            self._stop.wait(EVENT_STREAM_RECONNECT_DELAY)
+        if not self._stop.is_set():
+            self.recorder.note(
+                "event-stream-abandoned",
+                f"gave up after {EVENT_STREAM_MAX_RECONNECTS} reconnect attempts",
+            )
+
+    def _consume(self) -> None:
+        request = urllib.request.Request(
+            self.url,
+            headers={
+                "Authorization": auth_header(self.password),
+                "Accept": "text/event-stream",
+            },
+        )
+        response = urllib.request.urlopen(request)
+        with self._lock:
+            self._response = response
+        try:
+            for raw in response:
+                if self._stop.is_set():
+                    return
+                line = raw.decode("utf-8", "replace").rstrip("\n")
+                if not line.startswith("data:"):
+                    continue  # heartbeat comments and frame separators
+                payload = line[5:].strip()
+                if not payload:
+                    continue
+                self.recorder.agent_event(payload)
+        finally:
+            with self._lock:
+                if self._response is response:
+                    self._response = None
+            try:
+                response.close()
+            except Exception:
+                pass
 
 
 def auth_header(password: str) -> str:
@@ -1726,6 +1965,7 @@ def main() -> None:
     server_exit_code: int | None = None
     early_root_candidates: set[str] = set()
     early_root_events: deque[dict[str, str]] = deque(maxlen=CLI_CAPTURE_MAX_LINES)
+    event_stream: OpenCodeEventStream | None = None
 
     def handle_termination(signum, _frame):
         raise KeyboardInterrupt(f"received signal {signum}")
@@ -1737,6 +1977,9 @@ def main() -> None:
         server.start()
         assert server.url is not None
         recorder.stage("server-started", server_started=True, server_url_known=True)
+        # Subscribe before the CLI starts so no agent activity is missed.
+        event_stream = OpenCodeEventStream(server.url, password, recorder)
+        event_stream.start()
         model_spec = args.model
         if model_spec and args.variant and "#" not in model_spec:
             model_spec = f"{model_spec}#{args.variant}"
@@ -1998,6 +2241,13 @@ def main() -> None:
             )
     finally:
         recorder.stage("shutting-down")
+        if event_stream is not None:
+            try:
+                event_stream.stop()
+            except Exception as error:
+                collection_errors.append(
+                    f"event stream shutdown: {type(error).__name__}: {error}"
+                )
         process = server.process
         if process is not None:
             server_exit_code = process.poll()
@@ -2088,6 +2338,7 @@ def main() -> None:
         "raw_pages_dropped": server.raw_pages_dropped,
         "raw_pages_deduplicated": server.raw_pages_deduplicated,
         "raw_pages_oversize": server.raw_pages_oversize,
+        "agent_events_seen": recorder.snapshot().get("agent_events_seen"),
         "resolved_model_sha256": (preflight or {}).get("resolved_model_sha256"),
         "private_state_artifacts": private_state_artifacts,
         "session_count": len(inspections),

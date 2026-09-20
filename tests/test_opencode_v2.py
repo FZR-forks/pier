@@ -4108,3 +4108,355 @@ def test_transient_collection_failure_does_not_invalidate_a_clean_settle(
     )
     # ... but does not mark the completed collection incomplete.
     assert list(errors) == []
+
+
+# ---------------------------------------------------------------------------
+# Server event capture
+#
+# `opencode run --format json` reports a tool only once it finishes and drops
+# non-root sessions, so the CLI stream cannot show a hang. Pi, Codex and
+# Claude Code all record tool starts; these tests cover the subscription that
+# restores the same granularity.
+# ---------------------------------------------------------------------------
+
+
+def _tool_event(kind: str, *, session: str, message: str, ident: str, **data: Any):
+    return json.dumps(
+        {
+            "type": f"session.tool.{kind}",
+            "data": {
+                "sessionID": session,
+                "assistantMessageID": message,
+                "id": ident,
+                **data,
+            },
+        }
+    )
+
+
+def test_running_tools_are_visible_while_they_run(tmp_path: Path):
+    recorder = runner_module.LiveRecorder(tmp_path, echo=False, heartbeat_seconds=0)
+    recorder.agent_event(
+        _tool_event(
+            "input.started", session="ses_root", message="m1", ident="t1", name="bash"
+        )
+    )
+    recorder.agent_event(
+        _tool_event(
+            "called",
+            session="ses_root",
+            message="m1",
+            ident="t1",
+            input={"command": "go test ./..."},
+        )
+    )
+    status = recorder.snapshot()
+    running = status["running_tools"]
+    assert [item["tool"] for item in running] == ["bash"]
+    # The arguments are what identify which command is stuck.
+    assert "go test ./..." in running[0]["input"]
+    assert status["last_tool_started"]["tool"] == "bash"
+
+    # ... and it disappears once it finishes.
+    recorder.agent_event(
+        _tool_event("success", session="ses_root", message="m1", ident="t1")
+    )
+    assert recorder.snapshot()["running_tools"] == []
+    recorder.close()
+
+
+def test_child_session_activity_is_captured(tmp_path: Path):
+    """The CLI drops non-root sessions; the event feed must not."""
+    recorder = runner_module.LiveRecorder(tmp_path, echo=False, heartbeat_seconds=0)
+    recorder.agent_event(
+        _tool_event(
+            "input.started", session="ses_child", message="mc", ident="c1", name="grep"
+        )
+    )
+    running = recorder.snapshot()["running_tools"]
+    assert running[0]["sessionID"] == "ses_child"
+    recorder.close()
+
+
+def test_running_tool_age_is_not_a_heartbeat_stale(tmp_path: Path):
+    """A tool stuck for hours must not report the age it had one write ago."""
+    recorder = runner_module.LiveRecorder(tmp_path, echo=False, heartbeat_seconds=0)
+    recorder.agent_event(
+        _tool_event(
+            "input.started", session="ses_root", message="m1", ident="t1", name="bash"
+        )
+    )
+    time.sleep(0.3)
+    recorder.close()  # forces a final status write
+
+    status = json.loads((tmp_path / runner_module.STATUS_FILENAME).read_text())
+    assert status["running_tools"][0]["running_for_seconds"] >= 0.3
+
+
+def test_agent_activity_clock_is_independent_of_the_cli(tmp_path: Path):
+    recorder = runner_module.LiveRecorder(tmp_path, echo=False, heartbeat_seconds=0)
+    recorder.cli_stdout_line('{"type": "tool_use"}')
+    recorder.agent_event('{"type": "session.idle", "data": {}}')
+    time.sleep(0.2)
+    recorder.cli_stdout_line('{"type": "tool_use"}')
+    recorder.close()
+    status = json.loads((tmp_path / runner_module.STATUS_FILENAME).read_text())
+    # The CLI just spoke, but the agent feed has been quiet.
+    assert status["seconds_since_cli_activity"] < 0.2
+    assert status["seconds_since_agent_activity"] >= 0.2
+
+
+def test_event_stream_errors_become_incidents(tmp_path: Path):
+    recorder = runner_module.LiveRecorder(tmp_path, echo=False, heartbeat_seconds=0)
+    recorder.agent_event(
+        json.dumps(
+            {"type": "session.error", "data": {"error": "provider refused: 529"}}
+        )
+    )
+    recorder.close()
+    incidents = [
+        json.loads(line)
+        for line in (tmp_path / runner_module.INCIDENTS_FILENAME)
+        .read_text()
+        .splitlines()
+    ]
+    assert any(
+        item["kind"] == "server-event-error" and "529" in item["message"]
+        for item in incidents
+    )
+
+
+def test_raw_events_are_durable(tmp_path: Path):
+    recorder = runner_module.LiveRecorder(tmp_path, echo=False, heartbeat_seconds=0)
+    recorder.agent_event('{"type": "session.tool.progress", "data": {}}')
+    recorder.close()
+    written = (tmp_path / runner_module.EVENTS_FILENAME).read_text().splitlines()
+    assert json.loads(written[0])["type"] == "session.tool.progress"
+
+
+def test_hanging_tool_is_named_in_the_trajectory(tmp_path: Path):
+    """End to end: the stub must name the command that is actually stuck."""
+    runner_dir = tmp_path / "opencode-v2"
+    runner_dir.mkdir()
+    (runner_dir / "opencode-v2-status.json").write_text(
+        json.dumps(
+            {
+                "stage": "cli-started",
+                "root_id": "ses_root",
+                "cli_stdout_lines": 1,
+                "seconds_since_cli_activity": 1800.0,
+                "seconds_since_agent_activity": 1799.0,
+                "last_reported_tool": {"tool": "read", "status": "completed"},
+                "running_tools": [
+                    {
+                        "tool": "bash",
+                        "sessionID": "ses_root",
+                        "running_for_seconds": 1799.0,
+                        "input": '{"command": "go test ./..."}',
+                    },
+                    {
+                        "tool": "grep",
+                        "sessionID": "ses_kid",
+                        "running_for_seconds": 1805.0,
+                    },
+                ],
+            }
+        )
+    )
+
+    make_agent(tmp_path).populate_context_post_run(AgentContext())
+    message = json.loads((tmp_path / "trajectory.json").read_text())["steps"][0][
+        "message"
+    ]
+
+    # The stuck command, with its arguments and how long it had been stuck.
+    assert "'bash' for 1799.0s" in message
+    assert "go test ./..." in message
+    # The child session's work, which the CLI stream never shows.
+    assert "'grep'" in message
+    assert "in child session ses_kid" in message
+    # The completed tool is still reported, but no longer as "what it was doing".
+    assert "last tool the CLI reported was 'read'" in message
+
+
+_FAKE_HANGING_OPENCODE = '''#!/usr/bin/env python3
+"""OpenCode stand-in that hangs *inside* a tool, and serves a real SSE feed."""
+import json, sys, threading, time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import urlparse
+
+SID = "ses_hang00000000000000000000"
+CHILD = "ses_child0000000000000000000"
+subs = []
+
+
+def sse(event):
+    for q in list(subs):
+        try:
+            q.write(("data: " + json.dumps(event) + "\\n\\n").encode())
+            q.flush()
+        except Exception:
+            subs.remove(q)
+
+
+class H(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
+    def log_message(self, *a):
+        pass
+
+    def _json(self, payload):
+        body = json.dumps(payload).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self):
+        path = urlparse(self.path).path
+        if path == "/api/event":
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.end_headers()
+            subs.append(self.wfile)
+            while True:
+                time.sleep(0.2)
+                try:
+                    self.wfile.write(b": heartbeat\\n\\n")
+                    self.wfile.flush()
+                except Exception:
+                    return
+        if path == "/api/model":
+            return self._json({"data": [{"providerID": "fake", "id": "model",
+                                         "variants": [], "body": {}, "limit": {}}]})
+        if path in ("/api/agent", "/api/session"):
+            return self._json({"data": [], "cursor": {}})
+        if path == "/api/session/active":
+            return self._json({"data": {}})
+        return self._json({"data": {}})
+
+    def do_POST(self):
+        self._json({"data": True})
+
+
+def serve():
+    httpd = ThreadingHTTPServer(("127.0.0.1", 0), H)
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    print(json.dumps({"url": "http://127.0.0.1:%d" % httpd.server_address[1]}), flush=True)
+    print("hang-server: ready", file=sys.stderr, flush=True)
+
+    def script():
+        time.sleep(1.0)
+        sse({"type": "session.tool.input.started", "data": {
+            "sessionID": SID, "assistantMessageID": "m1", "id": "t1", "name": "read"}})
+        sse({"type": "session.tool.success", "data": {
+            "sessionID": SID, "assistantMessageID": "m1", "id": "t1"}})
+        # A child doing work: filtered out of the root CLI stream entirely.
+        sse({"type": "session.tool.input.started", "data": {
+            "sessionID": CHILD, "assistantMessageID": "mc", "id": "c1", "name": "grep"}})
+        # The tool that never returns.
+        sse({"type": "session.tool.input.started", "data": {
+            "sessionID": SID, "assistantMessageID": "m2", "id": "t2", "name": "bash"}})
+        sse({"type": "session.tool.called", "data": {
+            "sessionID": SID, "assistantMessageID": "m2", "id": "t2",
+            "input": {"command": "go test ./... -run TestEverything"}}})
+
+    threading.Thread(target=script, daemon=True).start()
+    sys.stdin.read()
+
+
+def run():
+    time.sleep(1.2)
+    # The CLI reports only the completed tool, then falls silent forever.
+    print(json.dumps({"type": "tool_use", "timestamp": int(time.time() * 1000),
+                      "sessionID": SID,
+                      "part": {"type": "tool", "tool": "read", "sessionID": SID,
+                               "state": {"status": "completed"}}}), flush=True)
+    while True:
+        time.sleep(3600)
+
+
+if "serve" in sys.argv:
+    serve()
+elif "run" in sys.argv:
+    run()
+elif "--version" in sys.argv:
+    print("fake-hang 0.0.1")
+'''
+
+
+def test_killed_runner_identifies_the_tool_that_was_actually_stuck(tmp_path: Path):
+    """The reviewer's scenario, end to end against a real SSE feed.
+
+    A command starts and never returns while a child session is also working.
+    The CLI stream shows only the earlier completed tool, so the event
+    subscription is the only thing that can attribute the hang.
+    """
+    binary = tmp_path / "fake-hang"
+    binary.write_text(_FAKE_HANGING_OPENCODE)
+    binary.chmod(0o755)
+    logs_dir = tmp_path / "logs"
+    logs_dir.mkdir()
+    work_dir = tmp_path / "work"
+    work_dir.mkdir()
+    instruction = tmp_path / "instruction.txt"
+    instruction.write_text("do the task")
+
+    process = subprocess.Popen(
+        [
+            "python3",
+            str(Path(runner_module.__file__)),
+            "--instruction-file",
+            str(instruction),
+            "--logs-dir",
+            str(logs_dir),
+            "--work-dir",
+            str(work_dir),
+            "--binary",
+            str(binary),
+            "--model",
+            "fake/model",
+        ],
+        env={**os.environ, "HOME": str(tmp_path)},
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    status_path = logs_dir / runner_module.STATUS_FILENAME
+    try:
+        deadline = time.monotonic() + 60
+        while time.monotonic() < deadline:
+            try:
+                running = json.loads(status_path.read_text()).get("running_tools") or []
+            except (OSError, json.JSONDecodeError):
+                running = []
+            if any(item.get("tool") == "bash" for item in running):
+                break
+            time.sleep(0.1)
+        time.sleep(1.5)  # let the hang age
+    finally:
+        os.killpg(process.pid, signal.SIGKILL)
+        process.wait(timeout=30)
+        try:
+            subprocess.run(["pkill", "-9", "-f", str(binary)], check=False)
+        except OSError:
+            pass
+
+    status = json.loads(status_path.read_text())
+
+    # The CLI stream on its own points at the wrong tool.
+    assert status["last_reported_tool"]["tool"] == "read"
+
+    # The event feed names the command that is actually stuck ...
+    running = {item["tool"]: item for item in status["running_tools"]}
+    assert "bash" in running, f"stuck tool not captured: {status['running_tools']}"
+    assert "go test ./... -run TestEverything" in running["bash"]["input"]
+    # ... and the child session's work, which the CLI filters out.
+    assert "grep" in running
+    assert running["grep"]["sessionID"] == "ses_child0000000000000000000"
+
+    # Raw events are durable even though the runner never finalized.
+    assert not (logs_dir / "runner-result.json").exists()
+    events = (logs_dir / runner_module.EVENTS_FILENAME).read_text().splitlines()
+    assert any("session.tool.called" in line for line in events)

@@ -133,6 +133,21 @@ def _env_template_values(config: dict[str, Any]) -> dict[str, str]:
     return values
 
 
+def _session_suffix(session_id: Any, validated_root: Any) -> str:
+    """Describe which session a tool belongs to, without guessing.
+
+    Only call a session a *child* when the root has actually been confirmed;
+    otherwise the root itself would be mislabelled as a child.
+    """
+    if not session_id:
+        return ""
+    if not validated_root:
+        return f" in session {session_id}"
+    if str(session_id) == str(validated_root):
+        return ""
+    return f" in child session {session_id}"
+
+
 class OpenCodeV2(BaseInstalledAgent):
     """OpenCode V2 agent, driven through its own server process."""
 
@@ -154,6 +169,7 @@ class OpenCodeV2(BaseInstalledAgent):
     _PARTIAL_SESSIONS_OUTPUT = _RUNNER_LOG_DIR / "opencode-v2-sessions.partial.jsonl"
     _CLI_STDERR_OUTPUT = _RUNNER_LOG_DIR / "opencode-v2-cli-stderr.log"
     _SERVER_STDERR_OUTPUT = _RUNNER_LOG_DIR / "opencode-v2-server-stderr.log"
+    _EVENTS_OUTPUT = _RUNNER_LOG_DIR / "opencode-v2-events.jsonl"
     _INSTRUCTION_PATH = _RUNNER_LOG_DIR / "instruction.txt"
 
     # These values define the adapter's private process/config boundary.  A
@@ -1307,6 +1323,10 @@ class OpenCodeV2(BaseInstalledAgent):
                 self._SERVER_STDERR_OUTPUT,
                 self.logs_dir / "opencode-v2" / "opencode-v2-server-stderr.log",
             ),
+            (
+                self._EVENTS_OUTPUT,
+                self.logs_dir / "opencode-v2" / "opencode-v2-events.jsonl",
+            ),
         ):
             try:
                 await environment.download_file(remote.as_posix(), local)
@@ -2412,6 +2432,12 @@ class OpenCodeV2(BaseInstalledAgent):
                 "last_cli_event",
                 "last_reported_tool",
                 "cli_stream_limitations",
+                "agent_events_seen",
+                "last_agent_activity_at",
+                "seconds_since_agent_activity",
+                "running_tools",
+                "last_tool_started",
+                "event_stream_connected",
                 "elapsed_seconds",
                 "updated_at",
             ):
@@ -2455,6 +2481,23 @@ class OpenCodeV2(BaseInstalledAgent):
                 f"{', '.join(str(item) for item in candidates[:5])} "
                 "as unvalidated candidate(s)."
             )
+        running = [
+            item
+            for item in (evidence.get("running_tools") or [])
+            if isinstance(item, dict)
+        ]
+        if running:
+            # The single most useful fact for a hang: what had started but
+            # never finished, and for how long.
+            described = "; ".join(
+                f"{item.get('tool')!r} for {item.get('running_for_seconds')}s"
+                + (f" ({item.get('input')})" if item.get("input") else "")
+                + _session_suffix(
+                    item.get("sessionID"), evidence.get("validated_root_id")
+                )
+                for item in running[:5]
+            )
+            sentence += f" Unfinished tool(s) at that point: {described}."
         tool = evidence.get("last_reported_tool")
         if isinstance(tool, dict) and tool.get("tool"):
             # "reported", not "running": the CLI only emits a tool once it
@@ -2473,11 +2516,20 @@ class OpenCodeV2(BaseInstalledAgent):
                 sentence += f", last seen {idle}s before the record ends"
             sentence += "."
             if isinstance(idle, (int, float)) and idle >= 60:
-                sentence += (
-                    " CLI silence does not by itself prove the agent stopped:"
-                    " a long-running tool and any child-session work are both"
-                    " invisible in this stream."
-                )
+                agent_idle = evidence.get("seconds_since_agent_activity")
+                if isinstance(agent_idle, (int, float)):
+                    # The event feed sees running tools and child sessions, so
+                    # its silence is meaningful where the CLI's is not.
+                    sentence += (
+                        f" The server event feed last saw activity {agent_idle}s"
+                        " before the record ends."
+                    )
+                else:
+                    sentence += (
+                        " CLI silence does not by itself prove the agent"
+                        " stopped: a long-running tool and any child-session"
+                        " work are both invisible in this stream."
+                    )
         incidents = evidence.get("last_incidents") or []
         if incidents:
             last = incidents[-1]
