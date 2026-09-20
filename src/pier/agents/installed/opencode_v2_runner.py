@@ -61,6 +61,18 @@ SERVER_STDERR_FILENAME = "opencode-v2-server-stderr.log"
 PARTIAL_SESSIONS_FILENAME = "opencode-v2-sessions.partial.jsonl"
 
 LIVE_LOG_MAX_BYTES = 64 * 1024 * 1024
+# What `opencode run --format json` can and cannot tell us. This is a
+# presentation stream, not the raw event bus: the CLI emits a `tool_use`
+# record only once a tool succeeds or fails, and drops every event belonging
+# to a session other than the root. Verified against OpenCode v2.0.8
+# (packages/cli/src/run/noninteractive.ts): tool input/called/progress events
+# mutate CLI-local state and emit nothing, and non-root sessions are filtered.
+CLI_STREAM_LIMITATIONS = (
+    "opencode run --format json reports a tool only after it completes or "
+    "fails, and omits events from non-root (child) sessions. A tool that is "
+    "still running is therefore invisible here, so CLI silence does not "
+    "prove the agent stopped working."
+)
 STATUS_MIN_INTERVAL_SECONDS = 1.0
 STATUS_HEARTBEAT_SECONDS = 5.0
 
@@ -199,6 +211,8 @@ class LiveRecorder:
             "sessions_snapshot_at": None,
             "incident_count": 0,
             "last_incident": None,
+            "last_reported_tool": None,
+            "cli_stream_limitations": CLI_STREAM_LIMITATIONS,
         }
         self._last_cli_activity: float | None = None
         self._last_server_activity: float | None = None
@@ -311,7 +325,10 @@ class LiveRecorder:
                 key: value for key, value in described.items() if value is not None
             }
             if part.get("tool"):
-                self._status["last_tool"] = {
+                # Named "reported" deliberately: this is the last tool the CLI
+                # told us about, which during a hang is the one *before* the
+                # tool that is actually stuck.
+                self._status["last_reported_tool"] = {
                     "tool": part.get("tool"),
                     "status": state.get("status"),
                     "at": _iso(time.time()),
@@ -1465,6 +1482,7 @@ def _collect_tree(
 ) -> tuple[list[dict], bool]:
     """Wait and collect two identical terminal snapshots of the whole tree."""
     previous: tuple | None = None
+    last_persisted: tuple | None = None
     stable = False
     inspections: list[dict] = []
     last_blockers: list[str] = []
@@ -1486,10 +1504,37 @@ def _collect_tree(
                     if not server.wait_session(session_id):
                         blockers.append(f"session.wait failed for {session_id}")
                 active = server.running_session_ids()
-                inspections = [
-                    server.inspect_session(session, active_ids=active)
-                    for session in sessions
-                ]
+                # Inspect one session at a time and keep what succeeds. A
+                # comprehension would discard an already-fetched root the
+                # moment any child request failed, which is the evidence we
+                # most want when collection is interrupted.
+                inspections = []
+                for session in sessions:
+                    try:
+                        inspections.append(
+                            server.inspect_session(session, active_ids=active)
+                        )
+                    except Exception as error:
+                        session_id = str(session.get("id") or "unknown")
+                        message = (
+                            f"inspect {session_id}: {type(error).__name__}: {error}"
+                        )
+                        # A blocker keeps this round non-terminal, but is not
+                        # promoted into collection_errors: a transient failure
+                        # must not permanently invalidate a collection that
+                        # later settles cleanly.
+                        blockers.append(message)
+                        if recorder is not None:
+                            recorder.note(
+                                "collection-exception", message, sessionID=session_id
+                            )
+                # Persist before the terminal checks, so successfully fetched
+                # sessions survive even when a later check raises.
+                if recorder is not None and inspections:
+                    persisted = _snapshot_signature(inspections)
+                    if persisted != last_persisted:
+                        recorder.write_partial_sessions(inspections)
+                        last_persisted = persisted
                 if any(item.get("inbox") is None for item in inspections):
                     blockers.append("session inbox state unavailable")
                 pending_inbox = any(item.get("inbox") for item in inspections)
@@ -1521,13 +1566,13 @@ def _collect_tree(
                     break
                 if previous != signature:
                     poll_interval = SETTLE_INTERVAL_SECONDS
-                    # Only rewrite when the tree actually changed: settling can
-                    # take minutes and the snapshot is large.
-                    if recorder is not None:
-                        recorder.write_partial_sessions(inspections)
                 previous = signature
             except Exception as error:  # preserve partial records and retry discovery
-                blockers = [f"collection: {type(error).__name__}: {error}"]
+                message = f"collection: {type(error).__name__}: {error}"
+                blockers = [message]
+                # Durable when observed, rather than only at the deadline.
+                if recorder is not None:
+                    recorder.note("collection-exception", message)
             last_blockers = blockers
             time.sleep(min(poll_interval, max(0.0, deadline - time.monotonic())))
             poll_interval = min(SETTLE_MAX_INTERVAL_SECONDS, poll_interval * 2)

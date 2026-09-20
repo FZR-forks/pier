@@ -3491,7 +3491,7 @@ def test_cli_error_detection_is_structural_not_textual(tmp_path: Path):
         },
     )
     assert recorder.snapshot()["incident_count"] == 0
-    assert recorder.snapshot()["last_tool"]["tool"] == "write"
+    assert recorder.snapshot()["last_reported_tool"]["tool"] == "write"
 
     runner_module._note_cli_error(
         recorder,
@@ -3725,7 +3725,7 @@ def test_killed_runner_still_explains_what_opencode_was_doing(tmp_path: Path):
     assert status["last_cli_activity_at"]
     assert status["seconds_since_cli_activity"] >= 3
     # ... what was it doing most recently?
-    assert status["last_tool"]["tool"] == "bash"
+    assert status["last_reported_tool"]["tool"] == "bash"
     # ... was there a visible failure?
     assert status["last_incident"]["kind"] == "tool-error"
 
@@ -3762,7 +3762,7 @@ def test_stub_trajectory_reports_the_live_evidence(tmp_path: Path):
                 "server_started": True,
                 "cli_stdout_lines": 412,
                 "seconds_since_cli_activity": 1802.5,
-                "last_tool": {"tool": "bash", "status": "running"},
+                "last_reported_tool": {"tool": "bash", "status": "running"},
             }
         )
     )
@@ -3968,3 +3968,143 @@ def test_manifest_records_how_the_run_ended_not_the_teardown_stage(tmp_path: Pat
     assert finalizing_at < snapshot_at
     # ... and "finished" is only claimed once the manifest is really on disk.
     assert written_at < finished_at
+
+
+def test_child_failure_preserves_the_root_inspection_and_records_why(
+    tmp_path: Path, monkeypatch
+):
+    """A failing child must not discard a successfully fetched root.
+
+    Reproduces the reviewer's injection: the root inspects cleanly, the child
+    raises, and the runner is interrupted before the settle deadline.
+    """
+    recorder = runner_module.LiveRecorder(tmp_path, echo=False, heartbeat_seconds=0)
+    sessions = [
+        {"id": "ses_root", "parentID": None},
+        {"id": "ses_child", "parentID": "ses_root"},
+    ]
+
+    def inspect(self, session, active_ids=None):
+        if str(session.get("id")) == "ses_child":
+            raise TimeoutError("child message page timed out")
+        return {
+            "session": session,
+            "messages": [{"id": "msg_1", "type": "assistant", "time": {}}],
+            "active": None,
+            "inbox": [],
+        }
+
+    monkeypatch.setattr(
+        runner_module.OpenCodeV2Server,
+        "collect_descendants",
+        lambda self, root_id: sessions,
+    )
+    monkeypatch.setattr(
+        runner_module.OpenCodeV2Server, "wait_session", lambda self, sid: True
+    )
+    monkeypatch.setattr(
+        runner_module.OpenCodeV2Server, "running_session_ids", lambda self: set()
+    )
+    monkeypatch.setattr(runner_module.OpenCodeV2Server, "inspect_session", inspect)
+    monkeypatch.setattr(runner_module.time, "sleep", lambda _seconds: None)
+    server = runner_module.OpenCodeV2Server(
+        binary="x", cwd=str(tmp_path), password="p", env={}
+    )
+    server.url = "http://127.0.0.1:1"
+
+    errors = runner_module.RecordedErrors(recorder)
+    runner_module._collect_tree(
+        server,
+        "ses_root",
+        deadline=time.monotonic() + 0.2,
+        errors=errors,
+        recorder=recorder,
+    )
+    recorder.close()
+
+    # The root we did fetch is preserved ...
+    partial = tmp_path / runner_module.PARTIAL_SESSIONS_FILENAME
+    records = [json.loads(line) for line in partial.read_text().splitlines()]
+    assert [item["session"]["id"] for item in records] == ["ses_root"]
+
+    # ... and the specific child failure is durable, not held until the
+    # settlement deadline.
+    incidents = [
+        json.loads(line)
+        for line in (tmp_path / runner_module.INCIDENTS_FILENAME)
+        .read_text()
+        .splitlines()
+    ]
+    child = [item for item in incidents if item["kind"] == "collection-exception"]
+    assert child, "the child failure was never recorded"
+    assert "child message page timed out" in child[0]["message"]
+    assert child[0]["sessionID"] == "ses_child"
+
+
+def test_transient_collection_failure_does_not_invalidate_a_clean_settle(
+    tmp_path: Path, monkeypatch
+):
+    """Recoverable incidents stay diagnostic, never collection_errors."""
+    recorder = runner_module.LiveRecorder(tmp_path, echo=False, heartbeat_seconds=0)
+    sessions = [{"id": "ses_root", "parentID": None}]
+    calls = {"n": 0}
+
+    def inspect(self, session, active_ids=None):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise TimeoutError("transient")
+        return {
+            "session": session,
+            "messages": [],
+            "active": None,
+            "inbox": [
+                *(),
+            ],
+        }
+
+    monkeypatch.setattr(
+        runner_module.OpenCodeV2Server,
+        "collect_descendants",
+        lambda self, root_id: sessions,
+    )
+    monkeypatch.setattr(
+        runner_module.OpenCodeV2Server, "wait_session", lambda self, sid: True
+    )
+    monkeypatch.setattr(
+        runner_module.OpenCodeV2Server, "running_session_ids", lambda self: set()
+    )
+    monkeypatch.setattr(runner_module.OpenCodeV2Server, "inspect_session", inspect)
+    monkeypatch.setattr(runner_module.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(
+        runner_module,
+        "_sessions_without_terminal_outcome",
+        lambda inspections: [],
+    )
+    server = runner_module.OpenCodeV2Server(
+        binary="x", cwd=str(tmp_path), password="p", env={}
+    )
+    server.url = "http://127.0.0.1:1"
+
+    errors = runner_module.RecordedErrors(recorder)
+    _, settled = runner_module._collect_tree(
+        server,
+        "ses_root",
+        deadline=time.monotonic() + 5,
+        errors=errors,
+        recorder=recorder,
+    )
+    recorder.close()
+
+    assert settled, "a transient failure must not prevent settling"
+    # The incident is recorded for diagnosis ...
+    assert any(
+        item["kind"] == "collection-exception"
+        for item in (
+            json.loads(line)
+            for line in (tmp_path / runner_module.INCIDENTS_FILENAME)
+            .read_text()
+            .splitlines()
+        )
+    )
+    # ... but does not mark the completed collection incomplete.
+    assert list(errors) == []

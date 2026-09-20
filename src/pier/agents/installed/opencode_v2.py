@@ -2410,7 +2410,8 @@ class OpenCodeV2(BaseInstalledAgent):
                 "last_cli_activity_at",
                 "seconds_since_cli_activity",
                 "last_cli_event",
-                "last_tool",
+                "last_reported_tool",
+                "cli_stream_limitations",
                 "elapsed_seconds",
                 "updated_at",
             ):
@@ -2454,11 +2455,14 @@ class OpenCodeV2(BaseInstalledAgent):
                 f"{', '.join(str(item) for item in candidates[:5])} "
                 "as unvalidated candidate(s)."
             )
-        tool = evidence.get("last_tool")
+        tool = evidence.get("last_reported_tool")
         if isinstance(tool, dict) and tool.get("tool"):
+            # "reported", not "running": the CLI only emits a tool once it
+            # finishes, so a stuck tool never appears here.
             sentence += (
-                f" Last observed activity was tool {tool['tool']!r}"
-                f" ({tool.get('status', 'unknown')})."
+                f" The last tool the CLI reported was {tool['tool']!r}"
+                f" ({tool.get('status', 'unknown')}); a tool still running"
+                " would not appear."
             )
         if evidence.get("cli_stdout_lines"):
             sentence += (
@@ -2468,6 +2472,12 @@ class OpenCodeV2(BaseInstalledAgent):
             if idle is not None:
                 sentence += f", last seen {idle}s before the record ends"
             sentence += "."
+            if isinstance(idle, (int, float)) and idle >= 60:
+                sentence += (
+                    " CLI silence does not by itself prove the agent stopped:"
+                    " a long-running tool and any child-session work are both"
+                    " invisible in this stream."
+                )
         incidents = evidence.get("last_incidents") or []
         if incidents:
             last = incidents[-1]
