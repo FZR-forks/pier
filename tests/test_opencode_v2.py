@@ -7,6 +7,7 @@ import os
 import signal
 import subprocess
 import time
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -4576,7 +4577,7 @@ class _ScriptedEnvironment(FakeEnvironment):
         sent = []
         for call in self.exec_calls:
             command = call.get("command", "")
-            if "pkill -KILL" in command:
+            if "pgrep -f" in command:
                 sent.append("SWEEP")
             elif "kill -TERM" in command:
                 sent.append("TERM")
@@ -5001,3 +5002,285 @@ def test_probe_failure_does_not_end_the_shutdown(tmp_path: Path):
     commands = [call.get("command", "") for call in environment.exec_calls]
     assert any("kill -TERM" in command for command in commands)
     assert any('kill -KILL -"$pid"' in command for command in commands)
+
+
+class _LocalShellEnvironment(FakeEnvironment):
+    """Runs the adapter's commands through a real shell.
+
+    The mocked environments only record command strings, so a command that is
+    syntactically fine but semantically wrong (reading the whole pidfile
+    instead of one entry) passes them. This executes what the adapter
+    actually generates.
+    """
+
+    async def exec(self, **kwargs: Any) -> ExecResult:
+        self.exec_calls.append(kwargs)
+        completed = subprocess.run(
+            ["bash", "-c", kwargs.get("command", "")],
+            capture_output=True,
+            text=True,
+        )
+        return ExecResult(
+            return_code=completed.returncode,
+            stdout=completed.stdout,
+            stderr=completed.stderr,
+        )
+
+
+def _pidfile_agent(tmp_path: Path, pidfile: Path):
+    agent = make_agent(tmp_path)
+    agent._RUNNER_PIDFILE = pidfile
+    # Keep the last-resort sweep from matching anything on this machine.
+    agent._REMOTE_BINARY = Path(f"/nonexistent/opencode-{uuid.uuid4().hex}")
+    agent._RUNNER_STOP_POLL_SECONDS = 0.05
+    return agent
+
+
+def test_shutdown_targets_the_runner_entry_of_a_multi_entry_pidfile(tmp_path: Path):
+    """The graceful SIGTERM must reach the runner, not the whole pidfile.
+
+    Regression: the pidfile records runner, server and CLI, and reading it
+    whole makes `$pid` a multi-line string that no signal can target. The
+    grace period then expires and shutdown escalates to a forced kill,
+    destroying the very evidence the graceful path exists to preserve.
+    """
+    import asyncio
+
+    victim = subprocess.Popen(["sleep", "300"])
+    decoys = [subprocess.Popen(["sleep", "300"]) for _ in range(2)]
+    pidfile = tmp_path / "runner.pid"
+    pidfile.write_text(
+        f"runner={victim.pid}\nserver={decoys[0].pid}\ncli={decoys[1].pid}\n"
+    )
+    try:
+        agent = _pidfile_agent(tmp_path, pidfile)
+        environment = _LocalShellEnvironment()
+
+        # The liveness probe reads only the runner entry.
+        assert asyncio.run(agent._runner_is_running(environment)) is True
+
+        asyncio.run(agent._ensure_runner_stopped(environment))
+
+        # The graceful SIGTERM actually landed on the runner ...
+        assert victim.poll() is not None, "graceful SIGTERM never reached the runner"
+        assert victim.returncode == -signal.SIGTERM
+        # ... so the forced path was never needed.
+        assert not any(
+            "kill -KILL" in call.get("command", "") for call in environment.exec_calls
+        ), "escalated to a forced kill despite a working graceful stop"
+    finally:
+        for process in (victim, *decoys):
+            try:
+                process.kill()
+                process.wait(timeout=10)
+            except (OSError, subprocess.TimeoutExpired):
+                pass
+
+
+def test_liveness_probe_reports_real_process_states(tmp_path: Path):
+    """The probe is shell; exercise it against real running/dead processes."""
+    import asyncio
+
+    alive = subprocess.Popen(["sleep", "300"])
+    pidfile = tmp_path / "runner.pid"
+    pidfile.write_text(f"runner={alive.pid}\nserver=1\ncli=1\n")
+    agent = _pidfile_agent(tmp_path, pidfile)
+    environment = _LocalShellEnvironment()
+    try:
+        assert asyncio.run(agent._runner_is_running(environment)) is True
+    finally:
+        alive.kill()
+        alive.wait(timeout=10)
+    # Reaped: the pid is gone entirely.
+    assert asyncio.run(agent._runner_is_running(environment)) is False
+
+    # An empty or absent pidfile is not a running runner.
+    pidfile.write_text("")
+    assert asyncio.run(agent._runner_is_running(environment)) is False
+    pidfile.unlink()
+    assert asyncio.run(agent._runner_is_running(environment)) is False
+
+
+def test_forced_stop_signals_each_recorded_process_group(tmp_path: Path):
+    """The forced path must reach the CLI's group, where the tools live."""
+    import asyncio
+
+    # Each process leads its own group, like the runner's server and CLI.
+    leaders = [
+        subprocess.Popen(["sleep", "300"], start_new_session=True) for _ in range(3)
+    ]
+    pidfile = tmp_path / "runner.pid"
+    pidfile.write_text(
+        f"runner={leaders[0].pid}\nserver={leaders[1].pid}\ncli={leaders[2].pid}\n"
+    )
+    try:
+        agent = _pidfile_agent(tmp_path, pidfile)
+        asyncio.run(agent._force_stop(_LocalShellEnvironment(), None))
+        for index, leader in enumerate(leaders):
+            try:
+                leader.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                raise AssertionError(f"pidfile entry {index} survived the forced stop")
+            assert leader.returncode == -signal.SIGKILL
+    finally:
+        for leader in leaders:
+            try:
+                leader.kill()
+                leader.wait(timeout=10)
+            except (OSError, subprocess.TimeoutExpired):
+                pass
+
+
+def test_termination_during_finalization_does_not_abort_it(tmp_path: Path):
+    """A stop request must never destroy the evidence it exists to preserve.
+
+    Pier signals the runner on timeout, and that signal can land while the
+    runner is already finalizing. Raising there would abort the write of
+    `runner-result.json` partway.
+    """
+    binary = tmp_path / "fake-polite"
+    binary.write_text(_FAKE_POLITE_OPENCODE)
+    binary.chmod(0o755)
+    logs_dir = tmp_path / "logs"
+    logs_dir.mkdir()
+    work_dir = tmp_path / "work"
+    work_dir.mkdir()
+    instruction = tmp_path / "instruction.txt"
+    instruction.write_text("do the task")
+
+    process = subprocess.Popen(
+        [
+            "python3",
+            str(Path(runner_module.__file__)),
+            "--instruction-file",
+            str(instruction),
+            "--logs-dir",
+            str(logs_dir),
+            "--work-dir",
+            str(work_dir),
+            "--binary",
+            str(binary),
+            "--model",
+            "fake/model",
+        ],
+        env={
+            **os.environ,
+            "HOME": str(tmp_path),
+            "POLITE_FLAG": str(tmp_path / "flag"),
+        },
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    status_path = logs_dir / runner_module.STATUS_FILENAME
+    pidfile = logs_dir / runner_module.RUNNER_PIDFILE
+    try:
+        deadline = time.monotonic() + 60
+        while time.monotonic() < deadline and not pidfile.exists():
+            time.sleep(0.05)
+        pid = int(
+            dict(
+                line.split("=", 1)
+                for line in pidfile.read_text().split()
+                if "=" in line
+            )["runner"]
+        )
+        # First signal: starts the graceful shutdown.
+        os.kill(pid, signal.SIGTERM)
+        # Wait until it is finalizing, then signal again -- the case a timeout
+        # produces when the runner was already winding down.
+        while time.monotonic() < deadline:
+            try:
+                if json.loads(status_path.read_text()).get("stage") in {
+                    "shutting-down",
+                    "finalizing",
+                    "finished",
+                }:
+                    break
+            except (OSError, json.JSONDecodeError):
+                pass
+            time.sleep(0.02)
+        for _ in range(3):
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except ProcessLookupError:
+                break
+            time.sleep(0.05)
+        process.wait(timeout=90)
+    finally:
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            pass
+        try:
+            subprocess.run(["pkill", "-9", "-f", str(binary)], check=False)
+        except OSError:
+            pass
+
+    # Finalization completed despite the extra signals.
+    result = json.loads((logs_dir / "runner-result.json").read_text())
+    assert result["cancelled"] is True
+    assert json.loads(status_path.read_text())["stage"] == "finished"
+
+
+def test_unreachable_environment_stops_probing_but_a_hiccup_does_not(tmp_path: Path):
+    """A dead container is not a stuck runner, and vice versa.
+
+    A runner cannot outlive its own container, so once the environment is
+    persistently unreachable there is nothing left to signal. A single
+    unreadable probe must still be retried, not mistaken for completion.
+    """
+    import asyncio
+
+    agent = make_agent(tmp_path)
+    agent._RUNNER_STOP_POLL_SECONDS = 0.01
+    agent._RUNNER_STOP_GRACE_SECONDS = 30  # never the thing that ends the loop
+
+    class DeadEnvironment(FakeEnvironment):
+        async def exec(self, **kwargs: Any) -> ExecResult:
+            self.exec_calls.append(kwargs)
+            if "/proc/$pid/stat" in kwargs.get("command", ""):
+                raise RuntimeError("container is not running")
+            return ExecResult(return_code=0, stdout="", stderr="")
+
+    environment = DeadEnvironment()
+    started = time.monotonic()
+    asyncio.run(agent._ensure_runner_stopped(environment))
+    # It stopped polling early instead of burning the whole grace period ...
+    assert time.monotonic() - started < 10
+    probes = [
+        call
+        for call in environment.exec_calls
+        if "/proc/$pid/stat" in call.get("command", "")
+    ]
+    assert len(probes) <= agent._RUNNER_PROBE_MAX_UNKNOWN + 3
+    # ... but still attempted the forced teardown rather than assuming the
+    # runner had stopped, since an unreadable probe is not evidence.
+    assert any(
+        'kill -KILL -"$pid"' in call.get("command", "")
+        for call in environment.exec_calls
+    )
+
+    # One transient failure must not end the shutdown.
+    calls = {"n": 0}
+
+    class FlakyOnceEnvironment(FakeEnvironment):
+        async def exec(self, **kwargs: Any) -> ExecResult:
+            self.exec_calls.append(kwargs)
+            if "/proc/$pid/stat" in kwargs.get("command", ""):
+                calls["n"] += 1
+                if calls["n"] == 2:
+                    raise RuntimeError("transient")
+                return ExecResult(
+                    return_code=0,
+                    stdout="RUNNING" if calls["n"] < 4 else "GONE",
+                    stderr="",
+                )
+            return ExecResult(return_code=0, stdout="", stderr="")
+
+    flaky = FlakyOnceEnvironment()
+    asyncio.run(agent._ensure_runner_stopped(flaky))
+    # Recovered and saw the runner stop; never escalated to a forced kill.
+    assert not any(
+        'kill -KILL -"$pid"' in call.get("command", "") for call in flaky.exec_calls
+    )

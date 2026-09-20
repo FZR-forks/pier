@@ -181,6 +181,9 @@ class OpenCodeV2(BaseInstalledAgent):
         os.environ.get("PIER_OPENCODE_V2_RUNNER_STOP_GRACE", "90")
     )
     _RUNNER_STOP_POLL_SECONDS = 2.0
+    # How many consecutive unreadable probes mean the environment itself is
+    # gone rather than briefly unhappy.
+    _RUNNER_PROBE_MAX_UNKNOWN = 5
     _INSTRUCTION_PATH = _RUNNER_LOG_DIR / "instruction.txt"
 
     # These values define the adapter's private process/config boundary.  A
@@ -1314,6 +1317,18 @@ class OpenCodeV2(BaseInstalledAgent):
         )
         return (getattr(result, "stdout", "") or "").strip()
 
+    async def _signal(
+        self,
+        environment: BaseEnvironment,
+        command: str,
+        env: dict[str, str] | None,
+    ) -> None:
+        """Deliver a signal; a failed exec must not end the shutdown ladder."""
+        try:
+            await self._probe(environment, command, env)
+        except Exception:
+            self.logger.debug("OpenCode V2 shutdown signal could not be delivered")
+
     async def _runner_state(
         self, environment: BaseEnvironment, env: dict[str, str] | None = None
     ) -> str:
@@ -1331,10 +1346,18 @@ class OpenCodeV2(BaseInstalledAgent):
             self.logger.debug("Could not probe the OpenCode V2 runner")
             return "UNKNOWN"
 
+    def _pid_expr(self, key: str) -> str:
+        """Shell that sets ``$pid`` to one entry of the ``key=pid`` pidfile.
+
+        The pidfile records the runner, server and CLI, so every consumer has
+        to select its own line; reading the file whole yields all three.
+        """
+        pidfile = shlex.quote(self._RUNNER_PIDFILE.as_posix())
+        return f"pid=$(sed -n 's/^{key}=//p' {pidfile} 2>/dev/null | head -n 1)"
+
     async def _runner_is_running(
         self, environment: BaseEnvironment, env: dict[str, str] | None = None
     ) -> bool:
-        pidfile = shlex.quote(self._RUNNER_PIDFILE.as_posix())
         # Signalling a recorded PID avoids matching the probe's own command
         # line, which any `pgrep -f` over the runner path would do.
         #
@@ -1345,7 +1368,7 @@ class OpenCodeV2(BaseInstalledAgent):
         # reason. Read the process state and treat Z as gone.
         answer = await self._probe(
             environment,
-            f"pid=$(sed -n 's/^runner=//p' {pidfile} 2>/dev/null); "
+            f"{self._pid_expr('runner')}; "
             'if [ -z "$pid" ]; then echo GONE; '
             'elif [ -r "/proc/$pid/stat" ]; then '
             "  state=$(sed 's/.*) //' \"/proc/$pid/stat\" | cut -d' ' -f1); "
@@ -1371,24 +1394,50 @@ class OpenCodeV2(BaseInstalledAgent):
         if state == "GONE":
             return  # the normal path: it already exited on its own
 
-        self.logger.warning(
-            "OpenCode V2 runner is still running; requesting graceful shutdown"
-        )
-        pidfile = shlex.quote(self._RUNNER_PIDFILE.as_posix())
-        await self._probe(
+        if state == "RUNNING":
+            self.logger.warning(
+                "OpenCode V2 runner is still running; requesting graceful shutdown"
+            )
+        else:
+            self.logger.warning(
+                "Could not confirm whether the OpenCode V2 runner stopped; "
+                "requesting graceful shutdown anyway"
+            )
+        await self._signal(
             environment,
-            f'pid=$(cat {pidfile} 2>/dev/null); [ -n "$pid" ] && kill -TERM "$pid"',
+            f'{self._pid_expr("runner")}; [ -n "$pid" ] && kill -TERM "$pid"',
             env,
         )
 
         # An unreadable probe is not evidence of a stopped runner, so keep
         # retrying inside the grace period rather than assuming success.
         deadline = time.monotonic() + self._RUNNER_STOP_GRACE_SECONDS
+        unknown_streak = 0
         while time.monotonic() < deadline:
             await asyncio.sleep(self._RUNNER_STOP_POLL_SECONDS)
-            if await self._runner_state(environment, env) == "GONE":
+            state = await self._runner_state(environment, env)
+            if state == "GONE":
                 self.logger.info("OpenCode V2 runner shut down gracefully")
                 return
+            if state != "UNKNOWN":
+                unknown_streak = 0
+                continue
+            # A single unreadable probe is a hiccup and must not be mistaken
+            # for a stopped runner. A sustained run of them means the
+            # environment is gone -- and a runner cannot outlive its own
+            # container, so there is nothing left to signal or to wait for.
+            unknown_streak += 1
+            if unknown_streak >= self._RUNNER_PROBE_MAX_UNKNOWN:
+                # Further polling will not help, but stop short of assuming
+                # the runner is gone: still run the forced teardown below,
+                # which is harmless against a dead container and correct if
+                # the container is actually alive and only the probe is not.
+                self.logger.warning(
+                    "OpenCode V2 environment unreadable after %d probes; "
+                    "skipping the remaining grace period",
+                    unknown_streak,
+                )
+                break
 
         self.logger.warning(
             "OpenCode V2 runner did not stop within %.0fs; forcing termination",
@@ -1414,19 +1463,31 @@ class OpenCodeV2(BaseInstalledAgent):
         reaches the tools they spawned too; killing only the recorded pids
         would orphan a running `bash` and leave it writing to the workspace.
         """
-        pidfile = shlex.quote(self._RUNNER_PIDFILE.as_posix())
         for key in ("cli", "server", "runner"):
-            await self._probe(
+            await self._signal(
                 environment,
-                f"pid=$(sed -n 's/^{key}=//p' {pidfile} 2>/dev/null); "
+                f"{self._pid_expr(key)}; "
                 'if [ -n "$pid" ]; then kill -KILL -"$pid" 2>/dev/null || '
                 'kill -KILL "$pid" 2>/dev/null; fi',
                 env,
             )
         # Anything that escaped its group still runs the OpenCode binary.
-        await self._probe(
+        #
+        # This cannot be a plain `pkill -f`: the probe shell's own command
+        # line contains the pattern, so pkill matches and kills itself, which
+        # both aborts the sweep partway and reports a spurious failure. Skip
+        # the probe's own process group instead. OpenCode's server and CLI
+        # are started in their own sessions, so they are never skipped.
+        pattern = shlex.quote(self._REMOTE_BINARY.as_posix())
+        await self._signal(
             environment,
-            f"pkill -KILL -f {shlex.quote(self._REMOTE_BINARY.as_posix())}",
+            "pgid() { sed 's/.*) //' \"/proc/$1/stat\" 2>/dev/null "
+            "| cut -d' ' -f3; }; "
+            "mine=$(pgid $$); "
+            f"for victim in $(pgrep -f {pattern} 2>/dev/null); do "
+            '  [ "$(pgid "$victim")" = "$mine" ] && continue; '
+            '  kill -KILL "$victim" 2>/dev/null; '
+            "done; true",
             env,
         )
 

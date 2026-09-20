@@ -2146,7 +2146,19 @@ def main() -> None:
     early_root_events: deque[dict[str, str]] = deque(maxlen=CLI_CAPTURE_MAX_LINES)
     event_stream: OpenCodeEventStream | None = None
 
+    # Shutdown must be idempotent. Pier signals the runner when a trial times
+    # out, and that signal can land while the runner is already finalizing --
+    # raising there would abort it partway and lose `runner-result.json`,
+    # which is the opposite of what asking it to stop is for.
+    finalizing = threading.Event()
+
     def handle_termination(signum, _frame):
+        if finalizing.is_set():
+            recorder.note(
+                "termination-signal-ignored",
+                f"signal {signum} arrived while already shutting down",
+            )
+            return
         raise KeyboardInterrupt(f"received signal {signum}")
 
     signal.signal(signal.SIGTERM, handle_termination)
@@ -2413,6 +2425,7 @@ def main() -> None:
                 f"partial collection: {type(cleanup_error).__name__}: {cleanup_error}"
             )
     finally:
+        finalizing.set()
         recorder.stage("shutting-down")
         if event_stream is not None:
             try:
