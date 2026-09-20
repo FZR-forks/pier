@@ -1407,6 +1407,11 @@ class OpenCodeV2(BaseInstalledAgent):
             # the container. Without this the runner, the OpenCode server and
             # the agent's tools keep running while Pier collects artifacts and
             # grades the task. Stop them before anything is read.
+            # Whether the run is already failing has to be sampled here,
+            # before the cleanup `try`: inside `except OpenCodeV2ShutdownError`
+            # the current exception is always that error, so asking there can
+            # never distinguish the two cases.
+            already_failing = sys.exc_info()[0] is not None
             try:
                 await self._ensure_runner_stopped(environment, env)
             except OpenCodeV2ShutdownError as error:
@@ -1421,7 +1426,7 @@ class OpenCodeV2(BaseInstalledAgent):
                 # become the failure.
                 self.logger.critical("%s", error)
                 self._shutdown_failure = str(error)
-                if sys.exc_info()[0] is None:
+                if not already_failing:
                     raise
             except Exception:
                 self.logger.exception("OpenCode V2 runner shutdown failed")

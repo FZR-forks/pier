@@ -47,6 +47,15 @@ class FakeEnvironment:
 
     async def exec(self, **kwargs: Any) -> ExecResult:
         self.exec_calls.append(kwargs)
+        if "/proc/$pid/stat" in kwargs.get("command", ""):
+            # Model a container where the run has finished: everything the
+            # runner owned is gone. Returning nothing would read as UNKNOWN,
+            # which the adapter correctly refuses to treat as stopped.
+            return ExecResult(
+                return_code=0,
+                stdout=" ".join(f"{key}=GONE" for key in OpenCodeV2._OWNED_PROCESSES),
+                stderr="",
+            )
         return ExecResult(return_code=0, stdout="", stderr="")
 
     async def download_file(self, remote: str, local: Path) -> None:
@@ -3599,7 +3608,7 @@ class H(BaseHTTPRequestHandler):
             while True:
                 time.sleep(0.2)
                 try:
-                    self.wfile.write(b": heartbeat\n\n")
+                    self.wfile.write(b": heartbeat\\n\\n")
                     self.wfile.flush()
                 except Exception:
                     return
@@ -4720,7 +4729,7 @@ class H(BaseHTTPRequestHandler):
             while True:
                 time.sleep(0.2)
                 try:
-                    self.wfile.write(b": heartbeat\n\n")
+                    self.wfile.write(b": heartbeat\\n\\n")
                     self.wfile.flush()
                 except Exception:
                     return
@@ -5390,7 +5399,14 @@ def test_forced_stop_kills_a_detached_shell_tool(tmp_path: Path):
     # A "server" in its own session, with a detached tool child that would
     # write to the workspace if it were left alive.
     tool_script = tmp_path / "tool.sh"
-    tool_script.write_text(f"#!/bin/sh\nsleep 4\necho late > {marker}\n")
+    started = workdir / "tool-started"
+    trigger = workdir / "tool-trigger"
+    tool_script.write_text(
+        "#!/bin/sh\n"
+        f"touch {started}\n"
+        f"while [ ! -f {trigger} ]; do sleep 0.05; done\n"
+        f"echo late > {marker}\n"
+    )
     tool_script.chmod(0o755)
     server = subprocess.Popen(
         ["sh", "-c", f"setsid {tool_script} & sleep 300"],
@@ -5404,25 +5420,18 @@ def test_forced_stop_kills_a_detached_shell_tool(tmp_path: Path):
         agent._remote_workdir_text = str(workdir)
         agent._RUNNER_STOP_GRACE_SECONDS = 0.05
 
-        # Wait for the detached tool to actually exist, rather than racing
-        # `setsid` with a fixed sleep.
+        # Wait for the tool to announce itself rather than racing `setsid`.
         deadline = time.monotonic() + 30
-        while time.monotonic() < deadline:
-            if (
-                subprocess.run(
-                    ["pgrep", "-f", str(tool_script)], capture_output=True
-                ).returncode
-                == 0
-            ):
-                break
+        while time.monotonic() < deadline and not started.exists():
             time.sleep(0.05)
-        else:
-            raise AssertionError("the detached tool never started")
+        assert started.exists(), "the detached tool never started"
 
         asyncio.run(agent._force_stop(_LocalShellEnvironment(), None))
 
-        # Give the tool longer than its own sleep: if it survived, it writes.
-        time.sleep(6)
+        # Release the trigger the tool waits on. A survivor reacts at once,
+        # so this needs a short bounded wait rather than a long sleep.
+        trigger.touch()
+        time.sleep(1.0)
         assert not marker.exists(), (
             "a detached shell tool survived cleanup and wrote to the workspace"
         )
@@ -5583,7 +5592,7 @@ class H(BaseHTTPRequestHandler):
             while True:
                 time.sleep(0.2)
                 try:
-                    self.wfile.write(b": heartbeat\n\n")
+                    self.wfile.write(b": heartbeat\\n\\n")
                     self.wfile.flush()
                 except Exception:
                     return
@@ -5607,7 +5616,13 @@ def serve():
           flush=True)
     # A detached tool, in its own session, that mutates the workspace later.
     subprocess.Popen(
-        ["sh", "-c", "sleep 12; echo mutated > " + MARKER],
+        [
+            "sh",
+            "-c",
+            f"touch {MARKER}.started; "
+            f"while [ ! -f {MARKER}.trigger ]; do sleep 0.05; done; "
+            f"echo mutated > {MARKER}",
+        ],
         start_new_session=True,
         cwd=os.getcwd(),
     )
@@ -5640,10 +5655,18 @@ class _LocalRunEnvironment(FakeEnvironment):
         command = kwargs.get("command", "")
         if command.strip().endswith("pwd"):
             return ExecResult(return_code=0, stdout=str(self.workdir) + "\n", stderr="")
-        # Only the runner launch and the shutdown probes are executed for
-        # real. The container-provisioning commands around them are not what
-        # this test is about, and they cannot run outside a trial image.
-        interesting = "opencode_v2_runner.py" in command or "/proc/" in command
+        # The runner launch, the shutdown probes and the shutdown signals are
+        # executed for real; stubbing the signals would let the test "pass"
+        # the graceful path without ever delivering SIGTERM. The
+        # container-provisioning commands around them are not what this test
+        # is about and cannot run outside a trial image.
+        interesting = (
+            "opencode_v2_runner.py" in command
+            or "/proc/" in command
+            or "kill -TERM" in command
+            or "kill -KILL" in command
+            or "pgrep -f" in command
+        )
         if not interesting:
             return ExecResult(return_code=0, stdout="", stderr="")
         # Genuinely async, like the docker exec it stands in for. A blocking
@@ -5657,6 +5680,9 @@ class _LocalRunEnvironment(FakeEnvironment):
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             cwd=str(self.workdir),
+            # Without this the requested env is dropped and the fake binary
+            # dies on a missing variable the moment it starts.
+            env={**os.environ, **(kwargs.get("env") or {})},
         )
         out, err = await process.communicate()
         return ExecResult(
@@ -5723,19 +5749,21 @@ def test_cancellation_mid_run_leaves_nothing_of_opencode_running(tmp_path: Path)
 
     async def main() -> None:
         task = asyncio.ensure_future(drive())
-        # Wait until OpenCode is genuinely working before cancelling. This is
-        # a startup wait, not an idle one: it needs room for the runner, the
-        # server and its readiness handshake under load.
-        deadline = time.monotonic() + 90
-        while time.monotonic() < deadline:
-            if agent._RUNNER_PIDFILE.exists() and marker.parent.exists():
-                states = await agent._owned_states(environment)
-                if states.get("server") == "RUNNING":
-                    break
+        # Wait for the detached tool itself, not merely the server: this
+        # test exists to prove that tool gets cleaned up, so cancelling
+        # before it is spawned would silently test nothing.
+        tool_started = Path(str(marker) + ".started")
+        deadline = time.monotonic() + 60
+        while time.monotonic() < deadline and not tool_started.exists():
+            # Surface a startup crash straight away instead of hiding it
+            # behind the full timeout.
+            if task.done():
+                await task
+                raise AssertionError("the runner exited before OpenCode started")
             await asyncio.sleep(0.1)
-        else:
+        if not tool_started.exists():
             task.cancel()
-            raise AssertionError("OpenCode never started")
+            raise AssertionError("OpenCode never started its detached tool")
         with pytest.raises(asyncio.TimeoutError):
             await asyncio.wait_for(task, timeout=0.1)
 
@@ -5756,9 +5784,31 @@ def test_cancellation_mid_run_leaves_nothing_of_opencode_running(tmp_path: Path)
     ).stdout.split()
     assert not leftovers, f"OpenCode survived the cancellation: {leftovers}"
 
-    # ... and the detached tool never got to mutate the workspace. Wait past
-    # the point where it would have written had it survived.
-    time.sleep(14)
+    # ... and the detached tool never got to mutate the workspace. Release
+    # the trigger it waits on: a survivor writes immediately.
+    Path(str(marker) + ".trigger").touch()
+    time.sleep(1.0)
     assert not marker.exists(), (
         "a detached tool mutated the workspace after cleanup completed"
     )
+
+
+def test_fake_opencode_sources_are_valid_python():
+    """The fakes are source strings, so a typo in them is invisible.
+
+    A broken fake does not fail loudly: its server simply never reports
+    ready, and the runner waits out its full readiness timeout. That turns a
+    one-character mistake into minutes of unexplained suite runtime.
+    """
+    import ast
+
+    for name, source in (
+        ("_FAKE_OPENCODE", _FAKE_OPENCODE),
+        ("_FAKE_HANGING_OPENCODE", _FAKE_HANGING_OPENCODE),
+        ("_FAKE_POLITE_OPENCODE", _FAKE_POLITE_OPENCODE),
+        ("_FAKE_DETACHING_OPENCODE", _FAKE_DETACHING_OPENCODE),
+    ):
+        ast.parse(source)  # raises SyntaxError with the offending line
+        # The real server always serves this; without it the runner
+        # reconnects on a tight loop.
+        assert "/api/event" in source, name

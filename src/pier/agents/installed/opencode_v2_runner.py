@@ -751,6 +751,15 @@ class OpenCodeEventStream:
                 # could consume arbitrary memory before any cap applies.
                 raw = response.readline(EVENT_LINE_MAX_BYTES + 1)
                 if not raw:
+                    # The feed ended without us asking it to. That is a gap
+                    # like any other -- there is no replay, so a terminal tool
+                    # event may have been lost -- so it must not reconnect
+                    # leaving the in-flight state looking trustworthy.
+                    if not self._stop.is_set():
+                        self.recorder.note_event_gap(
+                            "event stream closed unexpectedly; events during "
+                            "the gap are lost"
+                        )
                     return
                 if len(raw) > EVENT_LINE_MAX_BYTES:
                     self._discard_oversized_line(response, len(raw))
