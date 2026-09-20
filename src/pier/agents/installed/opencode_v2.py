@@ -1549,6 +1549,14 @@ class OpenCodeV2(BaseInstalledAgent):
             if "=" in line and line.split("=", 1)[1] in {"GONE", "RUNNING", "UNKNOWN"}
         )
         if not reported:
+            # The exec "succeeded" but said nothing, which is what a dying
+            # container looks like. Same discriminator as an outright
+            # failure: if the environment has gone, so have its processes.
+            if not await self._environment_reachable(environment, env):
+                self.logger.warning(
+                    "OpenCode V2 environment is gone; its processes went with it"
+                )
+                return {key: "GONE" for key in self._OWNED_PROCESSES}
             return {key: "UNKNOWN" for key in self._OWNED_PROCESSES}
         return {key: reported.get(key, "UNKNOWN") for key in self._OWNED_PROCESSES}
 

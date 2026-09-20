@@ -5227,11 +5227,15 @@ def test_forced_stop_signals_each_recorded_process_group(tmp_path: Path):
     try:
         agent = _pidfile_agent(tmp_path, pidfile)
         asyncio.run(agent._force_stop(_LocalShellEnvironment(), None))
+        # Poll rather than a single bounded wait: signal delivery and reaping
+        # are asynchronous, and under load a slow kill is not a survival.
+        deadline = time.monotonic() + 30
         for index, leader in enumerate(leaders):
-            try:
-                leader.wait(timeout=10)
-            except subprocess.TimeoutExpired:
-                raise AssertionError(f"pidfile entry {index} survived the forced stop")
+            while time.monotonic() < deadline and leader.poll() is None:
+                time.sleep(0.1)
+            assert leader.poll() is not None, (
+                f"pidfile entry {index} survived the forced stop"
+            )
             assert leader.returncode == -signal.SIGKILL
     finally:
         for leader in leaders:
@@ -5962,3 +5966,30 @@ def test_a_reachable_environment_that_cannot_be_read_still_fails_closed(
 
     with pytest.raises(OpenCodeV2ShutdownError):
         asyncio.run(agent._ensure_runner_stopped(UnreadableEnvironment()))
+
+
+def test_a_silent_dying_container_is_detected_without_burning_the_grace(
+    tmp_path: Path,
+):
+    """An exec that succeeds but says nothing is a dying container.
+
+    Live evidence: the grace period was spent probing a container that had
+    already gone, because reachability was only consulted when the probe
+    raised. An empty answer needs the same treatment.
+    """
+    import asyncio
+
+    agent = make_agent(tmp_path)
+    agent._RUNNER_STOP_POLL_SECONDS = 0.01
+    agent._RUNNER_STOP_GRACE_SECONDS = 30  # must not be what ends this
+
+    class SilentEnvironment(FakeEnvironment):
+        async def exec(self, **kwargs: Any) -> ExecResult:
+            self.exec_calls.append(kwargs)
+            # Everything returns success with no output, including the
+            # reachability check.
+            return ExecResult(return_code=0, stdout="", stderr="")
+
+    started = time.monotonic()
+    asyncio.run(agent._ensure_runner_stopped(SilentEnvironment()))
+    assert time.monotonic() - started < 5, "burned the grace period on a dead container"
