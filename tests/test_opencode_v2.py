@@ -9,6 +9,7 @@ import shlex
 import shutil
 import signal
 import subprocess
+import sys
 import time
 import uuid
 from pathlib import Path
@@ -18,6 +19,7 @@ import pytest
 
 from pier.agents.factory import AgentFactory
 from pier.agents.installed.base import NonZeroAgentExitCodeError
+from pier.trial.trial import AgentTimeoutError
 from pier.agents.installed import opencode_v2_runner as runner_module
 from pier.agents.installed.opencode_v2 import OpenCodeV2, OpenCodeV2ShutdownError
 from pier.environments.base import ExecResult
@@ -5812,3 +5814,93 @@ def test_fake_opencode_sources_are_valid_python():
         # The real server always serves this; without it the runner
         # reconnects on a tight loop.
         assert "/api/event" in source, name
+
+
+def test_unconfirmed_shutdown_on_timeout_is_fatal_not_an_agent_timeout(
+    tmp_path: Path,
+):
+    """A timeout must not reach the verifier when OpenCode may still run.
+
+    Pier treats `AgentTimeoutError` as an ordinary agent failure and carries
+    on to the collect hooks and the verifier. So preserving the timeout is
+    the wrong outcome when shutdown could not be confirmed: the repository
+    about to be graded may still be changing. The adapter has to surface
+    something Pier does not treat as a normal agent timeout -- while still
+    collecting the diagnostics first.
+    """
+    import asyncio
+
+    agent = make_agent(tmp_path)
+    agent._RUNNER_STOP_POLL_SECONDS = 0.01
+    agent._RUNNER_STOP_GRACE_SECONDS = 0.05
+
+    class NeverStopsEnvironment(FakeEnvironment):
+        async def exec(self, **kwargs: Any) -> ExecResult:
+            self.exec_calls.append(kwargs)
+            if "/proc/$pid/stat" in kwargs.get("command", ""):
+                return ExecResult(
+                    return_code=0,
+                    stdout=" ".join(
+                        f"{key}=RUNNING" for key in OpenCodeV2._OWNED_PROCESSES
+                    ),
+                    stderr="",
+                )
+            return ExecResult(return_code=0, stdout="", stderr="")
+
+    environment = NeverStopsEnvironment()
+
+    async def timed_out_run() -> None:
+        """The shape of `run()` when the agent exec is cancelled."""
+        original_error = None
+        try:
+            raise AgentTimeoutError("Agent execution timed out after 1 seconds")
+        except AgentTimeoutError:
+            original_error = sys.exc_info()[1]
+            shutdown_error = None
+            try:
+                await agent._ensure_runner_stopped(environment)
+            except OpenCodeV2ShutdownError as error:
+                shutdown_error = error
+            await agent._collect_runner_artifacts(environment)
+            if shutdown_error is not None:
+                raise shutdown_error from original_error
+
+    with pytest.raises(OpenCodeV2ShutdownError) as raised:
+        asyncio.run(timed_out_run())
+
+    # Pier's timeout branch keys off AgentTimeoutError; this must not be one,
+    # or the verifier would run against a workspace that may still change.
+    assert not isinstance(raised.value, AgentTimeoutError)
+    assert not isinstance(raised.value, NonZeroAgentExitCodeError)
+    # The original timeout is preserved as context rather than discarded.
+    assert isinstance(raised.value.__cause__, AgentTimeoutError)
+    # Diagnostics were still collected before failing.
+    assert environment.downloads
+
+
+def test_run_fails_closed_when_shutdown_cannot_be_confirmed(tmp_path: Path):
+    """End to end through `run()`: unconfirmed shutdown fails the trial."""
+    import asyncio
+
+    agent = make_agent(tmp_path)
+    agent._RUNNER_STOP_POLL_SECONDS = 0.01
+    agent._RUNNER_STOP_GRACE_SECONDS = 0.05
+
+    class NeverStopsEnvironment(FakeEnvironment):
+        async def exec(self, **kwargs: Any) -> ExecResult:
+            self.exec_calls.append(kwargs)
+            if "/proc/$pid/stat" in kwargs.get("command", ""):
+                return ExecResult(
+                    return_code=0,
+                    stdout=" ".join(
+                        f"{key}=RUNNING" for key in OpenCodeV2._OWNED_PROCESSES
+                    ),
+                    stderr="",
+                )
+            return ExecResult(return_code=0, stdout="", stderr="")
+
+    environment = NeverStopsEnvironment()
+    with pytest.raises(OpenCodeV2ShutdownError):
+        asyncio.run(agent.run("do the thing", environment, AgentContext()))
+    # Artifacts are still pulled, so the run can be diagnosed.
+    assert environment.downloads

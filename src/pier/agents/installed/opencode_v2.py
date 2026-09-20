@@ -1407,36 +1407,39 @@ class OpenCodeV2(BaseInstalledAgent):
             # the container. Without this the runner, the OpenCode server and
             # the agent's tools keep running while Pier collects artifacts and
             # grades the task. Stop them before anything is read.
-            # Whether the run is already failing has to be sampled here,
-            # before the cleanup `try`: inside `except OpenCodeV2ShutdownError`
-            # the current exception is always that error, so asking there can
-            # never distinguish the two cases.
-            already_failing = sys.exc_info()[0] is not None
+            # An unconfirmed shutdown has to be fatal, not merely logged.
+            # Preserving the original timeout is not enough: Pier treats
+            # AgentTimeoutError as an ordinary agent failure and carries on to
+            # the collect hooks and the verifier, which would grade a
+            # repository OpenCode may still be editing. Raising something
+            # else instead keeps the trial out of that branch entirely.
+            original_error = sys.exc_info()[1]
+            shutdown_error: OpenCodeV2ShutdownError | None = None
             try:
                 await self._ensure_runner_stopped(environment, env)
             except OpenCodeV2ShutdownError as error:
-                # Fail closed: nothing collected after this can be trusted,
-                # because OpenCode may still be editing the workspace that is
-                # about to be graded.
-                #
-                # If the run is already failing -- a timeout is the usual way
-                # to get here -- let that exception stand so the trial is
-                # still reported as a timeout, and record this alongside it.
-                # Only when the run would otherwise have succeeded does this
-                # become the failure.
-                self.logger.critical("%s", error)
-                self._shutdown_failure = str(error)
-                if not already_failing:
-                    raise
-            except Exception:
+                shutdown_error = error
+            except Exception as error:
+                # Shutdown machinery failing is itself a failure to establish
+                # that OpenCode stopped, so it gets the same treatment.
                 self.logger.exception("OpenCode V2 runner shutdown failed")
-            # Preserve the primary execution error even when artifact
-            # collection fails; the runner keeps its JSONL evidence on disk
-            # precisely so a failed run can still be graded.
+                shutdown_error = OpenCodeV2ShutdownError(
+                    "OpenCode V2 shutdown could not be completed: "
+                    f"{type(error).__name__}: {error}"
+                )
+            if shutdown_error is not None:
+                self.logger.critical("%s", shutdown_error)
+                self._shutdown_failure = str(shutdown_error)
+
+            # Evidence first: the diagnostics are most valuable precisely when
+            # shutdown went wrong, so they are collected before failing.
             try:
                 await self._collect_runner_artifacts(environment)
             except Exception:
                 self.logger.exception("OpenCode V2 artifact collection failed")
+
+            if shutdown_error is not None:
+                raise shutdown_error from original_error
 
     def _build_register_skills_command(self) -> str | None:
         if not self.skills_dir:
