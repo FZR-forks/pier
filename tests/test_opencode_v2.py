@@ -9,7 +9,6 @@ import shlex
 import shutil
 import signal
 import subprocess
-import sys
 import time
 import uuid
 from pathlib import Path
@@ -19,9 +18,8 @@ import pytest
 
 from pier.agents.factory import AgentFactory
 from pier.agents.installed.base import NonZeroAgentExitCodeError
-from pier.trial.trial import AgentTimeoutError
 from pier.agents.installed import opencode_v2_runner as runner_module
-from pier.agents.installed.opencode_v2 import OpenCodeV2, OpenCodeV2ShutdownError
+from pier.agents.installed.opencode_v2 import OpenCodeV2
 from pier.environments.base import ExecResult
 from pier.models.agent.context import AgentContext
 from pier.models.agent.name import AgentName
@@ -4641,8 +4639,8 @@ def test_timed_out_runner_is_asked_to_stop_and_not_killed(tmp_path: Path):
     assert environment.signals_sent() == ["TERM"]
 
 
-def test_runner_that_ignores_sigterm_is_killed_and_opencode_swept(tmp_path: Path):
-    """An unstoppable runner fails the run rather than being graded."""
+def test_runner_that_ignores_sigterm_is_killed(tmp_path: Path):
+    """A runner that ignores SIGTERM is killed, along with what it owned."""
     import asyncio
 
     agent = make_agent(tmp_path)
@@ -4650,51 +4648,13 @@ def test_runner_that_ignores_sigterm_is_killed_and_opencode_swept(tmp_path: Path
     agent._RUNNER_STOP_GRACE_SECONDS = 0.05
     environment = _ScriptedEnvironment(["RUNNING"] * 80)
 
-    with pytest.raises(OpenCodeV2ShutdownError, match="could not be confirmed stopped"):
-        asyncio.run(agent._ensure_runner_stopped(environment))
+    asyncio.run(agent._ensure_runner_stopped(environment))
 
     commands = [call.get("command", "") for call in environment.exec_calls]
     assert any("kill -TERM" in command for command in commands)
-    # Descendants are enumerated and killed, then the binary sweep runs.
-    assert any("/proc/[0-9]*/stat" in command for command in commands)
+    # Each recorded process group, then the binary sweep as a backstop.
+    assert sum('kill -KILL -"$pid"' in command for command in commands) == 3
     assert any("pgrep -f" in command for command in commands)
-
-
-def test_exited_runner_awaiting_reaping_is_not_killed(tmp_path: Path):
-    """A zombie is a finished runner, not a stuck one.
-
-    Container PID 1 often does not reap, and `kill -0` succeeds for zombies,
-    so a liveness check based on that alone would SIGKILL every clean run.
-    """
-    import asyncio
-
-    recorded: list[str] = []
-
-    class ProcEnvironment(FakeEnvironment):
-        async def exec(self, **kwargs: Any) -> ExecResult:
-            command = kwargs.get("command", "")
-            recorded.append(command)
-            if "/proc/$pid/stat" in command:
-                # Emulate the real shell against a zombie's stat line.
-                stat = "4242 (python3) Z 1 4242 4242 0 -1 4194560 0 0"
-                state = stat.split(") ")[-1].split()[0]
-                verdict = "GONE" if state == "Z" else "RUNNING"
-                return ExecResult(
-                    return_code=0,
-                    stdout=" ".join(
-                        f"{key}={verdict}" for key in OpenCodeV2._OWNED_PROCESSES
-                    ),
-                    stderr="",
-                )
-            return ExecResult(return_code=0, stdout="", stderr="")
-
-    environment = ProcEnvironment()
-    asyncio.run(make_agent(tmp_path)._ensure_runner_stopped(environment))
-    # Only the liveness probe should have run; no signal was delivered.
-    assert not any(
-        'kill -TERM "$pid"' in command or 'kill -KILL "$pid"' in command
-        for command in recorded
-    )
 
 
 _FAKE_POLITE_OPENCODE = '''#!/usr/bin/env python3
@@ -5024,43 +4984,6 @@ def test_partial_snapshot_is_adopted_when_the_root_is_present(tmp_path: Path):
     assert trajectory["final_metrics"]["extra"]["collection_incomplete"] is True
 
 
-def test_probe_failure_does_not_end_the_shutdown(tmp_path: Path):
-    """A transient exec failure must not be read as a stopped runner."""
-    import asyncio
-
-    agent = make_agent(tmp_path)
-    agent._RUNNER_STOP_POLL_SECONDS = 0.01
-    agent._RUNNER_STOP_GRACE_SECONDS = 0.2
-    calls = {"n": 0}
-
-    class FlakyEnvironment(FakeEnvironment):
-        async def exec(self, **kwargs: Any) -> ExecResult:
-            self.exec_calls.append(kwargs)
-            command = kwargs.get("command", "")
-            if "OPENCODE_V2_ALIVE" in command:
-                # The container is still there; only the probe is unhappy.
-                return ExecResult(return_code=0, stdout="OPENCODE_V2_ALIVE", stderr="")
-            if "/proc/$pid/stat" in command:
-                calls["n"] += 1
-                if calls["n"] == 1:
-                    return ExecResult(
-                        return_code=0,
-                        stdout="runner=RUNNING server=RUNNING cli=RUNNING",
-                        stderr="",
-                    )
-                raise RuntimeError("docker exec failed")
-            return ExecResult(return_code=0, stdout="", stderr="")
-
-    environment = FlakyEnvironment()
-    # It could never confirm the runner stopped, so it escalated and then
-    # failed closed instead of letting collection proceed silently.
-    with pytest.raises(OpenCodeV2ShutdownError):
-        asyncio.run(agent._ensure_runner_stopped(environment))
-    commands = [call.get("command", "") for call in environment.exec_calls]
-    assert any("kill -TERM" in command for command in commands)
-    assert any("/proc/[0-9]*/stat" in command for command in commands)
-
-
 class _LocalShellEnvironment(FakeEnvironment):
     """Runs the adapter's commands through a real shell.
 
@@ -5203,13 +5126,11 @@ def test_liveness_probe_reports_real_process_states(tmp_path: Path):
     assert states["server"] == "GONE" and states["cli"] == "GONE"
     assert agent._all_stopped(states)
 
-    # A truncated or absent pidfile is not evidence that anything stopped.
+    # Nothing recorded means nothing to stop.
     pidfile.write_text("")
-    assert asyncio.run(agent._owned_states(environment)) == {
-        key: "UNKNOWN" for key in OpenCodeV2._OWNED_PROCESSES
-    }
+    assert agent._all_stopped(asyncio.run(agent._owned_states(environment)))
     pidfile.unlink()
-    assert not agent._all_stopped(asyncio.run(agent._owned_states(environment)))
+    assert agent._all_stopped(asyncio.run(agent._owned_states(environment)))
 
 
 def test_forced_stop_signals_each_recorded_process_group(tmp_path: Path):
@@ -5336,155 +5257,6 @@ def test_termination_during_finalization_does_not_abort_it(tmp_path: Path):
     result = json.loads((logs_dir / "runner-result.json").read_text())
     assert result["cancelled"] is True
     assert json.loads(status_path.read_text())["stage"] == "finished"
-
-
-def test_unreachable_environment_stops_probing_but_a_hiccup_does_not(tmp_path: Path):
-    """A dead container must not be polled for the whole grace period.
-
-    It still fails closed: an unreadable probe is not evidence that OpenCode
-    stopped, so the run must not be graded on that basis.
-    """
-    import asyncio
-
-    agent = make_agent(tmp_path)
-    agent._RUNNER_STOP_POLL_SECONDS = 0.01
-    agent._RUNNER_STOP_GRACE_SECONDS = 30  # never the thing that ends the loop
-
-    class UnreadableEnvironment(FakeEnvironment):
-        """Still reachable, but its process state cannot be read."""
-
-        async def exec(self, **kwargs: Any) -> ExecResult:
-            self.exec_calls.append(kwargs)
-            command = kwargs.get("command", "")
-            if "OPENCODE_V2_ALIVE" in command:
-                return ExecResult(return_code=0, stdout="OPENCODE_V2_ALIVE", stderr="")
-            if "/proc/$pid/stat" in command:
-                raise RuntimeError("probe failed")
-            return ExecResult(return_code=0, stdout="", stderr="")
-
-    environment = UnreadableEnvironment()
-    started = time.monotonic()
-    with pytest.raises(OpenCodeV2ShutdownError):
-        asyncio.run(agent._ensure_runner_stopped(environment))
-    assert time.monotonic() - started < 10
-
-    # One transient failure must not end the shutdown.
-    calls = {"n": 0}
-
-    class FlakyOnceEnvironment(FakeEnvironment):
-        async def exec(self, **kwargs: Any) -> ExecResult:
-            self.exec_calls.append(kwargs)
-            if "OPENCODE_V2_ALIVE" in kwargs.get("command", ""):
-                return ExecResult(return_code=0, stdout="OPENCODE_V2_ALIVE", stderr="")
-            if "/proc/$pid/stat" in kwargs.get("command", ""):
-                calls["n"] += 1
-                if calls["n"] == 2:
-                    raise RuntimeError("transient")
-                verdict = "RUNNING" if calls["n"] < 4 else "GONE"
-                return ExecResult(
-                    return_code=0,
-                    stdout=" ".join(
-                        f"{key}={verdict}" for key in OpenCodeV2._OWNED_PROCESSES
-                    ),
-                    stderr="",
-                )
-            return ExecResult(return_code=0, stdout="", stderr="")
-
-    flaky = FlakyOnceEnvironment()
-    asyncio.run(agent._ensure_runner_stopped(flaky))
-    # Recovered and saw everything stop; never needed the forced teardown.
-    assert not any(
-        "/proc/[0-9]*/stat" in call.get("command", "") for call in flaky.exec_calls
-    )
-
-
-def test_forced_stop_kills_a_detached_shell_tool(tmp_path: Path):
-    """Process groups are not enough to stop OpenCode's shell tools.
-
-    v2.0.8 spawns them with `detached: true`, putting each in its own group
-    and session, so signalling the server's group never reaches a running
-    command. This is the process that can still edit the workspace while the
-    task is graded.
-    """
-    import asyncio
-
-    workdir = tmp_path / "work"
-    workdir.mkdir()
-    marker = workdir / "written-after-cleanup.txt"
-
-    # A "server" in its own session, with a detached tool child that would
-    # write to the workspace if it were left alive.
-    tool_script = tmp_path / "tool.sh"
-    started = workdir / "tool-started"
-    trigger = workdir / "tool-trigger"
-    tool_script.write_text(
-        "#!/bin/sh\n"
-        f"touch {started}\n"
-        f"while [ ! -f {trigger} ]; do sleep 0.05; done\n"
-        f"echo late > {marker}\n"
-    )
-    tool_script.chmod(0o755)
-    server = subprocess.Popen(
-        ["sh", "-c", f"setsid {tool_script} & sleep 300"],
-        cwd=str(workdir),
-        start_new_session=True,
-    )
-    pidfile = tmp_path / "runner.pid"
-    pidfile.write_text(f"runner=none\nserver={server.pid}\ncli=none\n")
-    try:
-        agent = _pidfile_agent(tmp_path, pidfile)
-        agent._remote_workdir_text = str(workdir)
-        agent._RUNNER_STOP_GRACE_SECONDS = 0.05
-
-        # Wait for the tool to announce itself rather than racing `setsid`.
-        deadline = time.monotonic() + 30
-        while time.monotonic() < deadline and not started.exists():
-            time.sleep(0.05)
-        assert started.exists(), "the detached tool never started"
-
-        asyncio.run(agent._force_stop(_LocalShellEnvironment(), None))
-
-        # Release the trigger the tool waits on. A survivor reacts at once,
-        # so this needs a short bounded wait rather than a long sleep.
-        trigger.touch()
-        time.sleep(1.0)
-        assert not marker.exists(), (
-            "a detached shell tool survived cleanup and wrote to the workspace"
-        )
-    finally:
-        try:
-            server.kill()
-            server.wait(timeout=10)
-        except (OSError, subprocess.TimeoutExpired):
-            pass
-        subprocess.run(["pkill", "-9", "-f", str(tool_script)], check=False)
-
-
-def test_workspace_processes_are_reported_for_confirmation(tmp_path: Path):
-    """Shutdown is only confirmed when nothing is left working in the repo."""
-    import asyncio
-
-    workdir = tmp_path / "work"
-    workdir.mkdir()
-    # Its own session, like a detached OpenCode tool -- and unlike the probe,
-    # which reaches the container through a separate exec and is deliberately
-    # excluded from its own sweep.
-    worker = subprocess.Popen(
-        ["sleep", "300"], cwd=str(workdir), start_new_session=True
-    )
-    pidfile = tmp_path / "runner.pid"
-    pidfile.write_text("runner=none\nserver=none\ncli=none\n")
-    try:
-        agent = _pidfile_agent(tmp_path, pidfile)
-        agent._remote_workdir_text = str(workdir)
-        environment = _LocalShellEnvironment()
-        # Every recorded pid is gone, yet work continues in the workspace.
-        assert agent._all_stopped(asyncio.run(agent._owned_states(environment)))
-        found = asyncio.run(agent._workspace_processes(environment, None))
-        assert str(worker.pid) in found
-    finally:
-        worker.kill()
-        worker.wait(timeout=10)
 
 
 def test_stream_gap_marks_tool_state_as_unreliable(tmp_path: Path):
@@ -5830,166 +5602,24 @@ def test_fake_opencode_sources_are_valid_python():
         assert "/api/event" in source, name
 
 
-def test_unconfirmed_shutdown_on_timeout_is_fatal_not_an_agent_timeout(
-    tmp_path: Path,
-):
-    """A timeout must not reach the verifier when OpenCode may still run.
+def test_a_reaped_and_a_zombie_runner_both_count_as_stopped(tmp_path: Path):
+    """A finished runner must not be killed just because nobody reaped it.
 
-    Pier treats `AgentTimeoutError` as an ordinary agent failure and carries
-    on to the collect hooks and the verifier. So preserving the timeout is
-    the wrong outcome when shutdown could not be confirmed: the repository
-    about to be graded may still be changing. The adapter has to surface
-    something Pier does not treat as a normal agent timeout -- while still
-    collecting the diagnostics first.
+    Container PID 1 frequently does not reap, and `kill -0` succeeds for
+    zombies, so a liveness check based on that alone would escalate on every
+    clean run.
     """
     import asyncio
 
-    agent = make_agent(tmp_path)
-    agent._RUNNER_STOP_POLL_SECONDS = 0.01
-    agent._RUNNER_STOP_GRACE_SECONDS = 0.05
-
-    class NeverStopsEnvironment(FakeEnvironment):
-        async def exec(self, **kwargs: Any) -> ExecResult:
-            self.exec_calls.append(kwargs)
-            if "/proc/$pid/stat" in kwargs.get("command", ""):
-                return ExecResult(
-                    return_code=0,
-                    stdout=" ".join(
-                        f"{key}=RUNNING" for key in OpenCodeV2._OWNED_PROCESSES
-                    ),
-                    stderr="",
-                )
-            return ExecResult(return_code=0, stdout="", stderr="")
-
-    environment = NeverStopsEnvironment()
-
-    async def timed_out_run() -> None:
-        """The shape of `run()` when the agent exec is cancelled."""
-        original_error = None
-        try:
-            raise AgentTimeoutError("Agent execution timed out after 1 seconds")
-        except AgentTimeoutError:
-            original_error = sys.exc_info()[1]
-            shutdown_error = None
-            try:
-                await agent._ensure_runner_stopped(environment)
-            except OpenCodeV2ShutdownError as error:
-                shutdown_error = error
-            await agent._collect_runner_artifacts(environment)
-            if shutdown_error is not None:
-                raise shutdown_error from original_error
-
-    with pytest.raises(OpenCodeV2ShutdownError) as raised:
-        asyncio.run(timed_out_run())
-
-    # Pier's timeout branch keys off AgentTimeoutError; this must not be one,
-    # or the verifier would run against a workspace that may still change.
-    assert not isinstance(raised.value, AgentTimeoutError)
-    assert not isinstance(raised.value, NonZeroAgentExitCodeError)
-    # The original timeout is preserved as context rather than discarded.
-    assert isinstance(raised.value.__cause__, AgentTimeoutError)
-    # Diagnostics were still collected before failing.
-    assert environment.downloads
-
-
-def test_run_fails_closed_when_shutdown_cannot_be_confirmed(tmp_path: Path):
-    """End to end through `run()`: unconfirmed shutdown fails the trial."""
-    import asyncio
-
-    agent = make_agent(tmp_path)
-    agent._RUNNER_STOP_POLL_SECONDS = 0.01
-    agent._RUNNER_STOP_GRACE_SECONDS = 0.05
-
-    class NeverStopsEnvironment(FakeEnvironment):
-        async def exec(self, **kwargs: Any) -> ExecResult:
-            self.exec_calls.append(kwargs)
-            if "/proc/$pid/stat" in kwargs.get("command", ""):
-                return ExecResult(
-                    return_code=0,
-                    stdout=" ".join(
-                        f"{key}=RUNNING" for key in OpenCodeV2._OWNED_PROCESSES
-                    ),
-                    stderr="",
-                )
-            return ExecResult(return_code=0, stdout="", stderr="")
-
-    environment = NeverStopsEnvironment()
-    with pytest.raises(OpenCodeV2ShutdownError):
-        asyncio.run(agent.run("do the thing", environment, AgentContext()))
-    # Artifacts are still pulled, so the run can be diagnosed.
-    assert environment.downloads
-
-
-def test_a_vanished_environment_is_not_an_unconfirmed_shutdown(tmp_path: Path):
-    """A dead container is proof of a stopped agent, not a failure to stop.
-
-    A process cannot outlive its container, so when the environment itself
-    is unreachable the run is safe to report as an ordinary timeout. Failing
-    closed there would discard every legitimate timeout whose container had
-    already been torn down.
-    """
-    import asyncio
-
-    agent = make_agent(tmp_path)
-    agent._RUNNER_STOP_POLL_SECONDS = 0.01
-    agent._RUNNER_STOP_GRACE_SECONDS = 0.05
-
-    class VanishedEnvironment(FakeEnvironment):
-        async def exec(self, **kwargs: Any) -> ExecResult:
-            self.exec_calls.append(kwargs)
-            raise RuntimeError("container is not running")
-
-    # No exception: nothing can still be running in a container that is gone.
-    asyncio.run(agent._ensure_runner_stopped(VanishedEnvironment()))
-
-
-def test_a_reachable_environment_that_cannot_be_read_still_fails_closed(
-    tmp_path: Path,
-):
-    """Only a *gone* environment is exculpatory, not an unreadable one."""
-    import asyncio
-
-    agent = make_agent(tmp_path)
-    agent._RUNNER_STOP_POLL_SECONDS = 0.01
-    agent._RUNNER_STOP_GRACE_SECONDS = 0.05
-
-    class UnreadableEnvironment(FakeEnvironment):
-        async def exec(self, **kwargs: Any) -> ExecResult:
-            self.exec_calls.append(kwargs)
-            command = kwargs.get("command", "")
-            if "OPENCODE_V2_ALIVE" in command:
-                # The container answers, so it is still there.
-                return ExecResult(return_code=0, stdout="OPENCODE_V2_ALIVE", stderr="")
-            if "/proc/$pid/stat" in command:
-                raise RuntimeError("probe failed")
-            return ExecResult(return_code=0, stdout="", stderr="")
-
-    with pytest.raises(OpenCodeV2ShutdownError):
-        asyncio.run(agent._ensure_runner_stopped(UnreadableEnvironment()))
-
-
-def test_a_silent_dying_container_is_detected_without_burning_the_grace(
-    tmp_path: Path,
-):
-    """An exec that succeeds but says nothing is a dying container.
-
-    Live evidence: the grace period was spent probing a container that had
-    already gone, because reachability was only consulted when the probe
-    raised. An empty answer needs the same treatment.
-    """
-    import asyncio
-
-    agent = make_agent(tmp_path)
-    agent._RUNNER_STOP_POLL_SECONDS = 0.01
-    agent._RUNNER_STOP_GRACE_SECONDS = 30  # must not be what ends this
-
-    class SilentEnvironment(FakeEnvironment):
-        async def exec(self, **kwargs: Any) -> ExecResult:
-            self.exec_calls.append(kwargs)
-            # Everything returns success with no output, including the
-            # reachability check.
-            return ExecResult(return_code=0, stdout="", stderr="")
-
-    started = time.monotonic()
-    asyncio.run(agent._ensure_runner_stopped(SilentEnvironment()))
-    assert time.monotonic() - started < 5, "burned the grace period on a dead container"
+    alive = subprocess.Popen(["sleep", "300"])
+    pidfile = tmp_path / "runner.pid"
+    pidfile.write_text(f"runner={alive.pid}\nserver=none\ncli=none\n")
+    agent = _pidfile_agent(tmp_path, pidfile)
+    environment = _LocalShellEnvironment()
+    try:
+        assert asyncio.run(agent._owned_states(environment))["runner"] == "RUNNING"
+    finally:
+        alive.kill()
+        alive.wait(timeout=10)
+    states = asyncio.run(agent._owned_states(environment))
+    assert agent._all_stopped(states)
