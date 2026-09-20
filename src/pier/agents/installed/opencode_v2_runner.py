@@ -69,6 +69,8 @@ RUNNER_PIDFILE = "opencode-v2-runner.pid"
 TOOL_INPUT_PREVIEW_BYTES = 2048
 EVENT_STREAM_RECONNECT_DELAY = 1.0
 EVENT_STREAM_MAX_RECONNECTS = 20
+EVENT_LINE_MAX_BYTES = 4 * 1024 * 1024
+EVENT_LINE_DISCARD_MAX_BYTES = 64 * 1024 * 1024
 
 # Graceful shutdown ladder. Interrupting the session is how OpenCode is meant
 # to be stopped: it aborts the model turn and its running tools itself and
@@ -381,7 +383,6 @@ class LiveRecorder:
             )
             self._last_agent_activity = now
             self._status["last_agent_activity_at"] = _iso(time.time())
-            self._status["event_stream_connected"] = True
             if isinstance(event, dict):
                 self._track_tool(event)
             write_due = now - self._last_status_write >= STATUS_MIN_INTERVAL_SECONDS
@@ -675,6 +676,21 @@ class OpenCodeEventStream:
                 f"gave up after {EVENT_STREAM_MAX_RECONNECTS} reconnect attempts",
             )
 
+    def _discard_oversized_line(self, response: Any, seen: int) -> None:
+        """Drop the remainder of an over-long event, recording only a summary."""
+        while not self._stop.is_set():
+            chunk = response.readline(EVENT_LINE_MAX_BYTES)
+            if not chunk:
+                break
+            seen += len(chunk)
+            if chunk.endswith(b"\n") or seen > EVENT_LINE_DISCARD_MAX_BYTES:
+                break
+        self.recorder.note(
+            "event-line-oversize",
+            f"discarded an event line of at least {seen} bytes "
+            f"(limit {EVENT_LINE_MAX_BYTES})",
+        )
+
     def _consume(self) -> None:
         request = urllib.request.Request(
             self.url,
@@ -686,10 +702,21 @@ class OpenCodeEventStream:
         response = urllib.request.urlopen(request)
         with self._lock:
             self._response = response
+        # Report connectivity at the boundary: a feed that is connected but
+        # quiet is not the same as one that never attached, and a later
+        # disconnect must not leave the field stuck on true.
+        self.recorder.update(event_stream_connected=True)
         try:
-            for raw in response:
-                if self._stop.is_set():
+            while not self._stop.is_set():
+                # Bounded read: iterating the response would call an
+                # unbounded readline(), so a single event without a newline
+                # could consume arbitrary memory before any cap applies.
+                raw = response.readline(EVENT_LINE_MAX_BYTES + 1)
+                if not raw:
                     return
+                if len(raw) > EVENT_LINE_MAX_BYTES:
+                    self._discard_oversized_line(response, len(raw))
+                    continue
                 line = raw.decode("utf-8", "replace").rstrip("\n")
                 if not line.startswith("data:"):
                     continue  # heartbeat comments and frame separators
@@ -701,6 +728,7 @@ class OpenCodeEventStream:
             with self._lock:
                 if self._response is response:
                     self._response = None
+            self.recorder.update(event_stream_connected=False)
             try:
                 response.close()
             except Exception:
@@ -1081,15 +1109,21 @@ class OpenCodeV2Server:
             if isinstance(info, dict) and info.get("type") == "running"
         }
 
-    def interrupt_session(self, session_id: str) -> None:
+    def interrupt_session(self, session_id: str) -> bool:
+        """Ask the server to abort a session. True only if it accepted.
+
+        A rejected or unreachable interrupt leaves the session running, so
+        callers must not record it as stopped.
+        """
         if not self.url:
-            return
-        http_post(
+            return False
+        status = http_post(
             self._api_url(f"api/session/{session_id}/interrupt"),
             self.password,
             {},
             timeout=self._request_timeout(10.0),
         )
+        return 200 <= status < 300
 
     def wait_session(
         self, session_id: str, timeout: float = SESSION_WAIT_REQUEST_SECONDS
@@ -1728,6 +1762,26 @@ def _raise_runner_failure(
     # Observational gaps withhold complete aggregates through runner-result.
 
 
+def _inspect_each(
+    server: OpenCodeV2Server,
+    sessions: list[dict],
+    errors: list[str],
+) -> list[dict]:
+    """Inspect sessions one by one, keeping whatever succeeds.
+
+    These run on the timeout and abort paths, where the evidence is often all
+    that survives; one failing session must not discard the rest.
+    """
+    inspections: list[dict] = []
+    for session in sessions:
+        try:
+            inspections.append(server.inspect_session(session))
+        except Exception as error:
+            session_id = str(session.get("id") or "unknown")
+            errors.append(f"inspect {session_id}: {type(error).__name__}: {error}")
+    return inspections
+
+
 def _collect_tree(
     server: OpenCodeV2Server,
     root_id: str,
@@ -1852,7 +1906,7 @@ def _collect_tree(
                 str(session.get("id")) for session in sessions if session.get("id")
             )
             server.interrupt_all(known_ids)
-            inspections = [server.inspect_session(session) for session in sessions]
+            inspections = _inspect_each(server, sessions, errors)
             if recorder is not None:
                 recorder.write_partial_sessions(inspections)
         except Exception as error:
@@ -1887,9 +1941,14 @@ def _request_graceful_stop(
         if not session_id or session_id in already:
             continue
         try:
-            server.interrupt_session(session_id)
+            accepted = server.interrupt_session(session_id)
         except Exception as error:
             errors.append(f"interrupt {session_id}: {type(error).__name__}: {error}")
+            continue
+        if not accepted:
+            # Still running server-side, so leave it eligible for the next
+            # attempt rather than recording it as stopped.
+            errors.append(f"interrupt {session_id}: server rejected the request")
             continue
         stopped.append(session_id)
     if stopped:
@@ -2009,10 +2068,20 @@ def main() -> None:
     # Start recording before anything else can fail, so even an immediate
     # crash leaves a stage behind.
     recorder = LiveRecorder(logs_dir)
-    try:
-        (logs_dir / RUNNER_PIDFILE).write_text(f"{os.getpid()}\n")
-    except OSError as error:
-        recorder.note("pidfile-failed", f"{type(error).__name__}: {error}")
+    # ``key=pid`` lines so a forced teardown can signal each owned process
+    # group by name. The server and CLI are session leaders, so their groups
+    # cover the tools they spawn.
+    owned_pids: dict[str, int] = {"runner": os.getpid()}
+
+    def write_pidfile() -> None:
+        try:
+            (logs_dir / RUNNER_PIDFILE).write_text(
+                "".join(f"{key}={pid}\n" for key, pid in owned_pids.items())
+            )
+        except OSError as error:
+            recorder.note("pidfile-failed", f"{type(error).__name__}: {error}")
+
+    write_pidfile()
     work_dir = Path(args.work_dir).resolve()
     instruction = Path(args.instruction_file).read_text()
     binary = resolve_binary(args.binary)
@@ -2086,6 +2155,9 @@ def main() -> None:
         recorder.stage("server-starting")
         server.start()
         assert server.url is not None
+        if server.process is not None:
+            owned_pids["server"] = server.process.pid
+            write_pidfile()
         recorder.stage(
             "server-started",
             server_started=True,
@@ -2214,6 +2286,8 @@ def main() -> None:
         )
         stdout_thread.start()
         stderr_thread.start()
+        owned_pids["cli"] = cli_process.pid
+        write_pidfile()
         recorder.stage("cli-started", cli_started=True, cli_pid=cli_process.pid)
         try:
             cli_returncode = cli_process.wait()
@@ -2333,7 +2407,7 @@ def main() -> None:
                     recorder=recorder,
                 )
             else:
-                inspections = [server.inspect_session(item) for item in discovered]
+                inspections = _inspect_each(server, discovered, collection_errors)
         except Exception as cleanup_error:
             collection_errors.append(
                 f"partial collection: {type(cleanup_error).__name__}: {cleanup_error}"

@@ -1314,6 +1314,23 @@ class OpenCodeV2(BaseInstalledAgent):
         )
         return (getattr(result, "stdout", "") or "").strip()
 
+    async def _runner_state(
+        self, environment: BaseEnvironment, env: dict[str, str] | None = None
+    ) -> str:
+        """``GONE``, ``RUNNING``, or ``UNKNOWN`` when the probe itself failed.
+
+        ``UNKNOWN`` deliberately is not ``GONE``: a transient exec failure
+        must not end the shutdown and let collection start under a live
+        runner.
+        """
+        try:
+            return (
+                "RUNNING" if await self._runner_is_running(environment, env) else "GONE"
+            )
+        except Exception:
+            self.logger.debug("Could not probe the OpenCode V2 runner")
+            return "UNKNOWN"
+
     async def _runner_is_running(
         self, environment: BaseEnvironment, env: dict[str, str] | None = None
     ) -> bool:
@@ -1328,7 +1345,7 @@ class OpenCodeV2(BaseInstalledAgent):
         # reason. Read the process state and treat Z as gone.
         answer = await self._probe(
             environment,
-            f"pid=$(cat {pidfile} 2>/dev/null); "
+            f"pid=$(sed -n 's/^runner=//p' {pidfile} 2>/dev/null); "
             'if [ -z "$pid" ]; then echo GONE; '
             'elif [ -r "/proc/$pid/stat" ]; then '
             "  state=$(sed 's/.*) //' \"/proc/$pid/stat\" | cut -d' ' -f1); "
@@ -1350,12 +1367,9 @@ class OpenCodeV2(BaseInstalledAgent):
         that ignores that is killed, and only then is a stray OpenCode process
         swept up.
         """
-        try:
-            if not await self._runner_is_running(environment, env):
-                return  # the normal path: it already exited on its own
-        except Exception:
-            self.logger.debug("Could not probe the OpenCode V2 runner")
-            return
+        state = await self._runner_state(environment, env)
+        if state == "GONE":
+            return  # the normal path: it already exited on its own
 
         self.logger.warning(
             "OpenCode V2 runner is still running; requesting graceful shutdown"
@@ -1367,27 +1381,49 @@ class OpenCodeV2(BaseInstalledAgent):
             env,
         )
 
+        # An unreadable probe is not evidence of a stopped runner, so keep
+        # retrying inside the grace period rather than assuming success.
         deadline = time.monotonic() + self._RUNNER_STOP_GRACE_SECONDS
         while time.monotonic() < deadline:
             await asyncio.sleep(self._RUNNER_STOP_POLL_SECONDS)
-            try:
-                if not await self._runner_is_running(environment, env):
-                    self.logger.info("OpenCode V2 runner shut down gracefully")
-                    return
-            except Exception:
+            if await self._runner_state(environment, env) == "GONE":
+                self.logger.info("OpenCode V2 runner shut down gracefully")
                 return
 
-        # It ignored SIGTERM. Kill it, then sweep any OpenCode process it owned,
-        # because its own cleanup never got to run.
         self.logger.warning(
-            "OpenCode V2 runner ignored SIGTERM after %.0fs; killing it",
+            "OpenCode V2 runner did not stop within %.0fs; forcing termination",
             self._RUNNER_STOP_GRACE_SECONDS,
         )
-        await self._probe(
-            environment,
-            f'pid=$(cat {pidfile} 2>/dev/null); [ -n "$pid" ] && kill -KILL "$pid"',
-            env,
-        )
+        await self._force_stop(environment, env)
+
+        if await self._runner_state(environment, env) != "GONE":
+            # Say so loudly: whatever is collected next was taken while
+            # OpenCode could still be writing.
+            self.logger.error(
+                "OpenCode V2 could not be confirmed stopped; artifacts may be "
+                "collected while it is still running"
+            )
+
+    async def _force_stop(
+        self, environment: BaseEnvironment, env: dict[str, str] | None
+    ) -> None:
+        """Tear down everything the runner owned.
+
+        The runner's own cleanup never ran, so kill by process group. The
+        server and CLI are each session leaders, so a negative-pid signal
+        reaches the tools they spawned too; killing only the recorded pids
+        would orphan a running `bash` and leave it writing to the workspace.
+        """
+        pidfile = shlex.quote(self._RUNNER_PIDFILE.as_posix())
+        for key in ("cli", "server", "runner"):
+            await self._probe(
+                environment,
+                f"pid=$(sed -n 's/^{key}=//p' {pidfile} 2>/dev/null); "
+                'if [ -n "$pid" ]; then kill -KILL -"$pid" 2>/dev/null || '
+                'kill -KILL "$pid" 2>/dev/null; fi',
+                env,
+            )
+        # Anything that escaped its group still runs the OpenCode binary.
         await self._probe(
             environment,
             f"pkill -KILL -f {shlex.quote(self._REMOTE_BINARY.as_posix())}",
@@ -2663,6 +2699,7 @@ class OpenCodeV2(BaseInstalledAgent):
             self.logs_dir / "opencode-v2" / "opencode-v2-sessions.jsonl"
         )
         partial_sessions_used = False
+        live_evidence: dict[str, Any] | None = None
         if not inspections:
             # The final dump only exists if the runner finished collecting.
             # The settle loop persists each snapshot it builds, so an
@@ -2672,13 +2709,32 @@ class OpenCodeV2(BaseInstalledAgent):
                 self.logs_dir / "opencode-v2" / "opencode-v2-sessions.partial.jsonl"
             )
             if partial:
-                self.logger.warning(
-                    "Using %d partial OpenCode V2 session snapshot record(s); "
-                    "the runner did not finish collection",
-                    len(partial),
-                )
-                inspections = partial
-                partial_sessions_used = True
+                # Only adopt the partial snapshot when a confirmed root is
+                # actually in it. Otherwise root selection would fall back to
+                # graph inference and could crown an orphaned child -- a
+                # snapshot taken mid-collection often holds a child whose
+                # parent was not fetched -- giving the run the wrong identity.
+                live_evidence = self._live_evidence()
+                validated_root = live_evidence.get("validated_root_id")
+                snapshot_ids = {
+                    str((record.get("session") or {}).get("id"))
+                    for record in partial
+                    if isinstance(record.get("session"), dict)
+                }
+                if validated_root and str(validated_root) in snapshot_ids:
+                    self.logger.warning(
+                        "Using %d partial OpenCode V2 session snapshot record(s); "
+                        "the runner did not finish collection",
+                        len(partial),
+                    )
+                    inspections = partial
+                    partial_sessions_used = True
+                else:
+                    self.logger.warning(
+                        "Ignoring %d partial OpenCode V2 session record(s): no "
+                        "confirmed root session is present in them",
+                        len(partial),
+                    )
         valid_inspections = [
             record
             for record in inspections
@@ -2693,7 +2749,8 @@ class OpenCodeV2(BaseInstalledAgent):
         if not inspections:
             # Only read now: the CLI stream can be large and a successful
             # collection never looks at it.
-            live_evidence = self._live_evidence()
+            if live_evidence is None:
+                live_evidence = self._live_evidence()
             raw_collection_errors = (runner_result or {}).get("collection_errors")
             collection_errors = [
                 str(error)
@@ -2794,7 +2851,9 @@ class OpenCodeV2(BaseInstalledAgent):
             if runner_result and runner_result.get("root_id")
             else None
         )
-        root = self._select_root(trajectories, recorded_root_id)
+        if partial_sessions_used and not recorded_root_id:
+            recorded_root_id = str((live_evidence or {}).get("validated_root_id") or "")
+        root = self._select_root(trajectories, recorded_root_id or None)
         if root is None:
             self._raise_model_restriction_failure(restriction_mismatches)
             return

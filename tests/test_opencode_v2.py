@@ -3799,6 +3799,9 @@ def test_partial_snapshot_becomes_a_real_but_incomplete_trajectory(tmp_path: Pat
     """Collection that was interrupted still yields real steps, never a stub."""
     runner_dir = tmp_path / "opencode-v2"
     runner_dir.mkdir()
+    (runner_dir / "opencode-v2-status.json").write_text(
+        json.dumps({"stage": "collecting", "root_id": "ses_partial"})
+    )
     (runner_dir / "opencode-v2-sessions.partial.jsonl").write_text(
         json.dumps(
             {
@@ -3943,6 +3946,7 @@ def test_degraded_download_fetches_every_live_artifact(tmp_path: Path):
         runner_module.PARTIAL_SESSIONS_FILENAME,
         runner_module.CLI_STDERR_FILENAME,
         runner_module.SERVER_STDERR_FILENAME,
+        runner_module.EVENTS_FILENAME,
     ):
         assert name in fetched, f"{name} would be lost when download_dir is absent"
 
@@ -4535,6 +4539,7 @@ def test_sessions_are_interrupted_before_any_signal(tmp_path, monkeypatch):
 
         def interrupt_session(self, session_id):
             order.append(f"interrupt:{session_id}")
+            return True
 
     server = Server(binary="x", cwd=str(tmp_path), password="p", env={})
     errors: list[str] = []
@@ -4608,8 +4613,17 @@ def test_runner_that_ignores_sigterm_is_killed_and_opencode_swept(tmp_path: Path
     agent._RUNNER_STOP_GRACE_SECONDS = 0.05
     environment = _ScriptedEnvironment(["RUNNING"] * 50)
     asyncio.run(agent._ensure_runner_stopped(environment))
-    # Its own cleanup never ran, so the owned OpenCode processes are swept.
-    assert environment.signals_sent() == ["TERM", "KILL", "SWEEP"]
+    # Its own cleanup never ran, so every owned process group is torn down
+    # (the CLI's group covers the tools it spawned) and then swept.
+    assert environment.signals_sent() == ["TERM", "KILL", "KILL", "KILL", "SWEEP"]
+    killed = [
+        call["command"]
+        for call in environment.exec_calls
+        if 'kill -KILL -"$pid"' in call.get("command", "")
+    ]
+    assert len(killed) == 3
+    for key in ("cli=", "server=", "runner="):
+        assert any(key in command for command in killed), key
 
 
 def test_exited_runner_awaiting_reaping_is_not_killed(tmp_path: Path):
@@ -4768,7 +4782,10 @@ def test_timeout_shutdown_stops_opencode_without_killing_it(tmp_path: Path):
             time.sleep(0.05)
 
         # Exactly what the adapter does when the agent times out.
-        os.kill(int(pidfile.read_text().strip()), signal.SIGTERM)
+        pids = dict(
+            line.split("=", 1) for line in pidfile.read_text().split() if "=" in line
+        )
+        os.kill(int(pids["runner"]), signal.SIGTERM)
         process.wait(timeout=90)
     finally:
         try:
@@ -4793,3 +4810,194 @@ def test_timeout_shutdown_stops_opencode_without_killing_it(tmp_path: Path):
         ["pgrep", "-f", str(binary)], capture_output=True, text=True
     ).stdout.split()
     assert not survivors, f"OpenCode processes survived shutdown: {survivors}"
+
+
+def test_rejected_interrupt_is_not_recorded_as_stopped(tmp_path):
+    """A refused interrupt leaves the session running, so it must retry."""
+    recorder = runner_module.LiveRecorder(tmp_path, echo=False, heartbeat_seconds=0)
+    attempts: list[str] = []
+
+    class Server(runner_module.OpenCodeV2Server):
+        def collect_sessions(self, parent_id=None):
+            return [{"id": "ses_ok"}, {"id": "ses_refused"}]
+
+        def interrupt_session(self, session_id):
+            attempts.append(session_id)
+            return session_id == "ses_ok"
+
+    server = Server(binary="x", cwd=str(tmp_path), password="p", env={})
+    errors: list[str] = []
+    stopped = runner_module._request_graceful_stop(server, recorder, errors)
+    assert stopped == ["ses_ok"]
+    assert any("ses_refused" in item for item in errors)
+
+    # The refused session is still eligible, so a later pass retries it.
+    runner_module._request_graceful_stop(server, recorder, errors, already=set(stopped))
+    recorder.close()
+    assert attempts == ["ses_ok", "ses_refused", "ses_refused"]
+
+
+def test_interrupt_session_reports_whether_the_server_accepted(tmp_path, monkeypatch):
+    server = runner_module.OpenCodeV2Server(
+        binary="x", cwd=str(tmp_path), password="p", env={}
+    )
+    server.url = "http://127.0.0.1:1"
+    for status, expected in (
+        (200, True),
+        (204, True),
+        (409, False),
+        (500, False),
+        (0, False),
+    ):
+        monkeypatch.setattr(runner_module, "http_post", lambda *a, _s=status, **k: _s)
+        assert server.interrupt_session("ses_1") is expected
+
+
+def test_failed_inspection_keeps_the_other_sessions(tmp_path):
+    """Timeout and abort paths must not discard a whole batch."""
+
+    class Server(runner_module.OpenCodeV2Server):
+        def inspect_session(self, session, active_ids=None):
+            if session["id"] == "ses_bad":
+                raise TimeoutError("page timed out")
+            return {"session": session, "messages": []}
+
+    server = Server(binary="x", cwd=str(tmp_path), password="p", env={})
+    errors: list[str] = []
+    kept = runner_module._inspect_each(
+        server, [{"id": "ses_a"}, {"id": "ses_bad"}, {"id": "ses_b"}], errors
+    )
+    assert [item["session"]["id"] for item in kept] == ["ses_a", "ses_b"]
+    assert any("ses_bad" in item for item in errors)
+
+
+def test_oversized_event_line_is_discarded_not_buffered(tmp_path):
+    """One newline-less event must not be read into memory unbounded."""
+    import io
+
+    recorder = runner_module.LiveRecorder(tmp_path, echo=False, heartbeat_seconds=0)
+    stream = OpenCodeEventStreamProbe(recorder)
+    huge = b"data: " + b"x" * (runner_module.EVENT_LINE_MAX_BYTES * 2) + b"\n"
+    good = b'data: {"type": "session.idle", "data": {}}\n'
+    stream.feed(io.BytesIO(huge + good))
+    recorder.close()
+
+    # The oversized frame is summarised, not stored ...
+    incidents = (tmp_path / runner_module.INCIDENTS_FILENAME).read_text()
+    assert "event-line-oversize" in incidents
+    events = (tmp_path / runner_module.EVENTS_FILENAME).read_text()
+    assert "xxxx" not in events
+    # ... and the following well-formed event is still processed.
+    assert "session.idle" in events
+
+
+class OpenCodeEventStreamProbe(runner_module.OpenCodeEventStream):
+    """Drives the SSE read loop against an in-memory response."""
+
+    def __init__(self, recorder):
+        super().__init__("http://127.0.0.1:1", "p", recorder)
+
+    def feed(self, response):
+        import urllib.request
+
+        original = urllib.request.urlopen
+        urllib.request.urlopen = lambda *a, **k: response
+        try:
+            self._consume()
+        finally:
+            urllib.request.urlopen = original
+
+
+def test_partial_snapshot_without_a_confirmed_root_is_not_adopted(tmp_path: Path):
+    """An orphaned child must never inherit the run's identity.
+
+    A snapshot taken mid-collection often holds a child whose parent was not
+    fetched. With no confirmed root, graph inference would crown that child.
+    """
+    runner_dir = tmp_path / "opencode-v2"
+    runner_dir.mkdir()
+    (runner_dir / "opencode-v2-status.json").write_text(
+        json.dumps({"stage": "collecting", "root_candidates": ["ses_parent"]})
+    )
+    (runner_dir / "opencode-v2-sessions.partial.jsonl").write_text(
+        json.dumps(
+            {
+                "session": {"id": "ses_orphan", "parentID": "ses_parent"},
+                "messages": [],
+                "active": None,
+                "inbox": [],
+            }
+        )
+        + "\n"
+    )
+
+    make_agent(tmp_path).populate_context_post_run(AgentContext())
+
+    trajectory = json.loads((tmp_path / "trajectory.json").read_text())
+    assert trajectory.get("trajectory_id") is None
+    assert trajectory.get("session_id") is None
+    # The evidence is still reported, just not as a trajectory identity.
+    assert trajectory["steps"][0]["extra"]["collection_gap"] is True
+
+
+def test_partial_snapshot_is_adopted_when_the_root_is_present(tmp_path: Path):
+    runner_dir = tmp_path / "opencode-v2"
+    runner_dir.mkdir()
+    (runner_dir / "opencode-v2-status.json").write_text(
+        json.dumps({"stage": "collecting", "root_id": "ses_root"})
+    )
+    (runner_dir / "opencode-v2-sessions.partial.jsonl").write_text(
+        "".join(
+            json.dumps(record) + "\n"
+            for record in (
+                {
+                    "session": {"id": "ses_root", "parentID": None},
+                    "messages": [],
+                    "active": None,
+                    "inbox": [],
+                },
+                {
+                    "session": {"id": "ses_kid", "parentID": "ses_root"},
+                    "messages": [],
+                    "active": None,
+                    "inbox": [],
+                },
+            )
+        )
+    )
+
+    make_agent(tmp_path).populate_context_post_run(AgentContext())
+
+    trajectory = json.loads((tmp_path / "trajectory.json").read_text())
+    assert trajectory["trajectory_id"] == "ses_root"
+    assert trajectory["final_metrics"]["extra"]["collection_incomplete"] is True
+
+
+def test_probe_failure_does_not_end_the_shutdown(tmp_path: Path):
+    """A transient exec failure must not be read as a stopped runner."""
+    import asyncio
+
+    agent = make_agent(tmp_path)
+    agent._RUNNER_STOP_POLL_SECONDS = 0.01
+    agent._RUNNER_STOP_GRACE_SECONDS = 0.2
+    calls = {"n": 0}
+
+    class FlakyEnvironment(FakeEnvironment):
+        async def exec(self, **kwargs: Any) -> ExecResult:
+            self.exec_calls.append(kwargs)
+            command = kwargs.get("command", "")
+            if "/proc/$pid/stat" in command:
+                calls["n"] += 1
+                if calls["n"] == 1:
+                    return ExecResult(return_code=0, stdout="RUNNING", stderr="")
+                raise RuntimeError("docker exec failed")
+            return ExecResult(return_code=0, stdout="", stderr="")
+
+    environment = FlakyEnvironment()
+    asyncio.run(agent._ensure_runner_stopped(environment))
+
+    # It could never confirm the runner stopped, so it escalated instead of
+    # silently returning and letting collection start under a live runner.
+    commands = [call.get("command", "") for call in environment.exec_calls]
+    assert any("kill -TERM" in command for command in commands)
+    assert any('kill -KILL -"$pid"' in command for command in commands)
