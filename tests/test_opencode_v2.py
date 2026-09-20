@@ -5037,6 +5037,9 @@ def test_probe_failure_does_not_end_the_shutdown(tmp_path: Path):
         async def exec(self, **kwargs: Any) -> ExecResult:
             self.exec_calls.append(kwargs)
             command = kwargs.get("command", "")
+            if "OPENCODE_V2_ALIVE" in command:
+                # The container is still there; only the probe is unhappy.
+                return ExecResult(return_code=0, stdout="OPENCODE_V2_ALIVE", stderr="")
             if "/proc/$pid/stat" in command:
                 calls["n"] += 1
                 if calls["n"] == 1:
@@ -5343,14 +5346,19 @@ def test_unreachable_environment_stops_probing_but_a_hiccup_does_not(tmp_path: P
     agent._RUNNER_STOP_POLL_SECONDS = 0.01
     agent._RUNNER_STOP_GRACE_SECONDS = 30  # never the thing that ends the loop
 
-    class DeadEnvironment(FakeEnvironment):
+    class UnreadableEnvironment(FakeEnvironment):
+        """Still reachable, but its process state cannot be read."""
+
         async def exec(self, **kwargs: Any) -> ExecResult:
             self.exec_calls.append(kwargs)
-            if "/proc/$pid/stat" in kwargs.get("command", ""):
-                raise RuntimeError("container is not running")
+            command = kwargs.get("command", "")
+            if "OPENCODE_V2_ALIVE" in command:
+                return ExecResult(return_code=0, stdout="OPENCODE_V2_ALIVE", stderr="")
+            if "/proc/$pid/stat" in command:
+                raise RuntimeError("probe failed")
             return ExecResult(return_code=0, stdout="", stderr="")
 
-    environment = DeadEnvironment()
+    environment = UnreadableEnvironment()
     started = time.monotonic()
     with pytest.raises(OpenCodeV2ShutdownError):
         asyncio.run(agent._ensure_runner_stopped(environment))
@@ -5362,6 +5370,8 @@ def test_unreachable_environment_stops_probing_but_a_hiccup_does_not(tmp_path: P
     class FlakyOnceEnvironment(FakeEnvironment):
         async def exec(self, **kwargs: Any) -> ExecResult:
             self.exec_calls.append(kwargs)
+            if "OPENCODE_V2_ALIVE" in kwargs.get("command", ""):
+                return ExecResult(return_code=0, stdout="OPENCODE_V2_ALIVE", stderr="")
             if "/proc/$pid/stat" in kwargs.get("command", ""):
                 calls["n"] += 1
                 if calls["n"] == 2:
@@ -5904,3 +5914,51 @@ def test_run_fails_closed_when_shutdown_cannot_be_confirmed(tmp_path: Path):
         asyncio.run(agent.run("do the thing", environment, AgentContext()))
     # Artifacts are still pulled, so the run can be diagnosed.
     assert environment.downloads
+
+
+def test_a_vanished_environment_is_not_an_unconfirmed_shutdown(tmp_path: Path):
+    """A dead container is proof of a stopped agent, not a failure to stop.
+
+    A process cannot outlive its container, so when the environment itself
+    is unreachable the run is safe to report as an ordinary timeout. Failing
+    closed there would discard every legitimate timeout whose container had
+    already been torn down.
+    """
+    import asyncio
+
+    agent = make_agent(tmp_path)
+    agent._RUNNER_STOP_POLL_SECONDS = 0.01
+    agent._RUNNER_STOP_GRACE_SECONDS = 0.05
+
+    class VanishedEnvironment(FakeEnvironment):
+        async def exec(self, **kwargs: Any) -> ExecResult:
+            self.exec_calls.append(kwargs)
+            raise RuntimeError("container is not running")
+
+    # No exception: nothing can still be running in a container that is gone.
+    asyncio.run(agent._ensure_runner_stopped(VanishedEnvironment()))
+
+
+def test_a_reachable_environment_that_cannot_be_read_still_fails_closed(
+    tmp_path: Path,
+):
+    """Only a *gone* environment is exculpatory, not an unreadable one."""
+    import asyncio
+
+    agent = make_agent(tmp_path)
+    agent._RUNNER_STOP_POLL_SECONDS = 0.01
+    agent._RUNNER_STOP_GRACE_SECONDS = 0.05
+
+    class UnreadableEnvironment(FakeEnvironment):
+        async def exec(self, **kwargs: Any) -> ExecResult:
+            self.exec_calls.append(kwargs)
+            command = kwargs.get("command", "")
+            if "OPENCODE_V2_ALIVE" in command:
+                # The container answers, so it is still there.
+                return ExecResult(return_code=0, stdout="OPENCODE_V2_ALIVE", stderr="")
+            if "/proc/$pid/stat" in command:
+                raise RuntimeError("probe failed")
+            return ExecResult(return_code=0, stdout="", stderr="")
+
+    with pytest.raises(OpenCodeV2ShutdownError):
+        asyncio.run(agent._ensure_runner_stopped(UnreadableEnvironment()))

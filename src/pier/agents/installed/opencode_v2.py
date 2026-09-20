@@ -1533,6 +1533,15 @@ class OpenCodeV2(BaseInstalledAgent):
             answer = await self._probe(environment, checks, env)
         except Exception:
             self.logger.debug("Could not probe the OpenCode V2 processes")
+            # A failed probe is usually "we cannot tell". But if the
+            # environment itself has gone, everything it contained went with
+            # it -- a process cannot outlive its container -- so that is a
+            # fact, not an assumption, and must not fail the trial.
+            if not await self._environment_reachable(environment, env):
+                self.logger.warning(
+                    "OpenCode V2 environment is gone; its processes went with it"
+                )
+                return {key: "GONE" for key in self._OWNED_PROCESSES}
             return {key: "UNKNOWN" for key in self._OWNED_PROCESSES}
         reported = dict(
             line.split("=", 1)
@@ -1542,6 +1551,17 @@ class OpenCodeV2(BaseInstalledAgent):
         if not reported:
             return {key: "UNKNOWN" for key in self._OWNED_PROCESSES}
         return {key: reported.get(key, "UNKNOWN") for key in self._OWNED_PROCESSES}
+
+    async def _environment_reachable(
+        self, environment: BaseEnvironment, env: dict[str, str] | None
+    ) -> bool:
+        """Whether commands can still run in the trial environment at all."""
+        try:
+            return (
+                await self._probe(environment, "echo OPENCODE_V2_ALIVE", env)
+            ).endswith("OPENCODE_V2_ALIVE")
+        except Exception:
+            return False
 
     @staticmethod
     def _all_stopped(states: dict[str, str]) -> bool:
@@ -1709,11 +1729,15 @@ class OpenCodeV2(BaseInstalledAgent):
         Every recorded pid can be gone while a detached tool keeps running,
         so confirming shutdown means asking this too.
         """
-        answer = await self._probe(
-            environment,
-            f"WORKDIR={shlex.quote(self._workdir())}; " + _WORKSPACE_PIDS_SCRIPT,
-            env,
-        )
+        try:
+            answer = await self._probe(
+                environment,
+                f"WORKDIR={shlex.quote(self._workdir())}; " + _WORKSPACE_PIDS_SCRIPT,
+                env,
+            )
+        except Exception:
+            self.logger.debug("Could not probe the OpenCode V2 workspace")
+            return []
         return [
             line.split("=", 1)[1]
             for line in answer.split()
