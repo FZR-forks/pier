@@ -146,6 +146,12 @@ class OpenCodeV2(BaseInstalledAgent):
     _RUNNER_OUTPUT = _RUNNER_LOG_DIR / "runner-result.json"
     _SESSIONS_OUTPUT = _RUNNER_LOG_DIR / "opencode-v2-sessions.jsonl"
     _CLI_EVENTS_OUTPUT = _RUNNER_LOG_DIR / "opencode-v2-cli-events.jsonl"
+    # Write-through evidence: present even when the runner never reached its
+    # finalization path, which is exactly when diagnosis matters most.
+    _STATUS_OUTPUT = _RUNNER_LOG_DIR / "opencode-v2-status.json"
+    _INCIDENTS_OUTPUT = _RUNNER_LOG_DIR / "opencode-v2-incidents.jsonl"
+    _CLI_STREAM_OUTPUT = _RUNNER_LOG_DIR / "opencode-v2-cli-stream.jsonl"
+    _PARTIAL_SESSIONS_OUTPUT = _RUNNER_LOG_DIR / "opencode-v2-sessions.partial.jsonl"
     _INSTRUCTION_PATH = _RUNNER_LOG_DIR / "instruction.txt"
 
     # These values define the adapter's private process/config boundary.  A
@@ -1275,6 +1281,22 @@ class OpenCodeV2(BaseInstalledAgent):
                 self._CLI_EVENTS_OUTPUT,
                 self.logs_dir / "opencode-v2" / "opencode-v2-cli-events.jsonl",
             ),
+            (
+                self._STATUS_OUTPUT,
+                self.logs_dir / "opencode-v2" / "opencode-v2-status.json",
+            ),
+            (
+                self._INCIDENTS_OUTPUT,
+                self.logs_dir / "opencode-v2" / "opencode-v2-incidents.jsonl",
+            ),
+            (
+                self._CLI_STREAM_OUTPUT,
+                self.logs_dir / "opencode-v2" / "opencode-v2-cli-stream.jsonl",
+            ),
+            (
+                self._PARTIAL_SESSIONS_OUTPUT,
+                self.logs_dir / "opencode-v2" / "opencode-v2-sessions.partial.jsonl",
+            ),
         ):
             try:
                 await environment.download_file(remote.as_posix(), local)
@@ -2340,14 +2362,119 @@ class OpenCodeV2(BaseInstalledAgent):
                 "OpenCode V2 model restriction failed: " + "; ".join(mismatches[:10])
             )
 
+    def _live_evidence(self) -> dict[str, Any]:
+        """Summarize the runner's write-through record of the run.
+
+        Unlike ``runner-result.json`` these files are written as execution
+        proceeds, so they survive a runner that was killed, hung, or timed
+        out before it could finalize anything.
+        """
+        base = self.logs_dir / "opencode-v2"
+        status = self._read_json(base / "opencode-v2-status.json") or {}
+        incidents = self._read_jsonl(base / "opencode-v2-incidents.jsonl")
+        evidence: dict[str, Any] = {}
+        if status:
+            for key in (
+                "stage",
+                "stage_history",
+                "root_id",
+                "root_candidates",
+                "cli_started",
+                "cli_returncode",
+                "server_started",
+                "server_exit_code",
+                "cli_stdout_lines",
+                "cli_stderr_lines",
+                "server_stderr_lines",
+                "last_cli_activity_at",
+                "seconds_since_cli_activity",
+                "last_cli_event",
+                "last_tool",
+                "elapsed_seconds",
+                "updated_at",
+            ):
+                if status.get(key) is not None:
+                    evidence[key] = status[key]
+        if incidents:
+            evidence["incident_count"] = len(incidents)
+            evidence["last_incidents"] = incidents[-10:]
+        stream = base / "opencode-v2-cli-stream.jsonl"
+        if stream.exists():
+            try:
+                lines = stream.read_text(errors="replace").splitlines()
+            except OSError:
+                lines = []
+            if lines:
+                evidence["cli_stream_lines"] = len(lines)
+                evidence["cli_stream_tail"] = [line[:2000] for line in lines[-5:]]
+        return evidence
+
+    @staticmethod
+    def _describe_live_evidence(evidence: dict[str, Any]) -> str:
+        """One human-readable sentence answering 'where did this stop?'."""
+        if not evidence:
+            return (
+                "OpenCode left no collectible session records and no live "
+                "runner evidence."
+            )
+        parts = [
+            f"OpenCode stopped at runner stage {evidence.get('stage', 'unknown')!r}"
+        ]
+        if evidence.get("elapsed_seconds") is not None:
+            parts.append(f"after {evidence['elapsed_seconds']}s")
+        root = evidence.get("root_id") or (evidence.get("root_candidates") or [None])[0]
+        if root:
+            parts.append(f"in session {root}")
+        sentence = " ".join(parts) + "."
+        tool = evidence.get("last_tool")
+        if isinstance(tool, dict) and tool.get("tool"):
+            sentence += (
+                f" Last observed activity was tool {tool['tool']!r}"
+                f" ({tool.get('status', 'unknown')})."
+            )
+        if evidence.get("cli_stdout_lines"):
+            sentence += (
+                f" The CLI produced {evidence['cli_stdout_lines']} output line(s)"
+            )
+            idle = evidence.get("seconds_since_cli_activity")
+            if idle is not None:
+                sentence += f", last seen {idle}s before the record ends"
+            sentence += "."
+        incidents = evidence.get("last_incidents") or []
+        if incidents:
+            last = incidents[-1]
+            sentence += (
+                f" Most recent incident: {last.get('kind')}: "
+                f"{str(last.get('message'))[:300]}"
+            )
+        return sentence
+
     def populate_context_post_run(self, context: AgentContext) -> None:
         """Convert the runner's recorded sessions into ATIF trajectories."""
         runner_result = self._read_json(
             self.logs_dir / "opencode-v2" / "runner-result.json"
         )
+        live_evidence = self._live_evidence()
         inspections = self._read_jsonl(
             self.logs_dir / "opencode-v2" / "opencode-v2-sessions.jsonl"
         )
+        partial_sessions_used = False
+        if not inspections:
+            # The final dump only exists if the runner finished collecting.
+            # The settle loop persists each snapshot it builds, so an
+            # interrupted run can still be reconstructed from real records
+            # instead of collapsing to a stub.
+            partial = self._read_jsonl(
+                self.logs_dir / "opencode-v2" / "opencode-v2-sessions.partial.jsonl"
+            )
+            if partial:
+                self.logger.warning(
+                    "Using %d partial OpenCode V2 session snapshot record(s); "
+                    "the runner did not finish collection",
+                    len(partial),
+                )
+                inspections = partial
+                partial_sessions_used = True
         valid_inspections = [
             record
             for record in inspections
@@ -2375,6 +2502,10 @@ class OpenCodeV2(BaseInstalledAgent):
                     if runner_result is None
                     else "no collectible session records"
                 ]
+            for incident in live_evidence.get("last_incidents") or []:
+                rendered = f"{incident.get('kind')}: {incident.get('message')}"
+                if rendered not in collection_errors:
+                    collection_errors.append(rendered)
             self.logger.error(
                 "No OpenCode V2 session inspections found: %s",
                 "; ".join(collection_errors),
@@ -2384,6 +2515,17 @@ class OpenCodeV2(BaseInstalledAgent):
                 if runner_result and runner_result.get("root_id")
                 else None
             )
+            if recorded_root_id is None:
+                # The runner records the root the moment the CLI reveals it,
+                # long before the manifest exists.
+                candidates = live_evidence.get("root_candidates") or []
+                recorded_root_id = (
+                    str(
+                        live_evidence.get("root_id")
+                        or (candidates[0] if candidates else "")
+                    )
+                    or None
+                )
             stub = Trajectory(
                 schema_version="ATIF-v1.7",
                 session_id=recorded_root_id,
@@ -2397,12 +2539,15 @@ class OpenCodeV2(BaseInstalledAgent):
                     Step(
                         step_id=1,
                         source="system",
-                        message=(
-                            "OpenCode completed without collectible session records."
-                        ),
+                        message=self._describe_live_evidence(live_evidence),
                         extra={
                             "collection_gap": True,
                             "collection_errors": collection_errors,
+                            **(
+                                {"live_evidence": live_evidence}
+                                if live_evidence
+                                else {}
+                            ),
                         },
                     )
                 ],
@@ -2414,6 +2559,7 @@ class OpenCodeV2(BaseInstalledAgent):
                         "tree_cost_complete": False,
                         "collection_incomplete": True,
                         "collection_errors": collection_errors,
+                        **({"live_evidence": live_evidence} if live_evidence else {}),
                     },
                 ),
             )
@@ -2477,7 +2623,8 @@ class OpenCodeV2(BaseInstalledAgent):
         # pages, children, and shutdown diagnostics were collected. Preserve
         # the partial trajectory but withhold its aggregate totals.
         if (
-            runner_result is None
+            partial_sessions_used
+            or runner_result is None
             or runner_result.get("collection_complete") is not True
             or (discovered_ids and discovered_ids != converted_ids)
             or not attachment_complete

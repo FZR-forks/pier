@@ -3396,3 +3396,455 @@ def test_install_spec_rejects_unsafe_version(tmp_path: Path):
 def test_version_command_uses_remote_binary(tmp_path: Path):
     agent = make_agent(tmp_path)
     assert str(agent._REMOTE_BINARY.as_posix()) in agent.get_version_command()
+
+
+# ---------------------------------------------------------------------------
+# Write-through observability
+#
+# The point of these artifacts is that they survive a runner that never
+# reaches its finalization path, so the tests below interrupt execution rather
+# than letting it complete.
+# ---------------------------------------------------------------------------
+
+
+def test_live_log_is_capped_and_records_its_own_truncation(tmp_path: Path):
+    log = runner_module.LiveLog(tmp_path / "live.log", max_bytes=64)
+    log.write("a" * 40 + "\n")
+    log.write("b" * 40 + "\n")
+    log.write("c" * 40 + "\n")
+    log.close()
+    text = (tmp_path / "live.log").read_text()
+    assert text.startswith("a" * 40)
+    assert "truncated" in text
+    assert "c" * 40 not in text
+
+
+def test_live_log_never_raises_when_its_file_is_unusable(tmp_path: Path):
+    # The drain threads that feed these logs are what keep the benchmarked
+    # CLI's pipes empty, so a broken log must degrade to silence.
+    log = runner_module.LiveLog(tmp_path / "missing-dir" / "live.log")
+    log.write("ignored\n")
+    assert log.disabled_reason is not None
+    log.write("still ignored\n")
+    log.close()
+
+
+def test_recorder_persists_stage_and_incidents_immediately(tmp_path: Path):
+    recorder = runner_module.LiveRecorder(tmp_path, echo=False)
+    recorder.stage("cli-started", cli_pid=42)
+    recorder.note("tool-error", "provider returned HTTP 529", tool="bash")
+
+    status = json.loads((tmp_path / runner_module.STATUS_FILENAME).read_text())
+    assert status["stage"] == "cli-started"
+    assert status["cli_pid"] == 42
+    assert [entry["stage"] for entry in status["stage_history"]] == [
+        "starting",
+        "cli-started",
+    ]
+    incidents = [
+        json.loads(line)
+        for line in (tmp_path / runner_module.INCIDENTS_FILENAME)
+        .read_text()
+        .splitlines()
+    ]
+    assert incidents[0]["kind"] == "tool-error"
+    assert incidents[0]["tool"] == "bash"
+    assert status["last_incident"]["message"] == "provider returned HTTP 529"
+    recorder.close()
+
+
+def test_recorded_errors_persist_every_collection_error(tmp_path: Path):
+    recorder = runner_module.LiveRecorder(tmp_path, echo=False)
+    errors = runner_module.RecordedErrors(recorder)
+    errors.append("first")
+    errors.extend(["second", "third"])
+    recorder.close()
+
+    assert list(errors) == ["first", "second", "third"]
+    incidents = [
+        json.loads(line)
+        for line in (tmp_path / runner_module.INCIDENTS_FILENAME)
+        .read_text()
+        .splitlines()
+    ]
+    assert [item["message"] for item in incidents] == ["first", "second", "third"]
+    assert all(item["kind"] == "collection-error" for item in incidents)
+
+
+def test_cli_error_detection_is_structural_not_textual(tmp_path: Path):
+    recorder = runner_module.LiveRecorder(tmp_path, echo=False)
+    # The agent routinely writes code and tests that mention errors. Those
+    # must not be recorded as failures of the run.
+    runner_module._note_cli_error(
+        recorder,
+        {
+            "type": "tool_use",
+            "sessionID": "ses_1",
+            "part": {
+                "type": "tool",
+                "tool": "write",
+                "state": {
+                    "status": "completed",
+                    "input": {"content": "it('raises an error', ...)"},
+                },
+            },
+        },
+    )
+    assert recorder.snapshot()["incident_count"] == 0
+    assert recorder.snapshot()["last_tool"]["tool"] == "write"
+
+    runner_module._note_cli_error(
+        recorder,
+        {
+            "type": "tool_use",
+            "sessionID": "ses_1",
+            "part": {
+                "type": "tool",
+                "tool": "bash",
+                "state": {"status": "error", "error": "exit 127"},
+            },
+        },
+    )
+    status = recorder.snapshot()
+    assert status["incident_count"] == 1
+    assert status["last_incident"]["kind"] == "tool-error"
+    assert status["last_incident"]["message"] == "exit 127"
+    recorder.close()
+
+
+def test_settle_loop_persists_each_changed_snapshot(tmp_path: Path, monkeypatch):
+    """A kill inside collection must not discard what was already fetched."""
+    recorder = runner_module.LiveRecorder(tmp_path, echo=False)
+    sessions = [{"id": "ses_root", "parentID": None}]
+    monkeypatch.setattr(
+        runner_module.OpenCodeV2Server,
+        "collect_descendants",
+        lambda self, root_id: sessions,
+    )
+    monkeypatch.setattr(
+        runner_module.OpenCodeV2Server, "wait_session", lambda self, sid: True
+    )
+    monkeypatch.setattr(
+        runner_module.OpenCodeV2Server, "running_session_ids", lambda self: {"ses_root"}
+    )
+    monkeypatch.setattr(
+        runner_module.OpenCodeV2Server,
+        "inspect_session",
+        lambda self, session, active_ids=None: {
+            "session": session,
+            "messages": [{"id": "msg_1", "type": "assistant", "time": {}}],
+            "active": {"type": "running"},
+            "inbox": [],
+        },
+    )
+    monkeypatch.setattr(runner_module.time, "sleep", lambda _seconds: None)
+    server = runner_module.OpenCodeV2Server(
+        binary="x", cwd=str(tmp_path), password="p", env={}
+    )
+    server.url = "http://127.0.0.1:1"
+
+    errors: list[str] = []
+    runner_module._collect_tree(
+        server,
+        "ses_root",
+        deadline=time.monotonic() + 0.2,
+        errors=errors,
+        recorder=recorder,
+    )
+    recorder.close()
+
+    partial = tmp_path / runner_module.PARTIAL_SESSIONS_FILENAME
+    records = [json.loads(line) for line in partial.read_text().splitlines()]
+    assert records[0]["session"]["id"] == "ses_root"
+    status = json.loads((tmp_path / runner_module.STATUS_FILENAME).read_text())
+    assert status["sessions_snapshot_count"] == 1
+    # The heartbeat distinguishes "still collecting" from "died immediately".
+    assert status["settle_iterations"] >= 1
+
+
+_FAKE_OPENCODE = '''#!/usr/bin/env python3
+"""Minimal OpenCode stand-in: serves the API, then hangs mid-task."""
+import json, sys, threading, time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import urlparse
+
+SID = "ses_fake0000000000000000000"
+
+
+class H(BaseHTTPRequestHandler):
+    def log_message(self, *a):
+        pass
+
+    def _json(self, payload, status=200):
+        body = json.dumps(payload).encode()
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self):
+        path = urlparse(self.path).path
+        if path == "/api/model":
+            return self._json({"data": [{"providerID": "fake", "id": "model",
+                                         "variants": [], "body": {}, "limit": {}}]})
+        if path in ("/api/agent", "/api/session"):
+            return self._json({"data": [], "cursor": {}})
+        if path == "/api/session/active":
+            return self._json({"data": {}})
+        return self._json({"data": {}})
+
+    def do_POST(self):
+        self._json({"data": True})
+
+
+def serve():
+    httpd = ThreadingHTTPServer(("127.0.0.1", 0), H)
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    print(json.dumps({"url": "http://127.0.0.1:%d" % httpd.server_address[1]}),
+          flush=True)
+    print("fake server: listening", file=sys.stderr, flush=True)
+    sys.stdin.read()
+
+
+def run():
+    for n in range(10000):
+        status = "error" if n == 3 else "completed"
+        print(json.dumps({
+            "type": "tool_use", "timestamp": int(time.time() * 1000),
+            "sessionID": SID,
+            "part": {"type": "tool", "tool": "bash", "sessionID": SID,
+                     "state": {"status": status,
+                               "error": "provider returned HTTP 529"
+                               if status == "error" else None}}}), flush=True)
+        time.sleep(0.02)
+        if n > 20:
+            while True:  # the agent hangs without ever exiting
+                time.sleep(3600)
+
+
+if "serve" in sys.argv:
+    serve()
+elif "run" in sys.argv:
+    run()
+elif "--version" in sys.argv:
+    print("fake 0.0.1")
+'''
+
+
+def test_killed_runner_still_explains_what_opencode_was_doing(tmp_path: Path):
+    """SIGKILL the runner mid-task: the evidence must already be on disk.
+
+    This is the failure that motivated write-through observability. The
+    runner gets no chance to clean up, so none of ``runner-result.json``,
+    ``opencode-v2-sessions.jsonl`` or ``opencode-v2-cli-events.jsonl`` can
+    exist, and everything below comes from the live record alone.
+    """
+    binary = tmp_path / "fake-opencode"
+    binary.write_text(_FAKE_OPENCODE)
+    binary.chmod(0o755)
+    logs_dir = tmp_path / "logs"
+    logs_dir.mkdir()
+    work_dir = tmp_path / "work"
+    work_dir.mkdir()
+    instruction = tmp_path / "instruction.txt"
+    instruction.write_text("do the task")
+
+    runner_path = Path(runner_module.__file__)
+    process = subprocess.Popen(
+        [
+            "python3",
+            str(runner_path),
+            "--instruction-file",
+            str(instruction),
+            "--logs-dir",
+            str(logs_dir),
+            "--work-dir",
+            str(work_dir),
+            "--binary",
+            str(binary),
+            "--model",
+            "fake/model",
+        ],
+        env={**os.environ, "HOME": str(tmp_path)},
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        start_new_session=True,
+    )
+    status_path = logs_dir / runner_module.STATUS_FILENAME
+
+    def read_status() -> dict[str, Any]:
+        try:
+            return json.loads(status_path.read_text())
+        except (json.JSONDecodeError, OSError, FileNotFoundError):
+            return {}
+
+    try:
+        # Let the agent work, then go quiet, then let the heartbeat observe
+        # that it has gone quiet.
+        deadline = time.monotonic() + 60
+        while time.monotonic() < deadline:
+            if (read_status().get("cli_stdout_lines") or 0) >= 10:
+                break
+            time.sleep(0.05)
+        assert (read_status().get("cli_stdout_lines") or 0) >= 10, (
+            "fake OpenCode never produced enough activity"
+        )
+        idle_deadline = time.monotonic() + 60
+        while time.monotonic() < idle_deadline:
+            if (read_status().get("seconds_since_cli_activity") or 0) >= 3:
+                break
+            time.sleep(0.2)
+    finally:
+        os.killpg(process.pid, signal.SIGKILL)
+        process.wait(timeout=30)
+        subprocess.run(["pkill", "-9", "-f", str(binary)], check=False)
+
+    # The runner never finalized, so its end-of-run artifacts cannot exist.
+    assert not (logs_dir / "runner-result.json").exists()
+    assert not (logs_dir / "opencode-v2-sessions.jsonl").exists()
+    assert not (logs_dir / "opencode-v2-cli-events.jsonl").exists()
+
+    status = json.loads(status_path.read_text())
+    # ... at approximately what stage did execution stop?
+    assert status["stage"] == "cli-started"
+    assert status["server_started"] is True
+    assert status["cli_started"] is True
+    assert status["cli_returncode"] is None
+    # ... which session was involved?
+    assert status["root_candidates"] == ["ses_fake0000000000000000000"]
+    # ... was it still producing output, or had activity stopped?
+    # The agent hung rather than exiting, so the heartbeat must keep reporting
+    # a growing silence instead of freezing at "busy right now".
+    assert status["cli_stdout_lines"] >= 10
+    assert status["last_cli_activity_at"]
+    assert status["seconds_since_cli_activity"] >= 3
+    # ... what was it doing most recently?
+    assert status["last_tool"]["tool"] == "bash"
+    # ... was there a visible failure?
+    assert status["last_incident"]["kind"] == "tool-error"
+
+    stream = (logs_dir / runner_module.CLI_STREAM_FILENAME).read_text().splitlines()
+    assert len(stream) >= 10
+    assert json.loads(stream[-1])["part"]["tool"] == "bash"
+
+    incidents = (logs_dir / runner_module.INCIDENTS_FILENAME).read_text()
+    assert "provider returned HTTP 529" in incidents
+    # Server-side diagnostics are durable from the moment they are emitted.
+    assert (
+        "fake server: listening"
+        in (logs_dir / runner_module.SERVER_STDERR_FILENAME).read_text()
+    )
+
+    # Pier already tees the runner's own stdout, so the timeline survives even
+    # if the logs directory itself is lost.
+    timeline = process.stdout.read()
+    assert "stage=server-started" in timeline
+    assert "stage=cli-started" in timeline
+
+
+def test_stub_trajectory_reports_the_live_evidence(tmp_path: Path):
+    """A killed run must not collapse to a generic 'no records' trajectory."""
+    runner_dir = tmp_path / "opencode-v2"
+    runner_dir.mkdir()
+    (runner_dir / "opencode-v2-status.json").write_text(
+        json.dumps(
+            {
+                "stage": "cli-started",
+                "elapsed_seconds": 9000.0,
+                "root_candidates": ["ses_abc"],
+                "cli_started": True,
+                "server_started": True,
+                "cli_stdout_lines": 412,
+                "seconds_since_cli_activity": 1802.5,
+                "last_tool": {"tool": "bash", "status": "running"},
+            }
+        )
+    )
+    (runner_dir / "opencode-v2-incidents.jsonl").write_text(
+        json.dumps({"kind": "tool-error", "message": "exit 127"}) + "\n"
+    )
+    (runner_dir / "opencode-v2-cli-stream.jsonl").write_text(
+        '{"type": "tool_use"}\n' * 5
+    )
+
+    make_agent(tmp_path).populate_context_post_run(AgentContext())
+
+    trajectory = json.loads((tmp_path / "trajectory.json").read_text())
+    # The session is known even though no manifest was ever written.
+    assert trajectory["session_id"] == "ses_abc"
+    message = trajectory["steps"][0]["message"]
+    assert "'cli-started'" in message
+    assert "9000.0s" in message
+    assert "ses_abc" in message
+    assert "bash" in message
+    assert "412 output line(s)" in message
+    assert "1802.5s" in message
+    assert "exit 127" in message
+    extra = trajectory["steps"][0]["extra"]
+    assert extra["live_evidence"]["cli_stream_lines"] == 5
+    assert "tool-error: exit 127" in extra["collection_errors"]
+    assert trajectory["final_metrics"]["extra"]["collection_incomplete"] is True
+
+
+def test_partial_snapshot_becomes_a_real_but_incomplete_trajectory(tmp_path: Path):
+    """Collection that was interrupted still yields real steps, never a stub."""
+    runner_dir = tmp_path / "opencode-v2"
+    runner_dir.mkdir()
+    (runner_dir / "opencode-v2-sessions.partial.jsonl").write_text(
+        json.dumps(
+            {
+                "session": {"id": "ses_partial", "parentID": None},
+                "messages": [
+                    {
+                        "id": "msg_1",
+                        "type": "assistant",
+                        "time": {"completed": None},
+                        "content": [
+                            {
+                                "type": "tool",
+                                "id": "t1",
+                                "tool": "bash",
+                                "state": {"status": "running"},
+                            }
+                        ],
+                    }
+                ],
+                "active": {"type": "running"},
+                "inbox": [],
+            }
+        )
+        + "\n"
+    )
+
+    make_agent(tmp_path).populate_context_post_run(AgentContext())
+
+    trajectory = json.loads((tmp_path / "trajectory.json").read_text())
+    assert trajectory["trajectory_id"] == "ses_partial"
+    assert trajectory["steps"], "partial records must produce real steps"
+    extra = trajectory["final_metrics"]["extra"]
+    # Real steps, but never presented as a complete or costed collection.
+    assert extra["collection_incomplete"] is True
+    assert extra["metrics_complete"] is False
+    assert extra["tree_cost_complete"] is False
+    assert "total_prompt_tokens" not in trajectory["final_metrics"]
+
+
+def test_completed_collection_ignores_any_partial_snapshot(tmp_path: Path):
+    """The live snapshot must never override a genuinely finished collection."""
+    inspection = {
+        "session": {"id": "ses_real", "parentID": None},
+        "messages": [],
+        "active": None,
+        "inbox": [],
+    }
+    write_inspections(tmp_path, [inspection])
+    (tmp_path / "opencode-v2" / "opencode-v2-sessions.partial.jsonl").write_text(
+        json.dumps({"session": {"id": "ses_stale"}, "messages": []}) + "\n"
+    )
+
+    make_agent(tmp_path).populate_context_post_run(AgentContext())
+
+    trajectory = json.loads((tmp_path / "trajectory.json").read_text())
+    assert trajectory["trajectory_id"] == "ses_real"

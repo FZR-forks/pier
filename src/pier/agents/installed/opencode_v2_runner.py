@@ -51,6 +51,369 @@ CLI_CAPTURE_MAX_LINES = 256
 CLI_CAPTURE_MAX_LINE_BYTES = 16 * 1024
 MAX_ROOT_CANDIDATES = 1024
 
+# Live (write-through) observability artifacts. These mirror state the runner
+# already holds; nothing here issues a request to the OpenCode server.
+STATUS_FILENAME = "opencode-v2-status.json"
+INCIDENTS_FILENAME = "opencode-v2-incidents.jsonl"
+CLI_STREAM_FILENAME = "opencode-v2-cli-stream.jsonl"
+CLI_STDERR_FILENAME = "opencode-v2-cli-stderr.log"
+SERVER_STDERR_FILENAME = "opencode-v2-server-stderr.log"
+PARTIAL_SESSIONS_FILENAME = "opencode-v2-sessions.partial.jsonl"
+
+LIVE_LOG_MAX_BYTES = 64 * 1024 * 1024
+STATUS_MIN_INTERVAL_SECONDS = 1.0
+STATUS_HEARTBEAT_SECONDS = 5.0
+
+
+# -- write-through observability ---------------------------------------------
+#
+# Pi, Codex and Claude Code stream agent output straight to a file while the
+# agent runs, so an interrupted trial still shows what the agent was doing.
+# This runner consumes the CLI and server pipes itself, so without the helpers
+# below its evidence would only reach disk during final collection -- exactly
+# the path a killed or timed-out run never reaches.
+#
+# Two rules keep this benchmark-neutral. Everything recorded is state the
+# runner already observes, so the OpenCode process is never polled or
+# perturbed. And every write is best effort: the threads that feed these logs
+# are the same threads that keep the benchmarked CLI's pipes drained, so a
+# failing log must degrade to silence rather than raise.
+
+
+def _iso(timestamp: float) -> str:
+    return (
+        time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(timestamp))
+        + f".{int((timestamp % 1) * 1000):03d}Z"
+    )
+
+
+class LiveLog:
+    """An append-only, byte-capped, never-raising text log."""
+
+    def __init__(self, path: Path, max_bytes: int = LIVE_LOG_MAX_BYTES):
+        self.path = path
+        self.max_bytes = max_bytes
+        self.written = 0
+        self.truncated = False
+        self.disabled_reason: str | None = None
+        self._handle: Any = None
+        self._lock = threading.Lock()
+
+    def _open(self) -> Any:
+        if self._handle is None and self.disabled_reason is None:
+            try:
+                self._handle = self.path.open("a", encoding="utf-8", errors="replace")
+            except OSError as error:
+                self.disabled_reason = f"{type(error).__name__}: {error}"
+        return self._handle
+
+    def write(self, text: str) -> None:
+        """Persist ``text`` immediately, or give up permanently on failure."""
+        if not text:
+            return
+        with self._lock:
+            if self.truncated or self.disabled_reason is not None:
+                return
+            handle = self._open()
+            if handle is None:
+                return
+            size = len(text.encode("utf-8", "replace"))
+            if self.written + size > self.max_bytes:
+                text = (
+                    f"\n[pier] live log truncated after {self.written} bytes "
+                    f"(cap {self.max_bytes})\n"
+                )
+                self.truncated = True
+            try:
+                handle.write(text)
+                handle.flush()
+            except (OSError, ValueError) as error:
+                self.disabled_reason = f"{type(error).__name__}: {error}"
+                return
+            if not self.truncated:
+                self.written += size
+
+    def close(self) -> None:
+        with self._lock:
+            handle, self._handle = self._handle, None
+        if handle is not None:
+            try:
+                handle.close()
+            except OSError:
+                pass
+
+    def state(self) -> dict[str, Any]:
+        return {
+            "path": self.path.name,
+            "bytes": self.written,
+            "truncated": self.truncated,
+            "disabled": self.disabled_reason,
+        }
+
+
+class LiveRecorder:
+    """A durable, continuously-updated view of what the runner is doing.
+
+    The runner's own stdout is already teed to a file by Pier, so stage and
+    incident lines are echoed there too. That gives a human-readable timeline
+    even when the logs directory itself cannot be written.
+    """
+
+    def __init__(
+        self,
+        logs_dir: Path,
+        *,
+        echo: bool = True,
+        heartbeat_seconds: float = STATUS_HEARTBEAT_SECONDS,
+    ):
+        self.logs_dir = logs_dir
+        self.echo = echo
+        self._lock = threading.RLock()
+        self._start = time.monotonic()
+        self._last_status_write = 0.0
+        self._incident_count = 0
+        self.cli_stream = LiveLog(logs_dir / CLI_STREAM_FILENAME)
+        self.cli_stderr = LiveLog(logs_dir / CLI_STDERR_FILENAME)
+        self.server_stderr = LiveLog(logs_dir / SERVER_STDERR_FILENAME)
+        self.incidents = LiveLog(logs_dir / INCIDENTS_FILENAME)
+        self._status: dict[str, Any] = {
+            "stage": "starting",
+            "stage_history": [],
+            "started_at": _iso(time.time()),
+            "runner_pid": os.getpid(),
+            "server_started": False,
+            "server_url_known": False,
+            "server_exit_code": None,
+            "cli_started": False,
+            "cli_pid": None,
+            "cli_returncode": None,
+            "root_id": None,
+            "root_candidates": [],
+            "cli_stdout_lines": 0,
+            "cli_stderr_lines": 0,
+            "server_stderr_lines": 0,
+            "last_cli_activity_at": None,
+            "settle_iterations": 0,
+            "sessions_snapshot_count": None,
+            "sessions_snapshot_at": None,
+            "incident_count": 0,
+            "last_incident": None,
+        }
+        self._last_activity_monotonic: float | None = None
+        self.stage("starting")
+        # A hung agent stops calling _activity, so without an independent
+        # heartbeat the status file would freeze with its last-known
+        # "seconds_since_cli_activity" of ~0 and imply the agent was busy at
+        # the moment it died. The heartbeat keeps idleness observable.
+        self._stop_heartbeat = threading.Event()
+        self._heartbeat_seconds = heartbeat_seconds
+        self._heartbeat: threading.Thread | None = None
+        if heartbeat_seconds > 0:
+            self._heartbeat = threading.Thread(
+                target=self._heartbeat_loop,
+                name="opencode-v2-status-heartbeat",
+                daemon=True,
+            )
+            self._heartbeat.start()
+
+    def _heartbeat_loop(self) -> None:
+        while not self._stop_heartbeat.wait(self._heartbeat_seconds):
+            with self._lock:
+                self._write_status()
+
+    # -- emission ----------------------------------------------------------
+
+    def _echo(self, text: str) -> None:
+        if not self.echo:
+            return
+        try:
+            print(text, flush=True)
+        except (OSError, ValueError):
+            self.echo = False
+
+    def stage(self, name: str, **fields: Any) -> None:
+        """Record that the runner reached a new stage of execution."""
+        with self._lock:
+            elapsed = round(time.monotonic() - self._start, 3)
+            self._status["stage"] = name
+            history = self._status["stage_history"]
+            history.append({"stage": name, "at": _iso(time.time()), "elapsed": elapsed})
+            del history[:-64]
+            self._status.update(fields)
+            self._write_status()
+        detail = " ".join(f"{key}={value!r}" for key, value in sorted(fields.items()))
+        self._echo(f"[opencode-v2] stage={name} elapsed={elapsed}s {detail}".rstrip())
+
+    def update(self, **fields: Any) -> None:
+        with self._lock:
+            self._status.update(fields)
+            self._write_status()
+
+    def note(self, kind: str, message: str, **fields: Any) -> None:
+        """Persist an error or notable observation at the moment it happens."""
+        with self._lock:
+            self._incident_count += 1
+            record = {
+                "at": _iso(time.time()),
+                "elapsed": round(time.monotonic() - self._start, 3),
+                "stage": self._status.get("stage"),
+                "kind": kind,
+                "message": message,
+            }
+            record.update(fields)
+            self._status["incident_count"] = self._incident_count
+            self._status["last_incident"] = record
+            self.incidents.write(json.dumps(record, ensure_ascii=False) + "\n")
+            self._write_status()
+        self._echo(f"[opencode-v2] {kind}: {message}")
+
+    # -- streamed activity -------------------------------------------------
+
+    def cli_stdout_line(self, line: str) -> None:
+        self.cli_stream.write(line if line.endswith("\n") else line + "\n")
+        self._activity("cli_stdout_lines")
+
+    def cli_stderr_line(self, line: str) -> None:
+        self.cli_stderr.write(line if line.endswith("\n") else line + "\n")
+        self._activity("cli_stderr_lines")
+
+    def server_stderr_line(self, line: str) -> None:
+        self.server_stderr.write(line if line.endswith("\n") else line + "\n")
+        self._activity("server_stderr_lines")
+
+    def observe_event(self, event: dict[str, Any]) -> None:
+        """Note what the CLI is doing right now, without forcing a write.
+
+        The throttled counter update that follows each line publishes this,
+        so describing activity costs nothing beyond the parse the drain
+        thread already performs for root-session capture.
+        """
+        part = event.get("part")
+        part = part if isinstance(part, dict) else {}
+        state = part.get("state")
+        state = state if isinstance(state, dict) else {}
+        described = {
+            "type": event.get("type"),
+            "tool": part.get("tool"),
+            "status": state.get("status"),
+            "sessionID": event.get("sessionID"),
+            "timestamp": event.get("timestamp"),
+        }
+        with self._lock:
+            self._status["last_cli_event"] = {
+                key: value for key, value in described.items() if value is not None
+            }
+            if part.get("tool"):
+                self._status["last_tool"] = {
+                    "tool": part.get("tool"),
+                    "status": state.get("status"),
+                    "at": _iso(time.time()),
+                }
+
+    def _activity(self, counter: str) -> None:
+        """Count a line and refresh status, throttled so a chatty CLI cannot
+        turn every line of output into a status rewrite."""
+        now = time.monotonic()
+        with self._lock:
+            self._status[counter] = int(self._status.get(counter) or 0) + 1
+            self._last_activity_monotonic = now
+            self._status["last_cli_activity_at"] = _iso(time.time())
+            if now - self._last_status_write >= STATUS_MIN_INTERVAL_SECONDS:
+                self._write_status()
+
+    # -- snapshots ---------------------------------------------------------
+
+    def write_partial_sessions(self, inspections: list[dict]) -> None:
+        """Preserve the newest full inspection snapshot from the settle loop.
+
+        Collection can legitimately run for minutes; without this, a kill
+        anywhere inside it discards every session record already fetched.
+        """
+        path = self.logs_dir / PARTIAL_SESSIONS_FILENAME
+        temporary = path.with_suffix(path.suffix + ".tmp")
+        try:
+            temporary.write_text(
+                "".join(
+                    json.dumps(item, ensure_ascii=False) + "\n" for item in inspections
+                )
+            )
+            os.replace(temporary, path)
+        except (OSError, TypeError, ValueError) as error:
+            self.note("partial-snapshot-failed", f"{type(error).__name__}: {error}")
+            return
+        with self._lock:
+            self._status["sessions_snapshot_count"] = len(inspections)
+            self._status["sessions_snapshot_at"] = _iso(time.time())
+            self._write_status()
+
+    # -- status file -------------------------------------------------------
+
+    def _write_status(self) -> None:
+        """Replace the status file atomically. Caller holds the lock."""
+        now = time.monotonic()
+        self._last_status_write = now
+        payload = dict(self._status)
+        payload["updated_at"] = _iso(time.time())
+        payload["elapsed_seconds"] = round(now - self._start, 3)
+        payload["seconds_since_cli_activity"] = (
+            round(now - self._last_activity_monotonic, 3)
+            if self._last_activity_monotonic is not None
+            else None
+        )
+        payload["live_logs"] = {
+            "cli_stream": self.cli_stream.state(),
+            "cli_stderr": self.cli_stderr.state(),
+            "server_stderr": self.server_stderr.state(),
+            "incidents": self.incidents.state(),
+        }
+        path = self.logs_dir / STATUS_FILENAME
+        temporary = path.with_suffix(".json.tmp")
+        try:
+            temporary.write_text(json.dumps(payload, indent=2, default=str) + "\n")
+            os.replace(temporary, path)
+        except (OSError, TypeError, ValueError):
+            # Status is a convenience; the incident and stream logs remain.
+            pass
+
+    def snapshot(self) -> dict[str, Any]:
+        with self._lock:
+            return dict(self._status)
+
+    def close(self) -> None:
+        self._stop_heartbeat.set()
+        if self._heartbeat is not None:
+            self._heartbeat.join(timeout=1)
+        with self._lock:
+            self._write_status()
+        for log in (
+            self.cli_stream,
+            self.cli_stderr,
+            self.server_stderr,
+            self.incidents,
+        ):
+            log.close()
+
+
+class RecordedErrors(list):
+    """A ``collection_errors`` list that persists each entry as it is added.
+
+    Subclassing the list keeps every existing ``append``/``extend`` call site
+    working unchanged, and makes it impossible to add a collection error that
+    is only visible once ``runner-result.json`` is written.
+    """
+
+    def __init__(self, recorder: LiveRecorder):
+        super().__init__()
+        self._recorder = recorder
+
+    def append(self, item: Any) -> None:
+        super().append(item)
+        self._recorder.note("collection-error", str(item))
+
+    def extend(self, items: Iterable[Any]) -> None:
+        for item in items:
+            self.append(item)
+
 
 def auth_header(password: str) -> str:
     token = base64.b64encode(f"{AUTH_USERNAME}:{password}".encode()).decode()
@@ -140,11 +503,21 @@ def wait_for_server(process, timeout_seconds: float = READY_TIMEOUT_SECONDS) -> 
 class OpenCodeV2Server:
     """One ``opencode serve --stdio`` process plus its authenticated client."""
 
-    def __init__(self, binary: str, cwd: str, password: str, env: dict[str, str]):
+    def __init__(
+        self,
+        binary: str,
+        cwd: str,
+        password: str,
+        env: dict[str, str],
+        recorder: "LiveRecorder | None" = None,
+    ):
         self.binary = binary
         self.cwd = cwd
         self.password = password
         self.env = env
+        # Optional: when present, server stderr becomes durable as it arrives
+        # instead of only reaching disk through the final runner result.
+        self.recorder = recorder
         self.process: subprocess.Popen | None = None
         self.url: str | None = None
         self.server_stderr = ""
@@ -238,6 +611,8 @@ class OpenCodeV2Server:
             try:
                 for line in stream:
                     self._stderr_chunks.append(line)
+                    if self.recorder is not None:
+                        self.recorder.server_stderr_line(line)
             except (OSError, ValueError):
                 pass
 
@@ -851,6 +1226,52 @@ def _bounded_cli_line(line: str) -> str:
     return encoded[:CLI_CAPTURE_MAX_LINE_BYTES].decode("utf-8", errors="ignore")
 
 
+def _truncate(value: Any, limit: int = 2000) -> str:
+    text = value if isinstance(value, str) else json.dumps(value, default=str)
+    return text if len(text) <= limit else text[:limit] + "...<truncated>"
+
+
+def _note_cli_error(recorder: LiveRecorder, event: dict[str, Any]) -> None:
+    """Persist tool/provider failures the CLI reports, as they are reported.
+
+    Detection is structural rather than a text search: the agent frequently
+    writes code and tests that merely mention errors, and those must not be
+    recorded as failures of the run.
+    """
+    recorder.observe_event(event)
+    event_type = str(event.get("type") or "")
+    session_id = event.get("sessionID")
+    if "error" in event_type.lower():
+        recorder.note(
+            "cli-error-event",
+            _truncate(event.get("error") or event),
+            event_type=event_type,
+            sessionID=session_id,
+        )
+        return
+    if event.get("error"):
+        recorder.note(
+            "cli-error",
+            _truncate(event["error"]),
+            event_type=event_type,
+            sessionID=session_id,
+        )
+        return
+    part = event.get("part")
+    if not isinstance(part, dict):
+        return
+    state = part.get("state")
+    if not isinstance(state, dict):
+        return
+    if str(state.get("status") or "") == "error":
+        recorder.note(
+            "tool-error",
+            _truncate(state.get("error") or state.get("output") or state),
+            tool=part.get("tool"),
+            sessionID=session_id,
+        )
+
+
 def _events(stdout_lines: Iterable[str]) -> list[dict]:
     result: list[dict] = []
     for line in stdout_lines:
@@ -1018,6 +1439,7 @@ def _collect_tree(
     *,
     deadline: float,
     errors: list[str],
+    recorder: LiveRecorder | None = None,
 ) -> tuple[list[dict], bool]:
     """Wait and collect two identical terminal snapshots of the whole tree."""
     previous: tuple | None = None
@@ -1025,9 +1447,13 @@ def _collect_tree(
     inspections: list[dict] = []
     last_blockers: list[str] = []
     poll_interval = SETTLE_INTERVAL_SECONDS
+    iterations = 0
     server.collection_deadline = deadline
     try:
         while time.monotonic() < deadline:
+            iterations += 1
+            if recorder is not None:
+                recorder.update(settle_iterations=iterations)
             blockers: list[str] = []
             try:
                 sessions = server.collect_descendants(root_id)
@@ -1073,6 +1499,10 @@ def _collect_tree(
                     break
                 if previous != signature:
                     poll_interval = SETTLE_INTERVAL_SECONDS
+                    # Only rewrite when the tree actually changed: settling can
+                    # take minutes and the snapshot is large.
+                    if recorder is not None:
+                        recorder.write_partial_sessions(inspections)
                 previous = signature
             except Exception as error:  # preserve partial records and retry discovery
                 blockers = [f"collection: {type(error).__name__}: {error}"]
@@ -1100,6 +1530,8 @@ def _collect_tree(
             )
             server.interrupt_all(known_ids)
             inspections = [server.inspect_session(session) for session in sessions]
+            if recorder is not None:
+                recorder.write_partial_sessions(inspections)
         except Exception as error:
             server.interrupt_all(known_ids)
             errors.append(f"timeout interruption: {type(error).__name__}: {error}")
@@ -1162,6 +1594,9 @@ def main() -> None:
 
     logs_dir = Path(args.logs_dir).resolve()
     logs_dir.mkdir(parents=True, exist_ok=True)
+    # Start recording before anything else can fail, so even an immediate
+    # crash leaves a stage behind.
+    recorder = LiveRecorder(logs_dir)
     work_dir = Path(args.work_dir).resolve()
     instruction = Path(args.instruction_file).read_text()
     binary = resolve_binary(args.binary)
@@ -1197,7 +1632,11 @@ def main() -> None:
         env["OPENCODE_CONFIG"] = os.path.abspath(args.config_file)
 
     server = OpenCodeV2Server(
-        binary=binary, cwd=str(work_dir), password=password, env=env
+        binary=binary,
+        cwd=str(work_dir),
+        password=password,
+        env=env,
+        recorder=recorder,
     )
 
     stdout_lines: deque[str] = deque(maxlen=CLI_CAPTURE_MAX_LINES)
@@ -1205,7 +1644,7 @@ def main() -> None:
     cli_returncode: int | None = None
     server_stderr = ""
     run_error: str | None = None
-    collection_errors: list[str] = []
+    collection_errors: list[str] = RecordedErrors(recorder)
     inspections: list[dict] = []
     interrupted: list[str] = []
     cancelled = False
@@ -1227,8 +1666,10 @@ def main() -> None:
     signal.signal(signal.SIGTERM, handle_termination)
 
     try:
+        recorder.stage("server-starting")
         server.start()
         assert server.url is not None
+        recorder.stage("server-started", server_started=True, server_url_known=True)
         model_spec = args.model
         if model_spec and args.variant and "#" not in model_spec:
             model_spec = f"{model_spec}#{args.variant}"
@@ -1241,6 +1682,7 @@ def main() -> None:
         (logs_dir / "opencode-v2-preflight.json").write_text(
             json.dumps(preflight, indent=2) + "\n"
         )
+        recorder.stage("preflight-ok")
         try:
             before_ids = {
                 str(item.get("id"))
@@ -1296,6 +1738,8 @@ def main() -> None:
                         session_id = (
                             event.get("sessionID") if isinstance(event, dict) else None
                         )
+                        if isinstance(event, dict):
+                            _note_cli_error(recorder, event)
                         if isinstance(session_id, str) and session_id:
                             early_root_events.append({"sessionID": session_id})
                             if (
@@ -1306,6 +1750,9 @@ def main() -> None:
                                 # Persist the CLI-supplied ID while execution
                                 # is in progress. Final collection validates it
                                 # against private server metadata.
+                                recorder.update(
+                                    root_candidates=sorted(early_root_candidates)
+                                )
                                 _persist_root_candidates(
                                     logs_dir / "opencode-v2-root-candidates.json",
                                     {
@@ -1318,6 +1765,12 @@ def main() -> None:
                                     collection_errors,
                                 )
                     destination.append(_bounded_cli_line(line))
+                    # Durable at observation time. The bounded deque above
+                    # still backs the existing cli-events artifact unchanged.
+                    if capture_root:
+                        recorder.cli_stdout_line(line.rstrip("\n"))
+                    else:
+                        recorder.cli_stderr_line(line.rstrip("\n"))
             except (OSError, ValueError):
                 pass
 
@@ -1336,12 +1789,19 @@ def main() -> None:
         )
         stdout_thread.start()
         stderr_thread.start()
+        recorder.stage("cli-started", cli_started=True, cli_pid=cli_process.pid)
         try:
             cli_returncode = cli_process.wait()
+            recorder.stage("cli-exited", cli_returncode=cli_returncode)
         except BaseException as error:
             # Cancellation or runner shutdown: kill the CLI, then interrupt
             # every session the server has discovered before tearing down.
             cancelled = True
+            recorder.stage(
+                "cli-cancelled",
+                cancelled=True,
+                cancel_cause=f"{type(error).__name__}: {error}",
+            )
             try:
                 os.killpg(cli_process.pid, signal.SIGTERM)
             except (ProcessLookupError, PermissionError):
@@ -1411,12 +1871,15 @@ def main() -> None:
                     )
                     + "\n"
                 )
+                recorder.stage("collecting", root_id=root_id)
                 inspections, settled = _collect_tree(
                     server,
                     root_id,
                     deadline=time.monotonic() + max(0.1, args.settle_timeout),
                     errors=collection_errors,
+                    recorder=recorder,
                 )
+                recorder.stage("collected", settled=settled)
                 if not settled:
                     collection_errors.append(
                         "session tree did not reach two identical terminal snapshots"
@@ -1429,6 +1892,12 @@ def main() -> None:
         pending_error = error
         run_error = run_error or f"{type(error).__name__}: {error}"
         cancelled = cancelled or isinstance(error, (KeyboardInterrupt, SystemExit))
+        recorder.stage(
+            "aborted",
+            cancelled=cancelled,
+            run_error=run_error,
+        )
+        recorder.note("runner-aborted", run_error)
         # On cancellation, interrupt the entire currently-discovered tree and
         # take one partial snapshot before closing the server.
         try:
@@ -1452,6 +1921,7 @@ def main() -> None:
                     root_id,
                     deadline=time.monotonic() + 5,
                     errors=collection_errors,
+                    recorder=recorder,
                 )
             else:
                 inspections = [server.inspect_session(item) for item in discovered]
@@ -1460,9 +1930,11 @@ def main() -> None:
                 f"partial collection: {type(cleanup_error).__name__}: {cleanup_error}"
             )
     finally:
+        recorder.stage("shutting-down")
         process = server.process
         if process is not None:
             server_exit_code = process.poll()
+            recorder.update(server_exit_code=server_exit_code)
             if server_exit_code is not None:
                 collection_errors.append(
                     "OpenCode server exited unexpectedly before owned shutdown "
@@ -1536,8 +2008,19 @@ def main() -> None:
         "private_state_artifacts": private_state_artifacts,
         "session_count": len(inspections),
         "message_count": sum(len(inspection["messages"]) for inspection in inspections),
+        # A pointer to the write-through evidence, so a reader that only has
+        # runner-result.json knows the live record exists and how far it got.
+        "live_status": recorder.snapshot(),
     }
     (logs_dir / "runner-result.json").write_text(json.dumps(result, indent=2))
+    recorder.stage(
+        "finished",
+        root_id=root_id,
+        cli_returncode=cli_returncode,
+        session_count=len(inspections),
+        collection_complete=result["collection_complete"],
+    )
+    recorder.close()
 
     _raise_runner_failure(pending_error, run_error)
 
