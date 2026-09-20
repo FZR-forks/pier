@@ -243,6 +243,10 @@ class LiveRecorder:
             "running_tools": [],
             "last_tool_started": None,
             "event_stream_connected": False,
+            # Set once the event feed has dropped: the feed has no replay, so
+            # a tool that finished during the gap stays listed as running.
+            "tool_state_stale": False,
+            "event_stream_gaps": 0,
         }
         self._last_cli_activity: float | None = None
         self._last_server_activity: float | None = None
@@ -437,6 +441,24 @@ class LiveRecorder:
             self._running_tools.pop(key, None)
         self._publish_running_tools()
 
+    def note_event_gap(self, reason: str) -> None:
+        """Record that the event feed dropped, so tool state may be stale.
+
+        The feed is volatile by contract and never replays, so a tool that
+        completed while disconnected keeps ageing in `running_tools`. Callers
+        must not present those entries as definitely still running.
+        """
+        with self._lock:
+            self._status["tool_state_stale"] = True
+            self._status["event_stream_gaps"] = (
+                int(self._status.get("event_stream_gaps") or 0) + 1
+            )
+            for entry in self._running_tools.values():
+                entry["observed_across_stream_gap"] = True
+            self._publish_running_tools()
+            self._write_status()
+        self.note("event-stream-gap", reason)
+
     def _publish_running_tools(self) -> None:
         """Caller holds the lock."""
         now = time.monotonic()
@@ -453,14 +475,29 @@ class LiveRecorder:
         ]
 
     def _note_event_error(self, event: dict[str, Any]) -> None:
+        """Record server-side failures, however v2 spells them.
+
+        Matching the substring "error" in the type name misses OpenCode's
+        canonical failure events (`session.tool.failed`,
+        `session.step.failed`, `session.execution.failed`), which carry the
+        cause in `data.error`. Those are exactly the child-session failures
+        the CLI stream drops, which is why this subscription exists.
+        """
         event_type = str(event.get("type") or "")
-        if "error" not in event_type.lower():
+        data = event.get("data") if isinstance(event.get("data"), dict) else {}
+        failure = data.get("error")
+        is_failure = (
+            "error" in event_type.lower()
+            or event_type.endswith(".failed")
+            or failure not in (None, "", {}, [])
+        )
+        if not is_failure:
             return
-        data = event.get("data")
         self.note(
             "server-event-error",
-            _truncate((data or {}).get("error") if isinstance(data, dict) else event),
+            _truncate(failure if failure not in (None, "", {}, []) else event),
             event_type=event_type,
+            sessionID=data.get("sessionID"),
         )
 
     def _activity(self, counter: str, *, source: str) -> None:
@@ -661,10 +698,11 @@ class OpenCodeEventStream:
                 # The feed is volatile by contract: a dropped subscriber and
                 # any events missed while disconnected are expected, so this
                 # is recorded rather than treated as a run failure.
-                self.recorder.note(
-                    "event-stream-disconnected",
-                    f"{type(error).__name__}: {error}",
-                    reconnect_attempt=attempts + 1,
+                # A gap means missed events, including terminal tool
+                # results, so flag the in-flight state as unreliable.
+                self.recorder.note_event_gap(
+                    f"event stream dropped ({type(error).__name__}: {error}); "
+                    "events during the gap are lost"
                 )
             if self._stop.is_set():
                 return
@@ -838,6 +876,9 @@ class OpenCodeV2Server:
         # Optional: when present, server stderr becomes durable as it arrives
         # instead of only reaching disk through the final runner result.
         self.recorder = recorder
+        # Invoked with the pid the moment the process exists, so an abrupt
+        # death during readiness still leaves it externally killable.
+        self.on_process_spawned: Any = None
         self.process: subprocess.Popen | None = None
         self.url: str | None = None
         self.server_stderr = ""
@@ -922,6 +963,8 @@ class OpenCodeV2Server:
             text=True,
             start_new_session=True,
         )
+        if self.on_process_spawned is not None:
+            self.on_process_spawned(self.process.pid)
         self._stderr_chunks = []
 
         def drain_stderr() -> None:
@@ -1297,12 +1340,19 @@ def dump_jsonl(path: Path, records: list[dict]) -> None:
     )
 
 
+def _write_atomic(path: Path, text: str) -> None:
+    """Replace ``path`` in one step, so no reader sees a half-written file."""
+    temporary = path.with_name(path.name + ".tmp")
+    temporary.write_text(text)
+    os.replace(temporary, path)
+
+
 def _persist_root_candidates(
     path: Path, payload: dict[str, Any], errors: list[str]
 ) -> None:
     """Retain root candidates without interrupting CLI stdout collection."""
     try:
-        path.write_text(json.dumps(payload, indent=2) + "\n")
+        _write_atomic(path, json.dumps(payload, indent=2) + "\n")
     except OSError as error:
         errors.append(f"root candidate persistence: {type(error).__name__}: {error}")
 
@@ -2071,15 +2121,34 @@ def main() -> None:
     # ``key=pid`` lines so a forced teardown can signal each owned process
     # group by name. The server and CLI are session leaders, so their groups
     # cover the tools they spawn.
-    owned_pids: dict[str, int] = {"runner": os.getpid()}
+    #
+    # Every owned process is named up front. An explicit ``none`` means "not
+    # started", which is safe to read as stopped; a *missing* line means the
+    # file was truncated or never finished, which is not. Shutdown depends on
+    # telling those apart, so the file is replaced atomically and never left
+    # half-written.
+    owned_pids: dict[str, str] = {
+        "runner": str(os.getpid()),
+        "server": "none",
+        "cli": "none",
+    }
+    pidfile_lock = threading.Lock()
 
     def write_pidfile() -> None:
+        path = logs_dir / RUNNER_PIDFILE
+        temporary = path.with_suffix(".pid.tmp")
         try:
-            (logs_dir / RUNNER_PIDFILE).write_text(
-                "".join(f"{key}={pid}\n" for key, pid in owned_pids.items())
-            )
+            with pidfile_lock:
+                temporary.write_text(
+                    "".join(f"{key}={pid}\n" for key, pid in owned_pids.items())
+                )
+                os.replace(temporary, path)
         except OSError as error:
             recorder.note("pidfile-failed", f"{type(error).__name__}: {error}")
+
+    def record_pid(key: str, pid: int) -> None:
+        owned_pids[key] = str(pid)
+        write_pidfile()
 
     write_pidfile()
     work_dir = Path(args.work_dir).resolve()
@@ -2165,11 +2234,11 @@ def main() -> None:
 
     try:
         recorder.stage("server-starting")
+        # Durable before readiness: a runner that dies mid-startup must still
+        # leave the server killable from outside.
+        server.on_process_spawned = lambda pid: record_pid("server", pid)
         server.start()
         assert server.url is not None
-        if server.process is not None:
-            owned_pids["server"] = server.process.pid
-            write_pidfile()
         recorder.stage(
             "server-started",
             server_started=True,
@@ -2298,8 +2367,7 @@ def main() -> None:
         )
         stdout_thread.start()
         stderr_thread.start()
-        owned_pids["cli"] = cli_process.pid
-        write_pidfile()
+        record_pid("cli", cli_process.pid)
         recorder.stage("cli-started", cli_started=True, cli_pid=cli_process.pid)
         try:
             cli_returncode = cli_process.wait()
@@ -2353,7 +2421,8 @@ def main() -> None:
                     "could not resolve an unambiguous newly-created root session"
                 )
             else:
-                (logs_dir / "opencode-v2-root-candidates.json").write_text(
+                _write_atomic(
+                    logs_dir / "opencode-v2-root-candidates.json",
                     json.dumps(
                         {
                             "source": "cli-event",
@@ -2363,7 +2432,7 @@ def main() -> None:
                         },
                         indent=2,
                     )
-                    + "\n"
+                    + "\n",
                 )
                 recorder.stage("collecting", root_id=root_id)
                 inspections, settled = _collect_tree(
@@ -2537,8 +2606,8 @@ def main() -> None:
         # runner-result.json knows the live record exists and how far it got.
         "live_status": recorder.snapshot(),
     }
-    (logs_dir / "runner-result.json").write_text(
-        json.dumps(result, indent=2, default=str)
+    _write_atomic(
+        logs_dir / "runner-result.json", json.dumps(result, indent=2, default=str)
     )
     # Only now is the manifest genuinely on disk.
     recorder.stage("finished", runner_result_written=True)

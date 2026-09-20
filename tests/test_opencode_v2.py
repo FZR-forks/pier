@@ -1,9 +1,12 @@
 """Focused tests for the OpenCode V2 (opencode-v2) Pier agent."""
 
+import asyncio
 import copy
 import json
 import logging
 import os
+import shlex
+import shutil
 import signal
 import subprocess
 import time
@@ -16,7 +19,7 @@ import pytest
 from pier.agents.factory import AgentFactory
 from pier.agents.installed.base import NonZeroAgentExitCodeError
 from pier.agents.installed import opencode_v2_runner as runner_module
-from pier.agents.installed.opencode_v2 import OpenCodeV2
+from pier.agents.installed.opencode_v2 import OpenCodeV2, OpenCodeV2ShutdownError
 from pier.environments.base import ExecResult
 from pier.models.agent.context import AgentContext
 from pier.models.agent.name import AgentName
@@ -3586,6 +3589,20 @@ class H(BaseHTTPRequestHandler):
 
     def do_GET(self):
         path = urlparse(self.path).path
+        if path == "/api/event":
+            # The real server always serves this and holds it open. Without
+            # it the runner reconnects on a tight loop, which is both slow
+            # and nothing like production.
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.end_headers()
+            while True:
+                time.sleep(0.2)
+                try:
+                    self.wfile.write(b": heartbeat\n\n")
+                    self.wfile.flush()
+                except Exception:
+                    return
         if path == "/api/model":
             return self._json({"data": [{"providerID": "fake", "id": "model",
                                          "variants": [], "body": {}, "limit": {}}]})
@@ -3684,7 +3701,7 @@ def test_killed_runner_still_explains_what_opencode_was_doing(tmp_path: Path):
     try:
         # Let the agent work, then go quiet, then let the heartbeat observe
         # that it has gone quiet.
-        deadline = time.monotonic() + 60
+        deadline = time.monotonic() + 20
         while time.monotonic() < deadline:
             if (read_status().get("cli_stdout_lines") or 0) >= 10:
                 break
@@ -3692,7 +3709,7 @@ def test_killed_runner_still_explains_what_opencode_was_doing(tmp_path: Path):
         assert (read_status().get("cli_stdout_lines") or 0) >= 10, (
             "fake OpenCode never produced enough activity"
         )
-        idle_deadline = time.monotonic() + 60
+        idle_deadline = time.monotonic() + 20
         while time.monotonic() < idle_deadline:
             if (read_status().get("seconds_since_cli_activity") or 0) >= 3:
                 break
@@ -3966,7 +3983,7 @@ def test_manifest_records_how_the_run_ended_not_the_teardown_stage(tmp_path: Pat
 
     snapshot_at = finalization.index('"live_status": recorder.snapshot()')
     finalizing_at = finalization.index('recorder.stage(\n        "finalizing"')
-    written_at = finalization.index('(logs_dir / "runner-result.json").write_text')
+    written_at = finalization.index('logs_dir / "runner-result.json"')
     finished_at = finalization.index('recorder.stage("finished"')
 
     # Terminal outcome is recorded before the snapshot is taken ...
@@ -4430,7 +4447,7 @@ def test_killed_runner_identifies_the_tool_that_was_actually_stuck(tmp_path: Pat
     )
     status_path = logs_dir / runner_module.STATUS_FILENAME
     try:
-        deadline = time.monotonic() + 60
+        deadline = time.monotonic() + 20
         while time.monotonic() < deadline:
             try:
                 running = json.loads(status_path.read_text()).get("running_tools") or []
@@ -4614,24 +4631,22 @@ def test_timed_out_runner_is_asked_to_stop_and_not_killed(tmp_path: Path):
 
 
 def test_runner_that_ignores_sigterm_is_killed_and_opencode_swept(tmp_path: Path):
+    """An unstoppable runner fails the run rather than being graded."""
     import asyncio
 
     agent = make_agent(tmp_path)
     agent._RUNNER_STOP_POLL_SECONDS = 0.01
     agent._RUNNER_STOP_GRACE_SECONDS = 0.05
-    environment = _ScriptedEnvironment(["RUNNING"] * 50)
-    asyncio.run(agent._ensure_runner_stopped(environment))
-    # Its own cleanup never ran, so every owned process group is torn down
-    # (the CLI's group covers the tools it spawned) and then swept.
-    assert environment.signals_sent() == ["TERM", "KILL", "KILL", "KILL", "SWEEP"]
-    killed = [
-        call["command"]
-        for call in environment.exec_calls
-        if 'kill -KILL -"$pid"' in call.get("command", "")
-    ]
-    assert len(killed) == 3
-    for key in ("cli=", "server=", "runner="):
-        assert any(key in command for command in killed), key
+    environment = _ScriptedEnvironment(["RUNNING"] * 80)
+
+    with pytest.raises(OpenCodeV2ShutdownError, match="could not be confirmed stopped"):
+        asyncio.run(agent._ensure_runner_stopped(environment))
+
+    commands = [call.get("command", "") for call in environment.exec_calls]
+    assert any("kill -TERM" in command for command in commands)
+    # Descendants are enumerated and killed, then the binary sweep runs.
+    assert any("/proc/[0-9]*/stat" in command for command in commands)
+    assert any("pgrep -f" in command for command in commands)
 
 
 def test_exited_runner_awaiting_reaping_is_not_killed(tmp_path: Path):
@@ -4695,6 +4710,20 @@ class H(BaseHTTPRequestHandler):
 
     def do_GET(self):
         path = urlparse(self.path).path
+        if path == "/api/event":
+            # The real server always serves this and holds it open. Without
+            # it the runner reconnects on a tight loop, which is both slow
+            # and nothing like production.
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.end_headers()
+            while True:
+                time.sleep(0.2)
+                try:
+                    self.wfile.write(b": heartbeat\n\n")
+                    self.wfile.flush()
+                except Exception:
+                    return
         if path == "/api/model":
             return self._json({"data": [{"providerID": "fake", "id": "model",
                                          "variants": [], "body": {}, "limit": {}}]})
@@ -4777,7 +4806,7 @@ def test_timeout_shutdown_stops_opencode_without_killing_it(tmp_path: Path):
     )
     pidfile = logs_dir / runner_module.RUNNER_PIDFILE
     try:
-        deadline = time.monotonic() + 60
+        deadline = time.monotonic() + 20
         while time.monotonic() < deadline and not pidfile.exists():
             time.sleep(0.05)
         assert pidfile.exists(), "the runner never recorded its pid"
@@ -4797,7 +4826,7 @@ def test_timeout_shutdown_stops_opencode_without_killing_it(tmp_path: Path):
             line.split("=", 1) for line in pidfile.read_text().split() if "=" in line
         )
         os.kill(int(pids["runner"]), signal.SIGTERM)
-        process.wait(timeout=90)
+        process.wait(timeout=30)
     finally:
         try:
             os.killpg(process.pid, signal.SIGKILL)
@@ -5009,13 +5038,13 @@ def test_probe_failure_does_not_end_the_shutdown(tmp_path: Path):
             return ExecResult(return_code=0, stdout="", stderr="")
 
     environment = FlakyEnvironment()
-    asyncio.run(agent._ensure_runner_stopped(environment))
-
-    # It could never confirm the runner stopped, so it escalated instead of
-    # silently returning and letting collection start under a live runner.
+    # It could never confirm the runner stopped, so it escalated and then
+    # failed closed instead of letting collection proceed silently.
+    with pytest.raises(OpenCodeV2ShutdownError):
+        asyncio.run(agent._ensure_runner_stopped(environment))
     commands = [call.get("command", "") for call in environment.exec_calls]
     assert any("kill -TERM" in command for command in commands)
-    assert any('kill -KILL -"$pid"' in command for command in commands)
+    assert any("/proc/[0-9]*/stat" in command for command in commands)
 
 
 class _LocalShellEnvironment(FakeEnvironment):
@@ -5146,7 +5175,7 @@ def test_liveness_probe_reports_real_process_states(tmp_path: Path):
 
     alive = subprocess.Popen(["sleep", "300"])
     pidfile = tmp_path / "runner.pid"
-    pidfile.write_text(f"runner={alive.pid}\nserver=1\ncli=1\n")
+    pidfile.write_text(f"runner={alive.pid}\nserver=none\ncli=none\n")
     agent = _pidfile_agent(tmp_path, pidfile)
     environment = _LocalShellEnvironment()
     try:
@@ -5154,14 +5183,19 @@ def test_liveness_probe_reports_real_process_states(tmp_path: Path):
     finally:
         alive.kill()
         alive.wait(timeout=10)
-    # Reaped: the pid is gone entirely.
-    assert asyncio.run(agent._owned_states(environment))["runner"] == "GONE"
+    states = asyncio.run(agent._owned_states(environment))
+    assert states["runner"] == "GONE"
+    # `none` is the runner saying it never started these.
+    assert states["server"] == "GONE" and states["cli"] == "GONE"
+    assert agent._all_stopped(states)
 
-    # An empty or absent pidfile is not a running process.
+    # A truncated or absent pidfile is not evidence that anything stopped.
     pidfile.write_text("")
-    assert agent._all_stopped(asyncio.run(agent._owned_states(environment)))
+    assert asyncio.run(agent._owned_states(environment)) == {
+        key: "UNKNOWN" for key in OpenCodeV2._OWNED_PROCESSES
+    }
     pidfile.unlink()
-    assert agent._all_stopped(asyncio.run(agent._owned_states(environment)))
+    assert not agent._all_stopped(asyncio.run(agent._owned_states(environment)))
 
 
 def test_forced_stop_signals_each_recorded_process_group(tmp_path: Path):
@@ -5238,7 +5272,7 @@ def test_termination_during_finalization_does_not_abort_it(tmp_path: Path):
     status_path = logs_dir / runner_module.STATUS_FILENAME
     pidfile = logs_dir / runner_module.RUNNER_PIDFILE
     try:
-        deadline = time.monotonic() + 60
+        deadline = time.monotonic() + 20
         while time.monotonic() < deadline and not pidfile.exists():
             time.sleep(0.05)
         pid = int(
@@ -5269,7 +5303,7 @@ def test_termination_during_finalization_does_not_abort_it(tmp_path: Path):
             except ProcessLookupError:
                 break
             time.sleep(0.05)
-        process.wait(timeout=90)
+        process.wait(timeout=30)
     finally:
         try:
             os.killpg(process.pid, signal.SIGKILL)
@@ -5287,11 +5321,10 @@ def test_termination_during_finalization_does_not_abort_it(tmp_path: Path):
 
 
 def test_unreachable_environment_stops_probing_but_a_hiccup_does_not(tmp_path: Path):
-    """A dead container is not a stuck runner, and vice versa.
+    """A dead container must not be polled for the whole grace period.
 
-    A runner cannot outlive its own container, so once the environment is
-    persistently unreachable there is nothing left to signal. A single
-    unreadable probe must still be retried, not mistaken for completion.
+    It still fails closed: an unreadable probe is not evidence that OpenCode
+    stopped, so the run must not be graded on that basis.
     """
     import asyncio
 
@@ -5308,21 +5341,9 @@ def test_unreachable_environment_stops_probing_but_a_hiccup_does_not(tmp_path: P
 
     environment = DeadEnvironment()
     started = time.monotonic()
-    asyncio.run(agent._ensure_runner_stopped(environment))
-    # It stopped polling early instead of burning the whole grace period ...
+    with pytest.raises(OpenCodeV2ShutdownError):
+        asyncio.run(agent._ensure_runner_stopped(environment))
     assert time.monotonic() - started < 10
-    probes = [
-        call
-        for call in environment.exec_calls
-        if "/proc/$pid/stat" in call.get("command", "")
-    ]
-    assert len(probes) <= agent._RUNNER_PROBE_MAX_UNKNOWN + 3
-    # ... but still attempted the forced teardown rather than assuming the
-    # runner had stopped, since an unreadable probe is not evidence.
-    assert any(
-        'kill -KILL -"$pid"' in call.get("command", "")
-        for call in environment.exec_calls
-    )
 
     # One transient failure must not end the shutdown.
     calls = {"n": 0}
@@ -5346,7 +5367,398 @@ def test_unreachable_environment_stops_probing_but_a_hiccup_does_not(tmp_path: P
 
     flaky = FlakyOnceEnvironment()
     asyncio.run(agent._ensure_runner_stopped(flaky))
-    # Recovered and saw the runner stop; never escalated to a forced kill.
+    # Recovered and saw everything stop; never needed the forced teardown.
     assert not any(
-        'kill -KILL -"$pid"' in call.get("command", "") for call in flaky.exec_calls
+        "/proc/[0-9]*/stat" in call.get("command", "") for call in flaky.exec_calls
+    )
+
+
+def test_forced_stop_kills_a_detached_shell_tool(tmp_path: Path):
+    """Process groups are not enough to stop OpenCode's shell tools.
+
+    v2.0.8 spawns them with `detached: true`, putting each in its own group
+    and session, so signalling the server's group never reaches a running
+    command. This is the process that can still edit the workspace while the
+    task is graded.
+    """
+    import asyncio
+
+    workdir = tmp_path / "work"
+    workdir.mkdir()
+    marker = workdir / "written-after-cleanup.txt"
+
+    # A "server" in its own session, with a detached tool child that would
+    # write to the workspace if it were left alive.
+    tool_script = tmp_path / "tool.sh"
+    tool_script.write_text(f"#!/bin/sh\nsleep 4\necho late > {marker}\n")
+    tool_script.chmod(0o755)
+    server = subprocess.Popen(
+        ["sh", "-c", f"setsid {tool_script} & sleep 300"],
+        cwd=str(workdir),
+        start_new_session=True,
+    )
+    pidfile = tmp_path / "runner.pid"
+    pidfile.write_text(f"runner=none\nserver={server.pid}\ncli=none\n")
+    try:
+        agent = _pidfile_agent(tmp_path, pidfile)
+        agent._remote_workdir_text = str(workdir)
+        agent._RUNNER_STOP_GRACE_SECONDS = 0.05
+
+        # Wait for the detached tool to actually exist, rather than racing
+        # `setsid` with a fixed sleep.
+        deadline = time.monotonic() + 30
+        while time.monotonic() < deadline:
+            if (
+                subprocess.run(
+                    ["pgrep", "-f", str(tool_script)], capture_output=True
+                ).returncode
+                == 0
+            ):
+                break
+            time.sleep(0.05)
+        else:
+            raise AssertionError("the detached tool never started")
+
+        asyncio.run(agent._force_stop(_LocalShellEnvironment(), None))
+
+        # Give the tool longer than its own sleep: if it survived, it writes.
+        time.sleep(6)
+        assert not marker.exists(), (
+            "a detached shell tool survived cleanup and wrote to the workspace"
+        )
+    finally:
+        try:
+            server.kill()
+            server.wait(timeout=10)
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+        subprocess.run(["pkill", "-9", "-f", str(tool_script)], check=False)
+
+
+def test_workspace_processes_are_reported_for_confirmation(tmp_path: Path):
+    """Shutdown is only confirmed when nothing is left working in the repo."""
+    import asyncio
+
+    workdir = tmp_path / "work"
+    workdir.mkdir()
+    # Its own session, like a detached OpenCode tool -- and unlike the probe,
+    # which reaches the container through a separate exec and is deliberately
+    # excluded from its own sweep.
+    worker = subprocess.Popen(
+        ["sleep", "300"], cwd=str(workdir), start_new_session=True
+    )
+    pidfile = tmp_path / "runner.pid"
+    pidfile.write_text("runner=none\nserver=none\ncli=none\n")
+    try:
+        agent = _pidfile_agent(tmp_path, pidfile)
+        agent._remote_workdir_text = str(workdir)
+        environment = _LocalShellEnvironment()
+        # Every recorded pid is gone, yet work continues in the workspace.
+        assert agent._all_stopped(asyncio.run(agent._owned_states(environment)))
+        found = asyncio.run(agent._workspace_processes(environment, None))
+        assert str(worker.pid) in found
+    finally:
+        worker.kill()
+        worker.wait(timeout=10)
+
+
+def test_stream_gap_marks_tool_state_as_unreliable(tmp_path: Path):
+    """The event feed never replays, so a gap invalidates in-flight state."""
+    recorder = runner_module.LiveRecorder(tmp_path, echo=False, heartbeat_seconds=0)
+    recorder.agent_event(
+        _tool_event(
+            "input.started", session="ses_root", message="m1", ident="t1", name="bash"
+        )
+    )
+    assert recorder.snapshot()["tool_state_stale"] is False
+
+    recorder.note_event_gap("event stream dropped")
+    status = recorder.snapshot()
+    assert status["tool_state_stale"] is True
+    assert status["event_stream_gaps"] == 1
+    # The entry survives as evidence but is flagged, not presented as fact.
+    assert status["running_tools"][0]["observed_across_stream_gap"] is True
+    recorder.close()
+    incidents = (tmp_path / runner_module.INCIDENTS_FILENAME).read_text()
+    assert "event-stream-gap" in incidents
+
+
+def test_canonical_failure_events_become_incidents(tmp_path: Path):
+    """v2 spells failures `*.failed`, not `*error*`."""
+    recorder = runner_module.LiveRecorder(tmp_path, echo=False, heartbeat_seconds=0)
+    for event_type, detail in (
+        ("session.tool.failed", "exit 2"),
+        ("session.step.failed", "provider 529"),
+        ("session.execution.failed", "aborted"),
+    ):
+        recorder.agent_event(
+            json.dumps(
+                {
+                    "type": event_type,
+                    "data": {"sessionID": "ses_kid", "error": detail},
+                }
+            )
+        )
+    recorder.close()
+    incidents = [
+        json.loads(line)
+        for line in (tmp_path / runner_module.INCIDENTS_FILENAME)
+        .read_text()
+        .splitlines()
+    ]
+    failures = [item for item in incidents if item["kind"] == "server-event-error"]
+    assert len(failures) == 3
+    assert {item["message"] for item in failures} == {
+        "exit 2",
+        "provider 529",
+        "aborted",
+    }
+    # Child-session attribution is kept: this is what the CLI stream drops.
+    assert all(item["sessionID"] == "ses_kid" for item in failures)
+
+
+def test_uncertain_tool_state_is_not_reported_as_fact(tmp_path: Path):
+    """After a stream gap the narrative must stop asserting tools are stuck."""
+    runner_dir = tmp_path / "opencode-v2"
+    runner_dir.mkdir()
+    (runner_dir / "opencode-v2-status.json").write_text(
+        json.dumps(
+            {
+                "stage": "cli-started",
+                "root_id": "ses_root",
+                "tool_state_stale": True,
+                "event_stream_gaps": 2,
+                "running_tools": [
+                    {
+                        "tool": "bash",
+                        "sessionID": "ses_root",
+                        "running_for_seconds": 900.0,
+                        "observed_across_stream_gap": True,
+                    }
+                ],
+            }
+        )
+    )
+
+    make_agent(tmp_path).populate_context_post_run(AgentContext())
+    message = json.loads((tmp_path / "trajectory.json").read_text())["steps"][0][
+        "message"
+    ]
+    assert "bash" in message
+    # Hedged, because the terminal event may simply have been missed.
+    assert "may have completed" in message or "unconfirmed" in message
+
+
+_FAKE_DETACHING_OPENCODE = '''#!/usr/bin/env python3
+"""OpenCode stand-in that spawns a detached shell tool, like v2.0.8 does."""
+import json, os, subprocess, sys, threading, time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import urlparse
+
+SID = "ses_detach0000000000000000"
+MARKER = os.environ["TOOL_MARKER"]
+
+
+class H(BaseHTTPRequestHandler):
+    def log_message(self, *a):
+        pass
+
+    def _json(self, payload):
+        body = json.dumps(payload).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self):
+        path = urlparse(self.path).path
+        if path == "/api/event":
+            # The real server always serves this and holds it open. Without
+            # it the runner reconnects on a tight loop, which is both slow
+            # and nothing like production.
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.end_headers()
+            while True:
+                time.sleep(0.2)
+                try:
+                    self.wfile.write(b": heartbeat\n\n")
+                    self.wfile.flush()
+                except Exception:
+                    return
+        if path == "/api/model":
+            return self._json({"data": [{"providerID": "fake", "id": "model",
+                                         "variants": [], "body": {}, "limit": {}}]})
+        if path in ("/api/agent", "/api/session"):
+            return self._json({"data": [], "cursor": {}})
+        if path == "/api/session/active":
+            return self._json({"data": {}})
+        return self._json({"data": {}})
+
+    def do_POST(self):
+        self._json({"data": True})
+
+
+def serve():
+    httpd = ThreadingHTTPServer(("127.0.0.1", 0), H)
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    print(json.dumps({"url": "http://127.0.0.1:%d" % httpd.server_address[1]}),
+          flush=True)
+    # A detached tool, in its own session, that mutates the workspace later.
+    subprocess.Popen(
+        ["sh", "-c", "sleep 12; echo mutated > " + MARKER],
+        start_new_session=True,
+        cwd=os.getcwd(),
+    )
+    sys.stdin.read()
+
+
+def run():
+    while True:
+        time.sleep(3600)
+
+
+if "serve" in sys.argv:
+    serve()
+elif "run" in sys.argv:
+    run()
+elif "--version" in sys.argv:
+    print("fake-detach 0.0.1")
+'''
+
+
+class _LocalRunEnvironment(FakeEnvironment):
+    """Runs the adapter's real commands locally, in a temporary workspace."""
+
+    def __init__(self, workdir: Path):
+        super().__init__()
+        self.workdir = workdir
+
+    async def exec(self, **kwargs: Any) -> ExecResult:
+        self.exec_calls.append(kwargs)
+        command = kwargs.get("command", "")
+        if command.strip().endswith("pwd"):
+            return ExecResult(return_code=0, stdout=str(self.workdir) + "\n", stderr="")
+        # Only the runner launch and the shutdown probes are executed for
+        # real. The container-provisioning commands around them are not what
+        # this test is about, and they cannot run outside a trial image.
+        interesting = "opencode_v2_runner.py" in command or "/proc/" in command
+        if not interesting:
+            return ExecResult(return_code=0, stdout="", stderr="")
+        # Genuinely async, like the docker exec it stands in for. A blocking
+        # subprocess.run here would pin the event loop, so `asyncio.wait_for`
+        # could never interrupt it and the cancellation under test would not
+        # actually happen.
+        process = await asyncio.create_subprocess_exec(
+            "bash",
+            "-c",
+            command,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            cwd=str(self.workdir),
+        )
+        out, err = await process.communicate()
+        return ExecResult(
+            return_code=process.returncode,
+            stdout=out.decode(errors="replace"),
+            stderr=err.decode(errors="replace"),
+        )
+
+    async def upload_file(self, source: Path | str, target: str) -> None:
+        Path(target).parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy(str(source), target)
+        self.uploads.append((str(source), target, ""))
+
+
+def test_cancellation_mid_run_leaves_nothing_of_opencode_running(tmp_path: Path):
+    """Cancel a live runner the way an agent timeout does, then clean up.
+
+    This drives the real cancellation-then-cleanup contract: a runner is
+    launched for real, the awaiting task is cancelled by `asyncio.wait_for`,
+    and `_ensure_runner_stopped` then has to leave nothing behind -- including
+    a detached shell tool, which is the only thing that can still mutate the
+    repository while the verifier reads it.
+
+    It does not run the container-provisioning half of `run()`; that part is
+    covered by the live benchmark smoke, not here.
+    """
+    workdir = tmp_path / "work"
+    workdir.mkdir()
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    marker = workdir / "mutated-after-cleanup.txt"
+
+    binary = tmp_path / "opencode-v2-bin"
+    binary.write_text(_FAKE_DETACHING_OPENCODE)
+    binary.chmod(0o755)
+    instruction = logs / "instruction.txt"
+    instruction.write_text("do the task\n")
+    runner_path = tmp_path / "opencode_v2_runner.py"
+    shutil.copy(runner_module.__file__, runner_path)
+
+    agent = make_agent(tmp_path)
+    agent._RUNNER_PIDFILE = logs / runner_module.RUNNER_PIDFILE
+    agent._REMOTE_BINARY = binary
+    agent._remote_workdir_text = str(workdir)
+    agent._RUNNER_STOP_POLL_SECONDS = 0.2
+    agent._RUNNER_STOP_GRACE_SECONDS = 15
+    environment = _LocalRunEnvironment(workdir)
+
+    async def drive() -> None:
+        """The shape of `run()`: await the agent, always stop it afterwards."""
+        try:
+            await environment.exec(
+                command=(
+                    f"python3 {shlex.quote(str(runner_path))} "
+                    f"--instruction-file {shlex.quote(str(instruction))} "
+                    f"--logs-dir {shlex.quote(str(logs))} "
+                    f"--work-dir {shlex.quote(str(workdir))} "
+                    f"--binary {shlex.quote(str(binary))} --model fake/model"
+                ),
+                env={"TOOL_MARKER": str(marker)},
+            )
+        finally:
+            await agent._ensure_runner_stopped(environment)
+
+    async def main() -> None:
+        task = asyncio.ensure_future(drive())
+        # Wait until OpenCode is genuinely working before cancelling. This is
+        # a startup wait, not an idle one: it needs room for the runner, the
+        # server and its readiness handshake under load.
+        deadline = time.monotonic() + 90
+        while time.monotonic() < deadline:
+            if agent._RUNNER_PIDFILE.exists() and marker.parent.exists():
+                states = await agent._owned_states(environment)
+                if states.get("server") == "RUNNING":
+                    break
+            await asyncio.sleep(0.1)
+        else:
+            task.cancel()
+            raise AssertionError("OpenCode never started")
+        with pytest.raises(asyncio.TimeoutError):
+            await asyncio.wait_for(task, timeout=0.1)
+
+    try:
+        asyncio.run(main())
+    finally:
+        subprocess.run(["pkill", "-9", "-f", str(binary)], check=False)
+        subprocess.run(["pkill", "-9", "-f", str(marker)], check=False)
+
+    # Partial evidence survived the cancellation.
+    status = logs / runner_module.STATUS_FILENAME
+    assert status.exists(), "no live evidence survived the cancellation"
+    assert json.loads(status.read_text()).get("stage")
+
+    # Nothing OpenCode owned is left running ...
+    leftovers = subprocess.run(
+        ["pgrep", "-f", str(binary)], capture_output=True, text=True
+    ).stdout.split()
+    assert not leftovers, f"OpenCode survived the cancellation: {leftovers}"
+
+    # ... and the detached tool never got to mutate the workspace. Wait past
+    # the point where it would have written had it survived.
+    time.sleep(14)
+    assert not marker.exists(), (
+        "a detached tool mutated the workspace after cleanup completed"
     )

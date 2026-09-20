@@ -25,6 +25,7 @@ import json
 import os
 import re
 import shlex
+import sys
 import tempfile
 import time
 import uuid
@@ -151,6 +152,120 @@ def _session_suffix(session_id: Any, validated_root: Any) -> str:
     return f" in child session {session_id}"
 
 
+# Descendant closure plus workspace-cwd sweep, in two single-pass scans.
+# A shell loop per pid would spawn thousands of processes and take long
+# enough that a short-lived tool can finish its work before being reached.
+_FORCE_STOP_SCRIPT = r"""
+MYPG=$(sed 's/.*) //' "/proc/$$/stat" 2>/dev/null | cut -d' ' -f3)
+roots=""
+for key in runner server cli; do
+  pid=$(sed -n "s/^$key=//p" "$PIDFILE" 2>/dev/null | head -n 1)
+  case "$pid" in ""|none) continue;; esac
+  roots="$roots $pid"
+done
+victims=$(
+  {
+    awk -v roots="$roots" '
+      BEGIN {
+        n = split(roots, r, " ")
+        for (i = 1; i <= n; i++) if (r[i] != "") want[r[i]] = 1
+      }
+      {
+        tail = substr($0, index($0, ") ") + 2)
+        split(tail, f, " ")
+        parent[$1] = f[2]
+        seen[$1] = 1
+      }
+      END {
+        changed = 1
+        while (changed) {
+          changed = 0
+          for (p in seen)
+            if (!(p in want) && (parent[p] in want)) { want[p] = 1; changed = 1 }
+        }
+        for (p in want) print p
+      }
+    ' /proc/[0-9]*/stat 2>/dev/null
+    ls -l /proc/[0-9]*/cwd 2>/dev/null | awk -v wd="$WORKDIR" -v mypg="$MYPG" '
+
+  function pgid(target,   line, tail, parts, path) {
+    path = "/proc/" target "/stat"
+    if ((getline line < path) > 0) {
+      close(path)
+      tail = substr(line, index(line, ") ") + 2)
+      split(tail, parts, " ")
+      return parts[3]
+    }
+    close(path)
+    return ""
+  }
+      {
+        if ($NF == wd || index($NF, wd "/") == 1) {
+          split($(NF - 2), a, "/")
+          # Never sweep this pipeline itself: it inherits the cwd it was
+          # launched from.
+          if (pgid(a[3]) != mypg) print a[3]
+        }
+      }
+    '
+  } | sort -u
+)
+mine=$$
+myparent=$PPID
+for victim in $victims; do
+  case "$victim" in ""|1|"$mine"|"$myparent") continue;; esac
+  kill -KILL -"$victim" 2>/dev/null
+  kill -KILL "$victim" 2>/dev/null
+done
+true
+"""
+
+_BINARY_SWEEP_SCRIPT = r"""
+pgid() { sed 's/.*) //' "/proc/$1/stat" 2>/dev/null | cut -d' ' -f3; }
+mine=$(pgid $$)
+for victim in $(pgrep -f "$PATTERN" 2>/dev/null); do
+  [ "$(pgid "$victim")" = "$mine" ] && continue
+  kill -KILL "$victim" 2>/dev/null
+done
+true
+"""
+
+_WORKSPACE_PIDS_SCRIPT = r"""
+MYPG=$(sed 's/.*) //' "/proc/$$/stat" 2>/dev/null | cut -d' ' -f3)
+ls -l /proc/[0-9]*/cwd 2>/dev/null | awk -v wd="$WORKDIR" -v mypg="$MYPG" '
+
+  function pgid(target,   line, tail, parts, path) {
+    path = "/proc/" target "/stat"
+    if ((getline line < path) > 0) {
+      close(path)
+      tail = substr(line, index(line, ") ") + 2)
+      split(tail, parts, " ")
+      return parts[3]
+    }
+    close(path)
+    return ""
+  }
+  {
+    if ($NF == wd || index($NF, wd "/") == 1) {
+      split($(NF - 2), a, "/")
+      # This pipeline inherits the cwd it was launched from, so exclude
+      # its process group or shutdown can never be confirmed.
+      if (a[3] != "1" && pgid(a[3]) != mypg) print "WORKSPACE_PID=" a[3]
+    }
+  }
+'
+true
+"""
+
+
+class OpenCodeV2ShutdownError(RuntimeError):
+    """OpenCode could not be confirmed stopped before artifacts were read.
+
+    Raised so a run that would otherwise be graded fails instead: a surviving
+    tool can still change the workspace the verifier is about to check.
+    """
+
+
 class OpenCodeV2(BaseInstalledAgent):
     """OpenCode V2 agent, driven through its own server process."""
 
@@ -182,6 +297,15 @@ class OpenCodeV2(BaseInstalledAgent):
         os.environ.get("PIER_OPENCODE_V2_RUNNER_STOP_GRACE", "90")
     )
     _RUNNER_STOP_POLL_SECONDS = 2.0
+    # Extra confirmation rounds after the forced teardown; signals land
+    # asynchronously, so one immediate check would be unfair to a process
+    # that is already dying.
+    _FORCE_CONFIRM_ATTEMPTS = 3
+    # Set once the workspace path is known, so the teardown can find detached
+    # tools by their working directory.
+    _remote_workdir_text: str | None = None
+    # Recorded when shutdown could not be confirmed, for the trajectory.
+    _shutdown_failure: str | None = None
     # How many consecutive unreadable probes mean the environment itself is
     # gone rather than briefly unhappy.
     _RUNNER_PROBE_MAX_UNKNOWN = 5
@@ -1148,6 +1272,7 @@ class OpenCodeV2(BaseInstalledAgent):
             # applies to minimal test environments without a meaningful cwd.
             remote_workdir = self._REMOTE_WORKDIR
         remote_workdir_text = remote_workdir.as_posix()
+        self._remote_workdir_text = remote_workdir_text
         env["HOME"] = remote_home.as_posix()
         env["XDG_CONFIG_HOME"] = (remote_home / "config").as_posix()
         env["XDG_DATA_HOME"] = (remote_home / "data").as_posix()
@@ -1284,6 +1409,20 @@ class OpenCodeV2(BaseInstalledAgent):
             # grades the task. Stop them before anything is read.
             try:
                 await self._ensure_runner_stopped(environment, env)
+            except OpenCodeV2ShutdownError as error:
+                # Fail closed: nothing collected after this can be trusted,
+                # because OpenCode may still be editing the workspace that is
+                # about to be graded.
+                #
+                # If the run is already failing -- a timeout is the usual way
+                # to get here -- let that exception stand so the trial is
+                # still reported as a timeout, and record this alongside it.
+                # Only when the run would otherwise have succeeded does this
+                # become the failure.
+                self.logger.critical("%s", error)
+                self._shutdown_failure = str(error)
+                if sys.exc_info()[0] is None:
+                    raise
             except Exception:
                 self.logger.exception("OpenCode V2 runner shutdown failed")
             # Preserve the primary execution error even when artifact
@@ -1312,7 +1451,10 @@ class OpenCodeV2(BaseInstalledAgent):
         """Run a short shell probe that always succeeds, returning its stdout."""
         result = await self.exec_as_agent(
             environment,
-            command=f"{{ {command} ; }} 2>/dev/null || true",
+            # Newline-delimited rather than `{ cmd ; }`: these commands are
+            # multi-line scripts, and a trailing `;` on its own line is a
+            # shell syntax error.
+            command=f"{{\n{command}\n}} 2>/dev/null || true",
             env=env,
             timeout_sec=30,
         )
@@ -1355,6 +1497,10 @@ class OpenCodeV2(BaseInstalledAgent):
         ``UNKNOWN`` means the probe itself failed and deliberately is not
         ``GONE``: an unreadable probe is not evidence that anything stopped.
         """
+        # An absent line is not proof of a stopped process: the runner can die
+        # after spawning something but before recording its pid. Only the
+        # explicit `none` the runner writes up front means "never started".
+        #
         # Signalling recorded PIDs avoids matching the probe's own command
         # line, which any `pgrep -f` over the runner path would do.
         #
@@ -1365,7 +1511,8 @@ class OpenCodeV2(BaseInstalledAgent):
         # the process state and treat Z as gone.
         checks = "; ".join(
             f"{{ {self._pid_expr(key)}; "
-            f'if [ -z "$pid" ]; then echo "{key}=GONE"; '
+            f'if [ "$pid" = "none" ]; then echo "{key}=GONE"; '
+            f'elif [ -z "$pid" ]; then echo "{key}=UNKNOWN"; '
             'elif [ -r "/proc/$pid/stat" ]; then '
             "  state=$(sed 's/.*) //' \"/proc/$pid/stat\" | cut -d' ' -f1); "
             f'  if [ "$state" = "Z" ]; then echo "{key}=GONE"; '
@@ -1382,7 +1529,7 @@ class OpenCodeV2(BaseInstalledAgent):
         reported = dict(
             line.split("=", 1)
             for line in answer.split()
-            if "=" in line and line.split("=", 1)[1] in {"GONE", "RUNNING"}
+            if "=" in line and line.split("=", 1)[1] in {"GONE", "RUNNING", "UNKNOWN"}
         )
         if not reported:
             return {key: "UNKNOWN" for key in self._OWNED_PROCESSES}
@@ -1396,6 +1543,23 @@ class OpenCodeV2(BaseInstalledAgent):
     def _still_alive(states: dict[str, str]) -> list[str]:
         return sorted(key for key, state in states.items() if state == "RUNNING")
 
+    async def _confirm_stopped(
+        self, environment: BaseEnvironment, env: dict[str, str] | None
+    ) -> tuple[bool, dict[str, str], list[str]]:
+        """Whether OpenCode is fully stopped, and what is left if not.
+
+        Both halves matter. The recorded pids can all be gone while a
+        detached shell tool keeps running in the workspace -- OpenCode's own
+        finalizers cannot clean those up if its server was killed -- and that
+        tool is the one thing that can still change the repository while the
+        verifier reads it.
+        """
+        states = await self._owned_states(environment, env)
+        if not self._all_stopped(states):
+            return False, states, []
+        workspace = await self._workspace_processes(environment, env)
+        return not workspace, states, workspace
+
     async def _ensure_runner_stopped(
         self, environment: BaseEnvironment, env: dict[str, str] | None = None
     ) -> None:
@@ -1404,13 +1568,14 @@ class OpenCodeV2(BaseInstalledAgent):
         The ladder is deliberate. SIGTERM reaches the runner's own handler,
         which interrupts the OpenCode sessions, lets the CLI exit, collects
         what evidence it can and shuts the server down cleanly. Only a runner
-        that ignores that is killed, and only then is a stray OpenCode process
+        that ignores that is killed, and only then is everything it owned
         swept up.
 
-        Completion means every owned process is gone, not just the runner.
+        Completion means every owned process is gone *and* nothing is still
+        working in the task workspace.
         """
-        states = await self._owned_states(environment, env)
-        if self._all_stopped(states):
+        stopped, states, workspace = await self._confirm_stopped(environment, env)
+        if stopped:
             return  # the normal path: everything already exited on its own
 
         if states.get("runner") == "RUNNING":
@@ -1429,8 +1594,10 @@ class OpenCodeV2(BaseInstalledAgent):
             unknown_streak = 0
             while time.monotonic() < deadline:
                 await asyncio.sleep(self._RUNNER_STOP_POLL_SECONDS)
-                states = await self._owned_states(environment, env)
-                if self._all_stopped(states):
+                stopped, states, workspace = await self._confirm_stopped(
+                    environment, env
+                )
+                if stopped:
                     self.logger.info("OpenCode V2 shut down gracefully")
                     return
                 if not all(state == "UNKNOWN" for state in states.values()):
@@ -1449,12 +1616,12 @@ class OpenCodeV2(BaseInstalledAgent):
                     )
                     break
         elif states.get("runner") == "GONE":
-            # The runner is gone but did not take everything with it. Its
-            # cleanup cannot run now, so go straight to the forced teardown
-            # rather than signalling a dead pid.
+            # The runner is gone but did not take everything with it -- a
+            # detached tool, or a server that outlived it. Its cleanup cannot
+            # run now, so go straight to the forced teardown.
             self.logger.warning(
                 "OpenCode V2 runner has exited but %s still running; cleaning up",
-                ", ".join(self._still_alive(states)) or "processes are",
+                ", ".join(self._still_alive(states) + workspace) or "work is",
             )
         else:
             self.logger.warning(
@@ -1470,53 +1637,80 @@ class OpenCodeV2(BaseInstalledAgent):
         self.logger.warning("Forcing termination of the OpenCode V2 processes")
         await self._force_stop(environment, env)
 
-        states = await self._owned_states(environment, env)
-        if not self._all_stopped(states):
-            # Say so loudly: whatever is collected next was taken while
-            # OpenCode could still be writing.
-            self.logger.error(
-                "OpenCode V2 could not be confirmed stopped (%s); artifacts may "
-                "be collected while it is still running",
-                ", ".join(f"{k}={v}" for k, v in sorted(states.items())),
-            )
+        # Killing is asynchronous, so give the signals a bounded chance to
+        # land before deciding, and re-force once if anything is left.
+        for attempt in range(self._FORCE_CONFIRM_ATTEMPTS):
+            await asyncio.sleep(self._RUNNER_STOP_POLL_SECONDS)
+            stopped, states, workspace = await self._confirm_stopped(environment, env)
+            if stopped:
+                return
+            if attempt == 0:
+                await self._force_stop(environment, env)
+
+        surviving = ", ".join(f"{k}={v}" for k, v in sorted(states.items()))
+        if workspace:
+            surviving += f"; workspace pids {', '.join(sorted(workspace))}"
+        raise OpenCodeV2ShutdownError(
+            "OpenCode V2 could not be confirmed stopped before artifact "
+            f"collection ({surviving})"
+        )
 
     async def _force_stop(
         self, environment: BaseEnvironment, env: dict[str, str] | None
     ) -> None:
-        """Tear down everything the runner owned.
+        """Tear down everything the runner owned, including detached tools.
 
-        The runner's own cleanup never ran, so kill by process group. The
-        server and CLI are each session leaders, so a negative-pid signal
-        reaches the tools they spawned too; killing only the recorded pids
-        would orphan a running `bash` and leave it writing to the workspace.
+        Process groups alone are not enough. OpenCode v2.0.8 spawns shell
+        tools with ``detached: true`` (``packages/core/src/shell.ts``), which
+        puts each in its *own* group and session, so signalling the server's
+        or CLI's group never reaches a running ``bash``/``go test``. Those are
+        precisely the processes that can keep editing the workspace while the
+        task is graded.
+
+        So this takes the descendant closure of the recorded pids and also
+        anything whose working directory is inside the task workspace, which
+        catches a tool that was already orphaned onto PID 1.
         """
-        for key in ("cli", "server", "runner"):
-            await self._signal(
-                environment,
-                f"{self._pid_expr(key)}; "
-                'if [ -n "$pid" ]; then kill -KILL -"$pid" 2>/dev/null || '
-                'kill -KILL "$pid" 2>/dev/null; fi',
-                env,
-            )
-        # Anything that escaped its group still runs the OpenCode binary.
+        await self._signal(
+            environment,
+            f"PIDFILE={shlex.quote(self._RUNNER_PIDFILE.as_posix())}; "
+            f"WORKDIR={shlex.quote(self._workdir())}; " + _FORCE_STOP_SCRIPT,
+            env,
+        )
+        # Anything that escaped still runs the OpenCode binary itself.
         #
         # This cannot be a plain `pkill -f`: the probe shell's own command
         # line contains the pattern, so pkill matches and kills itself, which
         # both aborts the sweep partway and reports a spurious failure. Skip
-        # the probe's own process group instead. OpenCode's server and CLI
-        # are started in their own sessions, so they are never skipped.
-        pattern = shlex.quote(self._REMOTE_BINARY.as_posix())
+        # the probe's own process group instead.
         await self._signal(
             environment,
-            "pgid() { sed 's/.*) //' \"/proc/$1/stat\" 2>/dev/null "
-            "| cut -d' ' -f3; }; "
-            "mine=$(pgid $$); "
-            f"for victim in $(pgrep -f {pattern} 2>/dev/null); do "
-            '  [ "$(pgid "$victim")" = "$mine" ] && continue; '
-            '  kill -KILL "$victim" 2>/dev/null; '
-            "done; true",
+            f"PATTERN={shlex.quote(self._REMOTE_BINARY.as_posix())}; "
+            + _BINARY_SWEEP_SCRIPT,
             env,
         )
+
+    def _workdir(self) -> str:
+        return self._remote_workdir_text or self._REMOTE_WORKDIR.as_posix()
+
+    async def _workspace_processes(
+        self, environment: BaseEnvironment, env: dict[str, str] | None
+    ) -> list[str]:
+        """Pids still working inside the task workspace, if any.
+
+        Every recorded pid can be gone while a detached tool keeps running,
+        so confirming shutdown means asking this too.
+        """
+        answer = await self._probe(
+            environment,
+            f"WORKDIR={shlex.quote(self._workdir())}; " + _WORKSPACE_PIDS_SCRIPT,
+            env,
+        )
+        return [
+            line.split("=", 1)[1]
+            for line in answer.split()
+            if line.startswith("WORKSPACE_PID=")
+        ]
 
     async def _collect_runner_artifacts(self, environment: BaseEnvironment) -> None:
         """Best-effort download of the runner's JSONL artifacts."""
@@ -2681,6 +2875,8 @@ class OpenCodeV2(BaseInstalledAgent):
                 "running_tools",
                 "last_tool_started",
                 "event_stream_connected",
+                "tool_state_stale",
+                "event_stream_gaps",
                 "elapsed_seconds",
                 "updated_at",
             ):
@@ -2740,7 +2936,19 @@ class OpenCodeV2(BaseInstalledAgent):
                 )
                 for item in running[:5]
             )
-            sentence += f" Unfinished tool(s) at that point: {described}."
+            if evidence.get("tool_state_stale"):
+                # The event feed has no replay, so a tool that finished while
+                # the stream was down still looks unfinished here. Report it,
+                # but do not let a timeout be blamed on a command that may
+                # already have completed.
+                sentence += (
+                    f" Tool(s) with no recorded completion: {described}."
+                    " The event stream dropped during the run, so these may"
+                    " have completed unobserved and their durations are"
+                    " unconfirmed."
+                )
+            else:
+                sentence += f" Unfinished tool(s) at that point: {described}."
         tool = evidence.get("last_reported_tool")
         if isinstance(tool, dict) and tool.get("tool"):
             # "reported", not "running": the CLI only emits a tool once it
