@@ -707,26 +707,21 @@ def test_allowlist_rejects_partially_templated_url(tmp_path: Path):
         agent.network_allowlist()
 
 
-def test_provider_url_does_not_restrict_http_gateways(tmp_path: Path):
-    remote = make_agent(
-        tmp_path,
-        opencode_v2_config={
-            "providers": {
-                "litellm": {"settings": {"baseURL": "http://gateway.example.com/v1"}}
-            }
-        },
-    )
-    assert "gateway.example.com" in remote.network_allowlist().domains
-
-    docker_gateway = make_agent(
-        tmp_path,
-        opencode_v2_config={
-            "providers": {
-                "litellm": {"settings": {"baseURL": "http://172.17.0.1/v1"}}
-            }
-        },
-    )
-    assert "172.17.0.1" in docker_gateway.network_allowlist().domains
+def test_provider_urls_are_not_restricted_by_adapter(tmp_path: Path):
+    for base_url, expected_host in (
+        ("http://gateway.example.com/v1", "gateway.example.com"),
+        ("http://172.17.0.1/v1", "172.17.0.1"),
+        ("gateway.internal:8080/v1", "gateway.internal"),
+    ):
+        agent = make_agent(
+            tmp_path,
+            opencode_v2_config={
+                "providers": {
+                    "litellm": {"settings": {"baseURL": base_url}}
+                }
+            },
+        )
+        assert expected_host in agent.network_allowlist().domains
 
 
 # ---------------------------------------------------------------------------
