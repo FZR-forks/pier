@@ -707,36 +707,21 @@ def test_allowlist_rejects_partially_templated_url(tmp_path: Path):
         agent.network_allowlist()
 
 
-def test_provider_url_requires_https_except_loopback(tmp_path: Path):
-    remote = make_agent(
-        tmp_path,
-        opencode_v2_config={
-            "providers": {
-                "litellm": {"settings": {"baseURL": "http://gateway.example.com/v1"}}
-            }
-        },
-    )
-    with pytest.raises(ValueError, match="must use HTTPS"):
-        remote.network_allowlist()
-
-    malformed = make_agent(
-        tmp_path,
-        opencode_v2_config={
-            "providers": {"litellm": {"settings": {"baseURL": "https://"}}}
-        },
-    )
-    with pytest.raises(ValueError, match="must include a hostname"):
-        malformed.network_allowlist()
-
-    loopback = make_agent(
-        tmp_path,
-        opencode_v2_config={
-            "providers": {
-                "litellm": {"settings": {"baseURL": "http://127.0.0.1:8080/v1"}}
-            }
-        },
-    )
-    assert "127.0.0.1" in loopback.network_allowlist().domains
+def test_provider_urls_are_not_restricted_by_adapter(tmp_path: Path):
+    for base_url, expected_host in (
+        ("http://gateway.example.com/v1", "gateway.example.com"),
+        ("http://172.17.0.1/v1", "172.17.0.1"),
+        ("gateway.internal:8080/v1", "gateway.internal"),
+    ):
+        agent = make_agent(
+            tmp_path,
+            opencode_v2_config={
+                "providers": {
+                    "litellm": {"settings": {"baseURL": base_url}}
+                }
+            },
+        )
+        assert expected_host in agent.network_allowlist().domains
 
 
 # ---------------------------------------------------------------------------

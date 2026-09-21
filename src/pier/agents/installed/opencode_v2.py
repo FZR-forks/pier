@@ -20,7 +20,6 @@ session, nested by their real ``parentID``.
 
 import asyncio
 import copy
-import ipaddress
 import json
 import os
 import re
@@ -31,7 +30,6 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlparse
 
 from pier.agents.installed.base import (
     BaseInstalledAgent,
@@ -978,30 +976,8 @@ class OpenCodeV2(BaseInstalledAgent):
                     f"{kind} URL template {value!r} is only partially templated; "
                     "use a whole-value {env:NAME} reference"
                 )
-            if kind == "provider":
-                self._validate_provider_url(value)
             resolved.append(value)
         return resolved
-
-    @staticmethod
-    def _validate_provider_url(value: str) -> None:
-        """Keep provider credentials off cleartext remote connections."""
-        parsed = urlparse(value)
-        hostname = (parsed.hostname or "").lower().rstrip(".")
-        if not hostname:
-            raise ValueError(f"Provider URLs must include a hostname, got {value!r}")
-        loopback = hostname == "localhost"
-        if hostname:
-            try:
-                loopback = loopback or ipaddress.ip_address(hostname).is_loopback
-            except ValueError:
-                pass
-        if parsed.scheme == "https" or (parsed.scheme == "http" and loopback):
-            return
-        raise ValueError(
-            "Provider URLs must use HTTPS; only explicit loopback HTTP endpoints "
-            f"are allowed, got {value!r}"
-        )
 
     # ------------------------------------------------------------------
     # Installation
