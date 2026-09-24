@@ -3320,7 +3320,15 @@ def test_preflight_accepts_inherited_input_above_reduced_context(
         ({"context": 272000, "input": 144000, "output": 128000}, None, 124000),
         ({"context": 272000, "input": 144000, "output": 128000}, {"buffer": 0}, 144000),
         ({"context": 272000, "output": 8000}, None, 252000),
+        # OpenCode 2.0.8 ConfigNormalize maps legacy `reserved` onto `buffer`.
         ({"context": 272000, "output": 128000}, {"reserved": 40000}, 232000),
+        (
+            {"context": 272000, "output": 128000},
+            {"reserved": 40000, "buffer": 0},
+            240000,
+        ),
+        ({"context": 272000, "output": 128000}, {"buffer": -1}, 240000),
+        ({"context": 272000, "output": 128000}, {"buffer": True}, 240000),
         ({"context": 272000, "output": 128000}, {"auto": False}, None),
     ],
 )

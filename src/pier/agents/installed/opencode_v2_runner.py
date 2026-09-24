@@ -1453,9 +1453,13 @@ def _compaction_prompt_ceiling(limit: dict[str, Any], compaction: Any) -> int | 
     output = limit.get("output")
     if not isinstance(context, int) or context <= 0 or not isinstance(output, int):
         return None
-    buffer = settings.get("buffer", settings.get("reserved"))
-    if not isinstance(buffer, int):
-        buffer = _COMPACTION_DEFAULT_BUFFER
+    # ConfigNormalize maps the legacy ``reserved`` key onto ``buffer`` (native
+    # wins) and skips values that are not non-negative integers.
+    buffer = _COMPACTION_DEFAULT_BUFFER
+    for key in ("reserved", "buffer"):
+        value = settings.get(key)
+        if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+            buffer = value
     reserved = max(min(output, _COMPACTION_OUTPUT_TOKEN_MAX), buffer)
     ceiling = context - reserved
     input_limit = limit.get("input")
