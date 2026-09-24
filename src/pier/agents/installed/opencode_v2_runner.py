@@ -1434,6 +1434,36 @@ def _model_selection(value: str, *, label: str) -> tuple[str, str, str]:
     return provider_id, model_id, variant if separator else ""
 
 
+# OpenCode 2.0.8 session/compaction.ts: DEFAULT_BUFFER and OUTPUT_TOKEN_MAX.
+_COMPACTION_DEFAULT_BUFFER = 20_000
+_COMPACTION_OUTPUT_TOKEN_MAX = 32_000
+
+
+def _compaction_prompt_ceiling(limit: dict[str, Any], compaction: Any) -> int | None:
+    """Prompt size at which OpenCode 2.0.8 auto-compacts, or None if it never does.
+
+    Mirrors ``SessionCompaction.required``: the input limit and the context
+    window minus reserved output are independent caps and the lower one wins,
+    so an inherited input limit above a reduced context is not contradictory.
+    """
+    settings = compaction if isinstance(compaction, dict) else {}
+    if settings.get("auto") is False:
+        return None
+    context = limit.get("context")
+    output = limit.get("output")
+    if not isinstance(context, int) or context <= 0 or not isinstance(output, int):
+        return None
+    buffer = settings.get("buffer", settings.get("reserved"))
+    if not isinstance(buffer, int):
+        buffer = _COMPACTION_DEFAULT_BUFFER
+    reserved = max(min(output, _COMPACTION_OUTPUT_TOKEN_MAX), buffer)
+    ceiling = context - reserved
+    input_limit = limit.get("input")
+    if isinstance(input_limit, int):
+        ceiling = min(ceiling, input_limit - buffer)
+    return ceiling
+
+
 def preflight_runtime(
     server: OpenCodeV2Server,
     *,
@@ -1518,19 +1548,13 @@ def preflight_runtime(
                         f"resolved model limit {key!r} is "
                         f"{resolved_limit.get(key)!r}, expected {value!r}"
                     )
-            context_limit = resolved_limit.get("context")
-            input_limit = resolved_limit.get("input")
-            output_limit = resolved_limit.get("output")
-            if (
-                isinstance(context_limit, int)
-                and isinstance(input_limit, int)
-                and isinstance(output_limit, int)
-                and input_limit + output_limit > context_limit
-            ):
+            compaction_ceiling = _compaction_prompt_ceiling(
+                resolved_limit, config.get("compaction")
+            )
+            if compaction_ceiling is not None and compaction_ceiling <= 0:
                 raise RuntimeError(
-                    "resolved model limits are contradictory: "
-                    f"input ({input_limit}) + output ({output_limit}) exceeds "
-                    f"context ({context_limit})"
+                    "resolved model limits leave no prompt budget before "
+                    f"compaction: {resolved_limit!r}"
                 )
 
             by_id = {str(item.get("id")): item for item in agents if item.get("id")}
@@ -1578,6 +1602,7 @@ def preflight_runtime(
                 "resolved_model": sanitized_model,
                 "resolved_model_sha256": hashlib.sha256(encoded).hexdigest(),
                 "resolved_agents": _redact(resolved_agents),
+                "compaction_prompt_ceiling": compaction_ceiling,
             }
         except Exception as error:  # entries can appear shortly after readiness
             last_error = f"{type(error).__name__}: {error}"
