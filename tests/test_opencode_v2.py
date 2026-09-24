@@ -3255,25 +3255,26 @@ def test_preflight_rejects_subagent_model_when_restricted(tmp_path: Path, monkey
         )
 
 
-def test_preflight_rejects_inherited_contradictory_model_limits(
-    tmp_path: Path, monkeypatch
-):
-    config_path = tmp_path / "opencode.json"
-    config_path.write_text(
-        json.dumps(
-            {
-                "providers": {
-                    "litellm": {
-                        "models": {
-                            "gpt-5.6-luna": {
-                                "limit": {"context": 272000, "output": 128000}
-                            }
+def _preflight_with_limits(
+    tmp_path: Path, monkeypatch, resolved_limit: dict, compaction: dict | None = None
+) -> dict:
+    config: dict = {
+        "providers": {
+            "litellm": {
+                "models": {
+                    "gpt-5.6-luna": {
+                        "limit": {
+                            key: resolved_limit[key] for key in ("context", "output")
                         }
                     }
                 }
             }
-        )
-    )
+        }
+    }
+    if compaction is not None:
+        config["compaction"] = compaction
+    config_path = tmp_path / "opencode.json"
+    config_path.write_text(json.dumps(config))
     server = runner_module.OpenCodeV2Server(
         binary="opencode", cwd="/tmp", password="pw", env={}
     )
@@ -3285,23 +3286,65 @@ def test_preflight_rejects_inherited_contradictory_model_limits(
                     "providerID": "litellm",
                     "id": "gpt-5.6-luna",
                     "variants": [{"id": "low"}],
-                    "limit": {
-                        "context": 272000,
-                        "input": 922000,
-                        "output": 128000,
-                    },
+                    "limit": resolved_limit,
                 }
             ]
         return []
 
     monkeypatch.setattr(runner_module, "_location_data", locations)
-    with pytest.raises(RuntimeError, match="limits are contradictory"):
-        runner_module.preflight_runtime(
-            server,
-            model_spec="litellm/gpt-5.6-luna#low",
-            config_file=str(config_path),
-            restrict_model=True,
-            timeout=0.01,
+    return runner_module.preflight_runtime(
+        server,
+        model_spec="litellm/gpt-5.6-luna#low",
+        config_file=str(config_path),
+        restrict_model=True,
+        timeout=0.01,
+    )
+
+
+def test_preflight_accepts_inherited_input_above_reduced_context(
+    tmp_path: Path, monkeypatch
+):
+    # OpenCode 2.0.8 takes the lower of input - buffer and context - reserved
+    # output, so the catalogue's 922000 input leaves context in control.
+    result = _preflight_with_limits(
+        tmp_path,
+        monkeypatch,
+        {"context": 272000, "input": 922000, "output": 128000},
+    )
+    assert result["compaction_prompt_ceiling"] == 272000 - 32000
+
+
+@pytest.mark.parametrize(
+    ("resolved_limit", "compaction", "expected"),
+    [
+        ({"context": 272000, "input": 144000, "output": 128000}, None, 124000),
+        ({"context": 272000, "input": 144000, "output": 128000}, {"buffer": 0}, 144000),
+        ({"context": 272000, "output": 8000}, None, 252000),
+        # OpenCode 2.0.8 ConfigNormalize maps legacy `reserved` onto `buffer`.
+        ({"context": 272000, "output": 128000}, {"reserved": 40000}, 232000),
+        (
+            {"context": 272000, "output": 128000},
+            {"reserved": 40000, "buffer": 0},
+            240000,
+        ),
+        ({"context": 272000, "output": 128000}, {"buffer": -1}, 240000),
+        ({"context": 272000, "output": 128000}, {"buffer": True}, 240000),
+        ({"context": 272000, "output": 128000}, {"auto": False}, None),
+    ],
+)
+def test_preflight_reports_opencode_compaction_ceiling(
+    tmp_path: Path, monkeypatch, resolved_limit, compaction, expected
+):
+    result = _preflight_with_limits(tmp_path, monkeypatch, resolved_limit, compaction)
+    assert result["compaction_prompt_ceiling"] == expected
+
+
+def test_preflight_rejects_limits_without_prompt_budget(tmp_path: Path, monkeypatch):
+    with pytest.raises(RuntimeError, match="no prompt budget before compaction"):
+        _preflight_with_limits(
+            tmp_path,
+            monkeypatch,
+            {"context": 272000, "input": 20000, "output": 128000},
         )
 
 
