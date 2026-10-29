@@ -119,3 +119,20 @@ def test_mini_swe_never_fabricates_per_call_cost_by_output_fraction():
         total_completion_tokens=40,
     )
     assert metrics.cost_usd is None
+
+
+def test_native_audit_fails_closed_on_empty_job(tmp_path):
+    import importlib.util
+    import json
+    from pathlib import Path
+
+    path = Path(__file__).parents[1] / "scripts" / "audit_native_usage.py"
+    spec = importlib.util.spec_from_file_location("native_audit", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    (tmp_path / "result.json").write_text(
+        json.dumps({"stats": {"n_completed_trials": 0}})
+    )
+    report = module.audit(tmp_path)
+    assert report["ok"] is False
+    assert "no supported trial" in report["errors"][0]

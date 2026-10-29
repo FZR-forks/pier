@@ -23,6 +23,7 @@ def jsonl(path):
 
 def audit(job_dir):
     errors, trials = [], []
+    stats = json.loads((job_dir / "result.json").read_text())["stats"]
     for path in sorted(job_dir.glob("*/result.json")):
         result = json.loads(path.read_text())
         context = result.get("agent_result") or {}
@@ -35,6 +36,16 @@ def audit(job_dir):
         def check(condition, detail):
             if not condition:
                 errors.append(label + ": " + detail)
+
+        check(result.get("canonical") is True, "root trial is not canonical")
+        observation = stats.get("canonical_trials", {}).get(label, {})
+        check(
+            observation.get("id") == result["id"], "job selects a different attempt ID"
+        )
+        check(
+            observation.get("attempt") == result.get("attempt"),
+            "job selects a different attempt number",
+        )
 
         for field, metric in (
             ("n_input_tokens", "total_prompt_tokens"),
@@ -68,6 +79,17 @@ def audit(job_dir):
             context.get("peak_context_tokens") == (max(prompts) if prompts else None),
             "peak context is not maximum observed prompt input",
         )
+        markers = [
+            step
+            for node in nodes
+            for step in node["steps"]
+            if (step.get("extra") or {}).get("compaction")
+        ]
+        if name == "codex":
+            check(
+                len(markers) == context.get("summarization_count"),
+                "compaction markers disagree with count",
+            )
         native = {}
         sources = []
         if name == "opencode-v2":
@@ -222,7 +244,10 @@ def audit(job_dir):
                 },
             }
         )
-    stats = json.loads((job_dir / "result.json").read_text())["stats"]
+    if not trials:
+        errors.append("job: no supported trial observations found")
+    if stats.get("n_completed_trials") != len(trials):
+        errors.append("job: completed count differs from canonical files")
     for key in ("n_input_tokens", "n_cache_tokens", "n_output_tokens", "cost_usd"):
         values = [trial["usage"][key] for trial in trials]
         expected = sum(values) if all(value is not None for value in values) else None
