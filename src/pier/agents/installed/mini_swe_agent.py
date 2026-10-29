@@ -465,8 +465,13 @@ def convert_mini_swe_agent_to_atif(
             _add_observation_to_last_agent_step(steps, output, _logger, i, timestamp)
 
     # Build final metrics
+    final_cost_usd = (
+        total_cost_usd if reported_cost is not None or total_usage_cost > 0 else None
+    )
     final_extra: dict[str, Any] = {}
-    final_extra["cost_source"] = "harness_reported"
+    final_extra["cost_source"] = (
+        "harness_reported" if final_cost_usd is not None else "unknown"
+    )
     if total_reasoning_tokens > 0:
         final_extra["total_reasoning_tokens"] = total_reasoning_tokens
     if total_text_tokens > 0:
@@ -481,9 +486,7 @@ def convert_mini_swe_agent_to_atif(
         total_prompt_tokens=total_prompt_tokens,
         total_completion_tokens=total_completion_tokens,
         total_cached_tokens=total_cached_tokens,
-        total_cost_usd=total_cost_usd
-        if reported_cost is not None or total_usage_cost > 0
-        else None,
+        total_cost_usd=final_cost_usd,
         total_steps=len(steps),
         extra=final_extra,
     )

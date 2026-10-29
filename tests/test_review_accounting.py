@@ -13,6 +13,11 @@ import pytest
 from fastapi.testclient import TestClient
 
 from pier.agents.installed.codex import Codex
+from pier.agents.installed.claude_code import ClaudeCode
+from pier.agents.installed.gemini_cli import GeminiCli
+from pier.agents.installed.mini_swe_agent import convert_mini_swe_agent_to_atif
+from pier.agents.installed.opencode import OpenCode
+from pier.agents.installed.opencode_v2 import OpenCodeV2
 from pier.agents.installed.pi import Pi
 from pier.job import Job
 from pier.metrics.mean import Mean
@@ -26,6 +31,7 @@ from pier.trial.hooks import TrialEvent, TrialHookEvent
 from pier.trial.queue import TrialQueue
 from pier.trial.trial import Trial
 from pier.utils.rejected_request import rejected_requests_from_errors
+from pier.utils.trajectory_metrics import populate_context_from_final_metrics
 from pier.viewer.server import create_app
 
 
@@ -465,3 +471,342 @@ def test_viewer_peak_and_step_averages_require_all_trials(tmp_path, complete):
         for cell in row.values():
             assert cell["avg_peak_context_tokens"] == (150 if complete else None)
             assert cell["avg_agent_steps"] == (6 if complete else None)
+
+
+@pytest.mark.parametrize("partial_dump", [False, True])
+def test_native_audit_reports_partial_opencode_categories_without_crashing(
+    tmp_path, partial_dump
+):
+    result = trial_result(tmp_path)
+    result.agent_info.name = "opencode-v2"
+    path = tmp_path / "trial"
+    dump_dir = path / "agent" / "opencode-v2"
+    dump_dir.mkdir(parents=True)
+    # One complete session, one without an output/cache-write/cost record.
+    sessions = [
+        {
+            "id": "complete",
+            "tokens": {
+                "input": 10,
+                "output": 2,
+                "reasoning": 1,
+                "cache": {"read": 5, "write": 0},
+            },
+            "cost": 0,
+        },
+        {"id": "partial", "tokens": {"input": 20, "cache": {"read": 0}}},
+    ]
+    from pier.models.agent.usage import ReportedUsage
+
+    observed = ReportedUsage.aggregate(
+        [
+            OpenCodeV2._session_reported_usage(session, complete=False)
+            for session in sessions
+        ],
+        source="opencode.session.tokens/cost",
+    )
+    result.agent_result = AgentContext(session_reported_usage=observed)
+    (path / "result.json").write_text(result.model_dump_json())
+    (path / "agent" / "trajectory.json").write_text(
+        json.dumps(
+            {
+                "steps": [],
+                "final_metrics": {},
+            }
+        )
+    )
+    name = (
+        "opencode-v2-sessions.partial.jsonl"
+        if partial_dump
+        else "opencode-v2-sessions.jsonl"
+    )
+    (dump_dir / name).write_text(
+        "".join(json.dumps({"session": session}) + "\n" for session in sessions)
+    )
+    (tmp_path / "result.json").write_text(
+        json.dumps(
+            {
+                "stats": {
+                    "n_completed_trials": 1,
+                    "canonical_trials": {"trial": {"id": str(result.id), "attempt": 1}},
+                }
+            }
+        )
+    )
+    report = native_audit().audit(tmp_path)
+    assert report["ok"] is False
+    assert any("missing categories" in error for error in report["errors"])
+    observation = report["trials"][0]
+    assert observation["native"]["n_input_tokens"] is None
+    assert observation["native"]["n_output_tokens"] is None
+    assert observation["native"]["n_cache_tokens"] == 5
+    assert observation["native_best_known"]["n_input_tokens"] == 15
+    assert observation["native_missing_observations"]["n_input_tokens"] == 1
+
+
+def assert_cost_observation(metrics, value, source):
+    assert metrics.total_cost_usd == value
+    assert metrics.extra["cost_source"] == source
+    context = AgentContext()
+    populate_context_from_final_metrics(context, metrics)
+    assert context.cost_usd == value
+    assert context.cost_source == source
+
+
+@pytest.mark.parametrize(
+    "stream,cost,source",
+    [
+        (None, None, "unknown"),
+        ("not-json\n", None, "unknown"),
+        ('{"type":"result"}\n', None, "unknown"),
+        ('{"type":"result","total_cost_usd":0}\n', 0, "harness_reported"),
+        ('{"type":"result","total_cost_usd":0.25}\n', 0.25, "harness_reported"),
+    ],
+)
+def test_claude_cost_provenance_requires_stream_cost(tmp_path, stream, cost, source):
+    (tmp_path / "session.jsonl").write_text(
+        json.dumps(
+            {
+                "type": "assistant",
+                "sessionId": "session",
+                "message": {
+                    "id": "answer",
+                    "role": "assistant",
+                    "model": "test",
+                    "content": [{"type": "text", "text": "answer"}],
+                    "usage": {"input_tokens": 1, "output_tokens": 1},
+                },
+            }
+        )
+        + "\n"
+    )
+    if stream is not None:
+        (tmp_path / "claude-code.txt").write_text(stream)
+    trajectory = ClaudeCode(
+        logs_dir=tmp_path, model_name="test"
+    )._convert_events_to_trajectory(tmp_path)
+    assert_cost_observation(trajectory.final_metrics, cost, source)
+
+
+@pytest.mark.parametrize(
+    "has_usage,price", [(False, None), (True, None), (True, 0), (True, 0.25)]
+)
+def test_codex_cost_provenance_requires_computed_estimate(
+    tmp_path, monkeypatch, has_usage, price
+):
+    agent = Codex(logs_dir=tmp_path, model_name="test")
+    monkeypatch.setattr(agent, "_compute_cost_from_pricing", lambda **kwargs: price)
+    events = [
+        {
+            "type": "response_item",
+            "payload": {
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "task"}],
+            },
+        }
+    ]
+    if has_usage:
+        events.append(
+            token_snapshot(
+                {"input_tokens": 1, "output_tokens": 1, "cached_input_tokens": 0}
+            )
+        )
+    else:
+        events.append({"type": "compacted", "payload": {}})
+    trajectory = agent._convert_session_file_to_trajectory(
+        tmp_path / "codex.jsonl", events
+    )
+    assert_cost_observation(
+        trajectory.final_metrics,
+        price,
+        "pricing_estimate" if price is not None else "unknown",
+    )
+
+
+@pytest.mark.parametrize(
+    "has_usage,price", [(False, None), (True, None), (True, 0), (True, 0.25)]
+)
+def test_gemini_cost_provenance_requires_computed_estimate(
+    tmp_path, monkeypatch, has_usage, price
+):
+    agent = GeminiCli(logs_dir=tmp_path, model_name="test")
+    monkeypatch.setattr(agent, "_compute_cost_from_pricing", lambda *args: price)
+    message = {"type": "gemini", "content": "answer"}
+    if has_usage:
+        message["tokens"] = {
+            "input": 1,
+            "output": 1,
+            "thoughts": 0,
+            "cached": 0,
+            "tool": 0,
+        }
+    trajectory = agent._convert_gemini_to_atif(
+        {"sessionId": "session", "messages": [message]}
+    )
+    assert_cost_observation(
+        trajectory.final_metrics,
+        price,
+        "pricing_estimate" if price is not None else "unknown",
+    )
+
+
+@pytest.mark.parametrize("cost", [None, 0, 0.25])
+def test_mini_swe_cost_provenance_requires_reported_cost(cost):
+    info = {"model_stats": {} if cost is None else {"instance_cost": cost}}
+    trajectory = convert_mini_swe_agent_to_atif(
+        {
+            "info": info,
+            "messages": [
+                {
+                    "role": "assistant",
+                    "content": "answer",
+                    "extra": {
+                        "response": {
+                            "usage": {
+                                "prompt_tokens": 1,
+                                "completion_tokens": 1,
+                            }
+                        }
+                    },
+                }
+            ],
+        },
+        "session",
+    )
+    assert_cost_observation(
+        trajectory.final_metrics,
+        cost,
+        "harness_reported" if cost is not None else "unknown",
+    )
+
+
+@pytest.mark.parametrize("cost", [None, 0, 0.25])
+def test_opencode_cost_provenance_requires_complete_step_costs(tmp_path, cost):
+    part = {"tokens": {"input": 1, "output": 1, "cache": {"read": 0, "write": 0}}}
+    if cost is not None:
+        part["cost"] = cost
+    trajectory = OpenCode(
+        logs_dir=tmp_path, model_name="test/test"
+    )._convert_events_to_trajectory(
+        [
+            {"type": "step_start"},
+            {"type": "step_finish", "part": part},
+        ]
+    )
+    assert_cost_observation(
+        trajectory.final_metrics,
+        cost,
+        "harness_reported" if cost is not None else "unknown",
+    )
+
+
+@pytest.mark.parametrize("state", ["missing", "partial", "complete", "zero", "active"])
+def test_opencode_v2_provenance_tracks_withheld_vs_session_cost(tmp_path, state):
+    tokens = {
+        "input": 10,
+        "output": 1,
+        "reasoning": 0,
+        "cache": {"read": 0, "write": 0},
+    }
+    cost = 0 if state == "zero" else 0.25
+    session = {"id": "session", "tokens": tokens, "cost": cost}
+    message = {
+        "id": "answer",
+        "type": "assistant",
+        "tokens": tokens,
+        "cost": cost,
+        "time": {"created": 1, "completed": 2},
+        "content": [],
+    }
+    if state == "missing":
+        message.pop("cost")
+        session.pop("cost")
+    if state == "partial":
+        message.pop("tokens")
+    agent = OpenCodeV2(logs_dir=tmp_path, model_name="test/test")
+    trajectory = agent._convert_session_to_trajectory(
+        {
+            "session": session,
+            "messages": [message],
+            "active": True if state == "active" else None,
+        },
+        {},
+    )
+    complete = state in {"complete", "zero"}
+    assert_cost_observation(
+        trajectory.final_metrics,
+        cost if complete else None,
+        "harness_reported" if complete else "unknown",
+    )
+    context = AgentContext()
+    agent._populate_context_if_usage_known(context, trajectory.final_metrics)
+    assert context.cost_source == ("harness_reported" if complete else "unknown")
+    assert context.session_reported_usage.cost_source == (
+        "unknown" if state == "missing" else "harness_reported"
+    )
+    if complete:
+        marked = agent._mark_collection_incomplete(trajectory)
+        assert_cost_observation(marked.final_metrics, None, "unknown")
+        assert (
+            marked.final_metrics.extra["session_reported_usage"]["cost_source"]
+            == "harness_reported"
+        )
+
+
+@pytest.mark.parametrize("name", ["codex", "opencode-v2"])
+def test_tree_cost_provenance_is_unknown_if_child_cost_is_missing(tmp_path, name):
+    from pier.models.trajectories import Agent, FinalMetrics, Step, Trajectory
+
+    root = Trajectory(
+        schema_version="ATIF-v1.7",
+        session_id="root",
+        trajectory_id="root",
+        agent=Agent(name=name, version="test"),
+        steps=[Step(step_id=1, source="user", message="task")],
+        final_metrics=FinalMetrics(
+            total_prompt_tokens=10,
+            total_completion_tokens=1,
+            total_cached_tokens=0,
+            total_cost_usd=0.25,
+            extra={"cost_source": "harness_reported"},
+        ),
+    )
+    child = root.model_copy(deep=True)
+    child.session_id = child.trajectory_id = "child"
+    child.final_metrics.total_cost_usd = None
+    child.final_metrics.extra["cost_source"] = "unknown"
+    root.subagent_trajectories = [child]
+    agent = (
+        Codex(logs_dir=tmp_path, model_name="test")
+        if name == "codex"
+        else OpenCodeV2(logs_dir=tmp_path, model_name="test/test")
+    )
+    tree = (
+        agent._with_tree_metrics(root)
+        if name == "codex"
+        else agent._with_tree_metrics(root, 1)
+    )
+    assert_cost_observation(tree.final_metrics, None, "unknown")
+
+
+def test_job_withheld_cost_source_differs_from_best_known_cost_source(tmp_path):
+    from pier.models.job.result import JobStats
+    from pier.models.agent.usage import ReportedUsage
+
+    known = trial_result(
+        tmp_path, "known", AgentContext(cost_usd=0.25, cost_source="harness_reported")
+    )
+    missing = trial_result(tmp_path, "missing", AgentContext(cost_source="unknown"))
+    stats = JobStats.from_trial_results([known, missing])
+    assert stats.cost_usd is None
+    assert stats.cost_source == "unknown"
+    assert stats.canonical_trials["missing"]["cost_source"] == "unknown"
+    best = ReportedUsage.aggregate(
+        [known.reported_usage(), missing.reported_usage()], source="test"
+    )
+    assert best.cost_usd == 0.25
+    assert best.cost_source == "mixed"
+    unknown = ReportedUsage.aggregate([missing.reported_usage()], source="test")
+    assert unknown.cost_usd is None
+    assert unknown.cost_source == "unknown"

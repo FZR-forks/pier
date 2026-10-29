@@ -45,7 +45,11 @@ def populate_context_from_final_metrics(
     context.n_cache_tokens = metrics.total_cached_tokens
     context.n_output_tokens = metrics.total_completion_tokens
     extra = metrics.extra or {}
-    context.cost_source = extra.get("cost_source")
+    context.cost_source = (
+        extra.get("cost_source", "unknown")
+        if metrics.total_cost_usd is not None
+        else "unknown"
+    )
     context.metrics_complete = all(
         value is not None
         for value in (

@@ -1482,7 +1482,7 @@ class Codex(BaseInstalledAgent):
                 )
 
         final_extra: dict[str, Any] = {}
-        final_extra["cost_source"] = "pricing_estimate"
+        final_extra["cost_source"] = "unknown"
         from pier.utils.rejected_request import rejected_requests_from_errors
 
         rejected = rejected_requests_from_errors(raw_events, source="codex.rollout")
@@ -1518,6 +1518,8 @@ class Codex(BaseInstalledAgent):
                 cache_write_tokens=usage["cache_write_tokens"],
                 model_name=default_model_name,
             )
+            if total_cost_usd is not None:
+                final_extra["cost_source"] = "pricing_estimate"
             final_extra["reasoning_output_tokens"] = usage["reasoning_tokens"]
             if usage["cache_write_tokens"] is not None:
                 final_extra["total_cache_write_input_tokens"] = usage[
@@ -1851,6 +1853,9 @@ class Codex(BaseInstalledAgent):
                 "total_cost_usd": None,
                 "total_steps": aggregate_steps,
             }
+        )
+        tree_extra["cost_source"] = (
+            "pricing_estimate" if aggregate["total_cost_usd"] is not None else "unknown"
         )
 
         data = root.to_json_dict()

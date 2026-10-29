@@ -456,18 +456,23 @@ class GeminiCli(BaseInstalledAgent):
             peak_context_tokens=peak_context_tokens_from_steps(steps),
             summarization_count=summarization_count,
         )
-        final_extra["cost_source"] = "pricing_estimate"
+        total_cost_usd = (
+            self._compute_cost_from_pricing(
+                total_input_tokens, total_output_tokens, total_cached_tokens
+            )
+            if usage_complete
+            else None
+        )
+        final_extra["cost_source"] = (
+            "pricing_estimate" if total_cost_usd is not None else "unknown"
+        )
 
         # Build final metrics
         final_metrics = FinalMetrics(
             total_prompt_tokens=total_input_tokens if usage_complete else None,
             total_completion_tokens=total_output_tokens if usage_complete else None,
             total_cached_tokens=total_cached_tokens if usage_complete else None,
-            total_cost_usd=self._compute_cost_from_pricing(
-                total_input_tokens, total_output_tokens, total_cached_tokens
-            )
-            if usage_complete
-            else None,
+            total_cost_usd=total_cost_usd,
             total_steps=len(steps),
             extra=final_extra,
         )

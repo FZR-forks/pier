@@ -1782,7 +1782,7 @@ class OpenCodeV2(BaseInstalledAgent):
                 )
 
         final_extra: dict[str, Any] = {}
-        final_extra["cost_source"] = "harness_reported"
+        final_extra["cost_source"] = "unknown"
         if usage_seen:
             final_extra["total_cache_write_input_tokens"] = totals["cache_write"]
             final_extra["total_reasoning_tokens"] = totals["reasoning"]
@@ -1856,6 +1856,8 @@ class OpenCodeV2(BaseInstalledAgent):
             final_metrics.total_completion_tokens = None
             final_metrics.total_cached_tokens = None
             final_metrics.total_cost_usd = None
+        if final_metrics.total_cost_usd is not None:
+            final_metrics.extra["cost_source"] = "harness_reported"
         if self._restrict_model and self.model_name and not model_provenance_complete:
             final_metrics.extra = dict(final_metrics.extra or {})
             final_metrics.extra["model_provenance_complete"] = False
@@ -2411,7 +2413,7 @@ class OpenCodeV2(BaseInstalledAgent):
             n_cache_write_tokens=tokens["cache_write"],
             n_reasoning_tokens=tokens["reasoning"],
             cost_usd=cost,
-            cost_source="harness_reported",
+            cost_source="harness_reported" if cost is not None else "unknown",
             session_ids=[str(session["id"])],
         )
 
@@ -2527,7 +2529,11 @@ class OpenCodeV2(BaseInstalledAgent):
         tree_extra["subagent_count"] = subagent_count
         tree_extra["tree_metrics_complete"] = complete
         tree_extra["tree_cost_complete"] = cost_complete
-        tree_extra["cost_source"] = "harness_reported"
+        tree_extra["cost_source"] = (
+            "harness_reported"
+            if complete and cost_complete and total_cost is not None
+            else "unknown"
+        )
         discrepancies = {
             str(node.trajectory_id): node.final_metrics.extra["usage_discrepancies"]
             for node in nodes
@@ -2622,6 +2628,7 @@ class OpenCodeV2(BaseInstalledAgent):
                 "tree_metrics_complete": False,
                 "tree_cost_complete": False,
                 "collection_incomplete": True,
+                "cost_source": "unknown",
             }
         )
         metrics.update(
@@ -2643,6 +2650,11 @@ class OpenCodeV2(BaseInstalledAgent):
         """Keep withheld token totals unknown instead of coercing them to zero."""
         if metrics is not None:
             extra = metrics.extra or {}
+            context.cost_source = (
+                extra.get("cost_source", "unknown")
+                if metrics.total_cost_usd is not None
+                else "unknown"
+            )
             context.usage_discrepancies = extra.get("usage_discrepancies")
             context.metrics_complete = all(
                 value is not None
@@ -3024,6 +3036,7 @@ class OpenCodeV2(BaseInstalledAgent):
                 final_metrics=FinalMetrics(
                     total_steps=1,
                     extra={
+                        "cost_source": "unknown",
                         "metrics_complete": False,
                         "tree_metrics_complete": False,
                         "tree_cost_complete": False,

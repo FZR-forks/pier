@@ -129,32 +129,57 @@ def audit(job_dir):
                 "compaction markers disagree with count",
             )
         native = {}
+        native_best_known = None
+        native_missing_observations = {}
         sources = []
         if name == "opencode-v2":
+            from pier.agents.installed.opencode_v2 import OpenCodeV2
+            from pier.models.agent.usage import ReportedUsage
+
             sources = [agent_dir / "opencode-v2" / "opencode-v2-sessions.jsonl"]
+            if not sources[0].exists():
+                sources = [
+                    agent_dir / "opencode-v2" / "opencode-v2-sessions.partial.jsonl"
+                ]
             records = jsonl(sources[0])
             sessions = {
-                record["session"]["id"]: record["session"] for record in records
+                record["session"]["id"]: record["session"]
+                for record in records
+                if isinstance(record.get("session"), dict)
+                and record["session"].get("id")
             }
-            native = {
-                "n_input_tokens": 0,
-                "n_cache_tokens": 0,
-                "n_output_tokens": 0,
-                "cost_usd": 0,
-            }
-            for session in sessions.values():
-                tokens, cache = session["tokens"], session["tokens"]["cache"]
-                native["n_input_tokens"] += (
-                    tokens["input"] + cache["read"] + cache["write"]
+            observations = [
+                OpenCodeV2._session_reported_usage(session, complete=False)
+                or ReportedUsage(
+                    source="opencode.session.tokens/cost", session_ids=[sid]
                 )
-                native["n_cache_tokens"] += cache["read"]
-                native["n_output_tokens"] += tokens["output"] + tokens["reasoning"]
-                native["cost_usd"] += session["cost"]
+                for sid, session in sessions.items()
+            ]
+            check(bool(observations), "no native session usage observations")
+            observed = ReportedUsage.aggregate(
+                observations, source="opencode.session.tokens/cost"
+            )
+            fields = ("n_input_tokens", "n_cache_tokens", "n_output_tokens", "cost_usd")
+            native_best_known = {key: getattr(observed, key) for key in fields}
+            native_missing_observations = observed.missing_observations
+            native = {
+                key: value if not native_missing_observations.get(key) else None
+                for key, value in native_best_known.items()
+            }
+            missing = [key for key in fields if native_missing_observations.get(key)]
+            check(
+                not missing,
+                "native session usage has missing categories: " + ", ".join(missing),
+            )
             reported = context.get("session_reported_usage") or {}
-            for key, value in native.items():
+            for key, value in native_best_known.items():
+                reported_value = reported.get(key)
                 check(
-                    math.isclose(
-                        value, reported.get(key, -1), rel_tol=1e-9, abs_tol=1e-12
+                    reported_value is None
+                    if value is None
+                    else isinstance(reported_value, (int, float))
+                    and math.isclose(
+                        value, reported_value, rel_tol=1e-9, abs_tol=1e-12
                     ),
                     key + " differs from saved session totals",
                 )
@@ -274,6 +299,8 @@ def audit(job_dir):
                     )
                 },
                 "native": native,
+                "native_best_known": native_best_known,
+                "native_missing_observations": native_missing_observations,
                 "sources_sha256": {
                     str(p.relative_to(job_dir)): hashlib.sha256(
                         p.read_bytes()

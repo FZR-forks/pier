@@ -186,7 +186,9 @@ class JobStats(BaseModel):
             )
         )
         self.canonical_trials[trial_result.trial_name]["cost_source"] = (
-            trial_result.reported_usage().cost_source or "unknown"
+            (trial_result.reported_usage().cost_source or "unknown")
+            if cost is not None
+            else "unknown"
         )
         self._refresh_usage_totals()
 
@@ -213,7 +215,11 @@ class JobStats(BaseModel):
             for item in self.canonical_trials.values()
         }
         self.cost_source = (
-            (next(iter(sources)) if len(sources) == 1 else "mixed") if sources else None
+            (next(iter(sources)) if len(sources) == 1 else "mixed")
+            if self.cost_usd is not None
+            else "unknown"
+            if sources
+            else None
         )
 
     def remove_trial(self, trial_result: TrialResult) -> None:

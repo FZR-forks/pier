@@ -76,3 +76,9 @@ explicitly free model rates, cancellation inside the real trial START hook,
 retry callback/backoff cancellation with resume-count verification, and viewer
 peak/step averages with partially missing observations. Provider error regex
 tests confirm the adjacent string literals form one two-capture pattern.
+
+A further review pass covers absent and withheld cost provenance across Claude
+Code, Codex, Gemini CLI, mini-swe-agent and both OpenCode adapters, including
+explicit zero-cost observations and incomplete child trees. Partial OpenCode
+session audits now retain best-known values and per-category missing counts,
+returning a non-green audit report instead of raising on absent counters.

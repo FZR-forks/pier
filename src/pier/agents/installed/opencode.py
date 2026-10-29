@@ -351,7 +351,7 @@ class OpenCode(BaseInstalledAgent):
             total_cost_usd=total_cost if cost_complete else None,
             total_steps=len(steps),
             extra=extra_with_context_metrics(
-                {"cost_source": "harness_reported"},
+                {"cost_source": "harness_reported" if cost_complete else "unknown"},
                 peak_context_tokens=peak_context_tokens_from_steps(steps),
                 summarization_count=None,
             ),

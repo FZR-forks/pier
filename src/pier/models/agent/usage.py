@@ -60,7 +60,11 @@ class ReportedUsage(BaseModel):
                     "cost_usd",
                 )
             ),
-            cost_source=next(iter(cost_sources)) if len(cost_sources) == 1 else "mixed",
+            cost_source=(
+                next(iter(cost_sources)) if len(cost_sources) == 1 else "mixed"
+            )
+            if values["cost_usd"] is not None
+            else "unknown",
             missing_observations=missing,
             session_ids=list(
                 dict.fromkeys(sid for item in observations for sid in item.session_ids)

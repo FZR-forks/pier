@@ -23,6 +23,9 @@ caching and gateway-specific billing are not part of these metrics.
   `mixed`/`unknown` in an aggregate). Harness prices and configured standard
   provider prices must be correct for the model being evaluated. Pier does not
   replace these figures with a gateway invoice or a gateway's response-cache cost.
+  A null/withheld cost always has `unknown` provenance, including incomplete
+  session trees. A separately retained running session cost can still be
+  `harness_reported` even when the exact whole-run cost is unknown.
 - Codex custom slugs can use `kwargs.pricing_model_name` to explicitly select
   the standard provider's LiteLLM price-table entry without changing the model
   sent to the harness. This only reprices that selected model, not differently
