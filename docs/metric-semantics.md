@@ -15,6 +15,10 @@ caching and gateway-specific billing are not part of these metrics.
   additional input, not generated output.
 - Cache creation and reasoning totals are promoted when reported. Unknown
   categories stay null; an explicitly reported zero stays zero.
+- Pi custom model entries with omitted cost rates generate placeholder zero
+  costs. Those are not free inference: Pier uses its standard-provider pricing
+  fallback, or leaves cost unknown if the slug cannot be priced. Explicitly
+  configured zero rates remain zero.
 - `cost_source` distinguishes `harness_reported` from `pricing_estimate` (or
   `mixed`/`unknown` in an aggregate). Harness prices and configured standard
   provider prices must be correct for the model being evaluated. Pier does not
@@ -64,6 +68,9 @@ emit `TrialEvent.RETRY`. Retry usage is separately labelled `stats.retry_overhea
 with `retry_attempt_paths`. Archive failure preserves the original observation
 and stops retrying instead of deleting evidence. Explicit resume filters also
 archive prior observations rather than deleting them.
+Retry counts increment only when a replacement attempt enters execution, not
+while waiting in backoff or notifying retry hooks. Cancellation in a start hook
+still finalizes and persists the initialized canonical observation.
 
 Existing historical output is not rewritten automatically. These semantics apply
 to newly generated files; retain the `lock.json` with every benchmark job.

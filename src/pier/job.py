@@ -265,9 +265,23 @@ class Job:
             if self._existing_job_result is not None
             else 0
         )
+        self._retry_counts_by_trial = {
+            result.trial_name: result.attempt - 1
+            for result in self._existing_trial_results
+        }
+        for path in (self.job_dir / ".retry-attempts").glob("*/*/result.json"):
+            try:
+                result = TrialResult.model_validate_json(path.read_text())
+            except (ValueError, OSError):
+                # Preserve legacy/unreadable archives without inventing a
+                # started replacement attempt from their directory names.
+                continue
+            self._retry_counts_by_trial[result.trial_name] = max(
+                self._retry_counts_by_trial.get(result.trial_name, 0),
+                result.attempt - 1,
+            )
         self._n_retries = max(
-            self._n_retries,
-            sum(1 for _ in (self.job_dir / ".retry-attempts").glob("*/*/result.json")),
+            self._n_retries, sum(self._retry_counts_by_trial.values())
         )
 
     def _init_remaining_trial_configs(self):
@@ -439,7 +453,6 @@ class Job:
         self._job_result.stats.remove_trial(previous_result)
         if self._is_cancelled_result(previous_result):
             self._cancelled_trial_ids.discard(trial_name)
-        self._n_retries += 1
         self._refresh_metrics_for_eval(evals_key, dataset_name)
 
     def _write_job_result(self, *, exclude_trial_results: bool = False) -> None:
@@ -579,6 +592,13 @@ class Job:
         """Internal hook to update live progress when a trial starts."""
         async with self._trial_completion_lock:
             self._remove_completed_attempt_for_retry(event.trial_id)
+            # Count a replacement only once it actually enters Trial.run.
+            # Cancellation in backoff/RETRY callbacks must not invent an attempt.
+            if event.result is not None:
+                previous = self._retry_counts_by_trial.get(event.trial_id, 0)
+                started = max(previous, event.result.attempt - 1)
+                self._retry_counts_by_trial[event.trial_id] = started
+                self._n_retries += started - previous
             self._running_trial_ids.add(event.trial_id)
             self._refresh_job_progress(updated_at=event.timestamp)
             await self._write_job_result_async(exclude_trial_results=True)
@@ -635,7 +655,6 @@ class Job:
     async def _on_trial_retry(self, event: TrialHookEvent) -> None:
         """A discarded infrastructure attempt is overhead, never a result."""
         async with self._trial_completion_lock:
-            self._n_retries += 1
             self._refresh_job_progress(updated_at=event.timestamp)
             await self._write_job_result_async(exclude_trial_results=True)
 

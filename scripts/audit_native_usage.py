@@ -21,6 +21,44 @@ def jsonl(path):
     ]
 
 
+def codex_usage_snapshot(events):
+    """Select native cumulative usage, excluding only context-full sentinels."""
+    usage = None
+    for event in events:
+        payload = event.get("payload")
+        if (
+            event.get("type") != "event_msg"
+            or not isinstance(payload, dict)
+            or payload.get("type") != "token_count"
+        ):
+            continue
+        info = payload.get("info")
+        if not isinstance(info, dict) or not isinstance(
+            info.get("total_token_usage"), dict
+        ):
+            continue
+        candidate = info["total_token_usage"]
+        window = info.get("model_context_window")
+        if (
+            isinstance(window, int)
+            and window > 0
+            and candidate.get("total_tokens") == window
+            and all(
+                (candidate.get(field) or 0) == 0
+                for field in (
+                    "input_tokens",
+                    "cached_input_tokens",
+                    "cache_write_input_tokens",
+                    "output_tokens",
+                    "reasoning_output_tokens",
+                )
+            )
+        ):
+            continue
+        usage = candidate
+    return usage
+
+
 def audit(job_dir):
     errors, trials = [], []
     stats = json.loads((job_dir / "result.json").read_text())["stats"]
@@ -172,23 +210,18 @@ def audit(job_dir):
         elif name == "codex":
             sources = list((agent_dir / "sessions").rglob("*.jsonl"))
             if len(nodes) == 1 and len(sources) == 1:
-                snapshots = [
-                    event["payload"]["info"]["total_token_usage"]
-                    for event in jsonl(sources[0])
-                    if event.get("type") == "event_msg"
-                    and event.get("payload", {}).get("type") == "token_count"
-                    and event["payload"].get("info")
-                ]
-                usage = snapshots[-1]
+                usage = codex_usage_snapshot(jsonl(sources[0]))
+                check(usage is not None, "no native cumulative usage snapshot")
+                usage = usage or {}
                 native = {
-                    "n_input_tokens": usage["input_tokens"],
-                    "n_cache_tokens": usage["cached_input_tokens"],
-                    "n_output_tokens": usage["output_tokens"],
+                    "n_input_tokens": usage.get("input_tokens"),
+                    "n_cache_tokens": usage.get("cached_input_tokens"),
+                    "n_output_tokens": usage.get("output_tokens"),
                 }
                 # Independently reconcile standard provider cache-aware pricing.
                 config = result["config"]["agent"]
                 pricing_name = config.get("kwargs", {}).get("pricing_model_name")
-                if pricing_name:
+                if pricing_name and all(value is not None for value in native.values()):
                     import litellm
 
                     rates = litellm.model_cost[pricing_name]
@@ -213,7 +246,12 @@ def audit(job_dir):
         else:
             check(False, "unsupported native harness: " + name)
         for key, value in native.items():
-            if context.get(key) is not None:
+            if value is None:
+                check(
+                    context.get(key) is None,
+                    key + " is reported without native evidence",
+                )
+            elif context.get(key) is not None:
                 check(
                     math.isclose(value, context[key], rel_tol=1e-9, abs_tol=1e-12),
                     key + " differs from native usage",

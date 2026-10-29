@@ -968,9 +968,10 @@ class Trial:
             source=self.config.task.source,
         )
 
-        await self._invoke_hooks(TrialEvent.START)
-
         try:
+            # START hooks can be cancelled too: every initialized observation
+            # must pass through finalization and reach result.json.
+            await self._invoke_hooks(TrialEvent.START)
             await self._setup_environment()
             await self._environment.run_healthcheck()
             self._environment.default_user = self._task.config.agent.user

@@ -245,8 +245,8 @@ class TrialQueue:
             )
 
             try:
-                await notify(TrialEvent.RETRY, result)
                 await asyncio.sleep(delay)
+                await notify(TrialEvent.RETRY, result)
             except asyncio.CancelledError:
                 # No replacement benchmark attempt started. Restore the last
                 # observation as canonical instead of leaving an archive only.

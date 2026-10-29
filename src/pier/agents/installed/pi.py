@@ -1,5 +1,6 @@
 import copy
 import json
+import math
 import shlex
 from datetime import datetime, timezone
 from typing import Any
@@ -267,6 +268,38 @@ class Pi(BaseInstalledAgent):
         return (
             f'mkdir -p "$(dirname {self._MODELS_JSON_PATH})" && '
             f"printf '%s\\n' {escaped} > {self._MODELS_JSON_PATH}"
+        )
+
+    def _has_model_cost_metadata(self, message: dict[str, Any] | None = None) -> bool:
+        """Custom model entries default omitted rates to zero in Pi.
+
+        Built-in models retain Pi's shipped rates. A custom entry must actually
+        supply rates before its zero calculated cost can mean a free inference.
+        """
+        message = message or {}
+        provider = message.get("provider") or self._provider()
+        model = message.get("model") or (self.model_name or "").split("/", 1)[-1]
+        entry = (self._pi_config.get("providers") or {}).get(provider) or {}
+        for candidate in entry.get("models") or []:
+            if isinstance(candidate, dict) and candidate.get("id") == model:
+                rates = candidate.get("cost")
+                return isinstance(rates, dict) and all(
+                    isinstance(rates.get(key), (int, float))
+                    and not isinstance(rates[key], bool)
+                    and math.isfinite(rates[key])
+                    and rates[key] >= 0
+                    for key in ("input", "output", "cacheRead", "cacheWrite")
+                )
+        return True
+
+    def _has_reported_cost(
+        self, usage: Any, message: dict[str, Any] | None = None
+    ) -> bool:
+        if not isinstance(usage, dict) or not isinstance(usage.get("cost"), dict):
+            return False
+        cost = usage["cost"].get("total")
+        return cost is not None and (
+            cost != 0 or self._has_model_cost_metadata(message)
         )
 
     def _build_register_skills_command(self) -> str | None:
@@ -570,8 +603,7 @@ class Pi(BaseInstalledAgent):
                 completion_tokens=output_tokens,
                 cached_tokens=cache_read,
                 cost_usd=cost_total
-                if isinstance(usage.get("cost"), dict)
-                and usage["cost"].get("total") is not None
+                if self._has_reported_cost(usage, message)
                 else None,
                 extra=metrics_extra or None,
             )
@@ -808,23 +840,30 @@ class Pi(BaseInstalledAgent):
             return None
 
         usages = []
+        cost_observations = []
         for record in records:
             if record["kind"] == "agent":
                 usages.append(record["message"].get("usage"))
+                cost_observations.append(
+                    self._has_reported_cost(usages[-1], record["message"])
+                )
                 usages.extend(
                     result["usage"]
                     for result in record["tool_results"]
                     if isinstance(result.get("usage"), dict)
                 )
+                cost_observations.extend(
+                    self._has_reported_cost(result["usage"], result)
+                    for result in record["tool_results"]
+                    if isinstance(result.get("usage"), dict)
+                )
             else:
                 usages.append(record["result"].get("usage"))
+                cost_observations.append(self._has_reported_cost(usages[-1]))
         usage_known = all(self._usage_record_known(usage) for usage in usages)
-        costs_reported = usage_known and all(
-            isinstance(usage.get("cost"), dict)
-            and usage["cost"].get("total") is not None
-            for usage in usages
-        )
-        # An explicit zero is the harness's observation, not missing data.
+        costs_reported = usage_known and all(cost_observations)
+        # Keep explicit zero rates, but not a custom model's omitted-rate
+        # placeholder zeros (those need standard inference pricing or unknown).
         total_cost = totals["cost"] if costs_reported else None
         cost_source = "harness_reported" if costs_reported else "pricing_estimate"
         if total_cost is None and usage_known:

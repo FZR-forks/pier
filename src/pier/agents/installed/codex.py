@@ -1539,6 +1539,7 @@ class Codex(BaseInstalledAgent):
         elif final_extra.get("rejected_request_tokens") or summarization_count:
             # Context rejection/compaction evidence is useful even if no
             # request ever returned a cumulative usage snapshot.
+            final_extra["metrics_complete"] = False
             total_metrics = FinalMetrics(total_steps=len(steps), extra=final_extra)
 
         trajectory = Trajectory(

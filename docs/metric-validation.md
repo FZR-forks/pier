@@ -69,3 +69,10 @@ session trees, contradictory usage, zero versus unknown, provider cache rates,
 cache-creation input, reasoning output, canonical retry selection, archive
 failure, cancellation during retry backoff, resume provenance, incomplete job
 and multi-step aggregates, and rejected request input diagnostics.
+
+PR review regressions additionally cover evidence-only Codex child sessions,
+missing/malformed/context-full audit snapshots, custom Pi default-zero versus
+explicitly free model rates, cancellation inside the real trial START hook,
+retry callback/backoff cancellation with resume-count verification, and viewer
+peak/step averages with partially missing observations. Provider error regex
+tests confirm the adjacent string literals form one two-capture pattern.
