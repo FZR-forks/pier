@@ -12,7 +12,7 @@ caching and gateway-specific billing are not part of these metrics.
 - `n_output_tokens` / `completion_tokens` includes billable reasoning output.
   Native harnesses differ: Codex and Pi already include reasoning in output;
   OpenCode V2 splits it out, so Pier adds it once. Gemini's tool-prompt count is
-  not generated output.
+  additional input, not generated output.
 - Cache creation and reasoning totals are promoted when reported. Unknown
   categories stay null; an explicitly reported zero stays zero.
 - `cost_source` distinguishes `harness_reported` from `pricing_estimate` (or

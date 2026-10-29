@@ -396,18 +396,19 @@ class GeminiCli(BaseInstalledAgent):
                     thoughts_tokens = tokens.get("thoughts", 0)
                     tool_tokens = tokens.get("tool", 0)
 
-                    # toolUsePromptTokenCount is input, not generated output.
+                    # toolUsePromptTokenCount is additional input, not output.
                     # Gemini CLI persists it as `tool`; hidden thoughts are
                     # billable output and are added to candidatesTokenCount.
                     completion_tokens = output_tokens + thoughts_tokens
+                    prompt_tokens = input_tokens + tool_tokens
 
                     # Update totals
-                    total_input_tokens += input_tokens
+                    total_input_tokens += prompt_tokens
                     total_output_tokens += completion_tokens
                     total_cached_tokens += cached_tokens
 
                     metrics = Metrics(
-                        prompt_tokens=input_tokens,
+                        prompt_tokens=prompt_tokens,
                         completion_tokens=completion_tokens,
                         cached_tokens=cached_tokens,
                         extra={

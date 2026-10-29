@@ -25,7 +25,7 @@ def test_gemini_tool_prompt_is_not_billed_as_output(tmp_path):
             ],
         }
     )
-    assert trajectory.final_metrics.total_prompt_tokens == 100
+    assert trajectory.final_metrics.total_prompt_tokens == 150
     assert trajectory.final_metrics.total_completion_tokens == 30
     assert trajectory.steps[0].metrics.extra["tool_tokens"] == 50
 
