@@ -174,7 +174,10 @@ class TrialResult(BaseModel):
                                 context.n_output_tokens,
                                 context.cost_usd,
                             )
-                        ),
+                        )
+                        and context.metrics_complete is not False,
+                        lower_bound=context.metrics_complete is False
+                        and not bool(context.usage_discrepancies),
                         n_input_tokens=context.n_input_tokens,
                         n_cache_tokens=context.n_cache_tokens,
                         n_output_tokens=context.n_output_tokens,

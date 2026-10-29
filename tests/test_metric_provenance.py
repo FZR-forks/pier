@@ -527,3 +527,86 @@ def test_ungraded_trial_is_still_counted_in_job_denominator(tmp_path):
     stats = JobStats.from_trial_results([result_for(tmp_path, error="RuntimeError")])
     assert stats.evals["test__adhoc"].n_trials == 1
     assert stats.evals["test__adhoc"].n_errors == 1
+
+
+@pytest.mark.asyncio
+async def test_job_hooks_and_disk_summary_select_only_canonical_attempt(
+    tmp_path, monkeypatch
+):
+    from collections import defaultdict
+    from pier.metrics.mean import Mean
+    from pier.models.trial.config import AgentConfig
+    from pier.trial.hooks import TrialHookEvent
+    from pier.models.agent.name import AgentName
+
+    config = JobConfig(
+        job_name="job",
+        jobs_dir=tmp_path,
+        quiet=True,
+        agents=[AgentConfig(name=AgentName.NOP)],
+        retry=RetryConfig(max_retries=1, min_wait_sec=0, max_wait_sec=0),
+    )
+    job = Job(
+        config,
+        _task_configs=[TaskConfig(path=tmp_path)],
+        _metrics=defaultdict(lambda: [Mean()]),
+    )
+    attempts = []
+
+    class FakeTrial:
+        def __init__(self, config):
+            self.config = config
+            self.trial_dir = config.trials_dir / config.trial_name
+            self.hooks = defaultdict(list)
+
+        def add_hook(self, event, hook):
+            self.hooks[event].append(hook)
+
+        async def run(self, **kwargs):
+            self.trial_dir.mkdir()
+            result = result_for(
+                tmp_path,
+                error="ConnectionError" if not attempts else None,
+                reward=None if not attempts else 1,
+                usage=AgentContext(
+                    n_input_tokens=100 if not attempts else 200,
+                    n_cache_tokens=0,
+                    n_output_tokens=10,
+                    cost_usd=0.1 if not attempts else 0.2,
+                ),
+            )
+            result.trial_name = self.config.trial_name
+            result.config = self.config
+            result.attempt = kwargs["attempt"]
+            result.retry_attempts = list(kwargs["retry_attempts"])
+            attempts.append(result)
+            for event in (TrialEvent.START, TrialEvent.END):
+                for hook in self.hooks[event]:
+                    await hook(
+                        TrialHookEvent(
+                            event=event,
+                            trial_id=result.trial_name,
+                            task_name=result.task_name,
+                            config=self.config,
+                            result=result,
+                        )
+                    )
+            (self.trial_dir / "result.json").write_text(result.model_dump_json())
+            return result
+
+    async def create(cls, config):
+        return FakeTrial(config)
+
+    monkeypatch.setattr(Trial, "create", classmethod(create))
+    result = await job.run()
+    assert result.stats.n_completed_trials == 1
+    assert result.stats.n_retries == 1
+    assert result.stats.n_input_tokens == 200
+    assert result.stats.cost_usd == 0.2
+    assert result.stats.retry_overhead.cost_usd == 0.1
+    assert result.stats.retry_overhead.n_input_tokens == 100
+    saved = json.loads((job.job_dir / "result.json").read_text())["stats"]
+    canonical = next(iter(saved["canonical_trials"].values()))
+    assert canonical["attempt"] == 2
+    assert canonical["id"] == str(attempts[1].id)
+    assert next(iter(saved["evals"].values()))["metrics"] == [{"mean": 1.0}]

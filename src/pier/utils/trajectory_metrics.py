@@ -46,6 +46,17 @@ def populate_context_from_final_metrics(
     context.n_output_tokens = metrics.total_completion_tokens
     extra = metrics.extra or {}
     context.cost_source = extra.get("cost_source")
+    context.metrics_complete = all(
+        value is not None
+        for value in (
+            metrics.total_prompt_tokens,
+            metrics.total_completion_tokens,
+            metrics.total_cached_tokens,
+        )
+    ) and not (
+        extra.get("metrics_complete") is False
+        or extra.get("tree_metrics_complete") is False
+    )
     for field, keys in (
         (
             "n_cache_write_tokens",

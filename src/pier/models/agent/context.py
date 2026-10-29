@@ -47,6 +47,10 @@ class AgentContext(BaseModel):
         default=None,
         description="Contradictions between harness session and per-call totals; exact totals are withheld.",
     )
+    metrics_complete: bool | None = Field(
+        default=None,
+        description="False when the harness tree or usage collection is known incomplete.",
+    )
     peak_context_tokens: int | None = Field(
         default=None,
         description="The largest input context observed for a single agent LLM call.",

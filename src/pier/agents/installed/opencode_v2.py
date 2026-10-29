@@ -2644,6 +2644,17 @@ class OpenCodeV2(BaseInstalledAgent):
         if metrics is not None:
             extra = metrics.extra or {}
             context.usage_discrepancies = extra.get("usage_discrepancies")
+            context.metrics_complete = all(
+                value is not None
+                for value in (
+                    metrics.total_prompt_tokens,
+                    metrics.total_completion_tokens,
+                    metrics.total_cached_tokens,
+                )
+            ) and not (
+                extra.get("metrics_complete") is False
+                or extra.get("tree_metrics_complete") is False
+            )
             if extra.get("session_reported_usage"):
                 context.session_reported_usage = ReportedUsage.model_validate(
                     extra["session_reported_usage"]
