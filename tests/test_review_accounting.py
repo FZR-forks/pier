@@ -23,6 +23,7 @@ from pier.job import Job
 from pier.metrics.mean import Mean
 from pier.models.agent.context import AgentContext
 from pier.models.job.config import JobConfig, RetryConfig
+from pier.models.job.result import JobResult, JobStats
 from pier.models.task.id import LocalTaskId
 from pier.models.trial.config import AgentConfig, TaskConfig, TrialConfig
 from pier.models.trial.paths import TrialPaths
@@ -810,3 +811,348 @@ def test_job_withheld_cost_source_differs_from_best_known_cost_source(tmp_path):
     unknown = ReportedUsage.aggregate([missing.reported_usage()], source="test")
     assert unknown.cost_usd is None
     assert unknown.cost_source == "unknown"
+
+
+def initialized_trial(config):
+    """Use the real Trial.run lifecycle without creating a sandbox."""
+    trial = Trial.__new__(Trial)
+    trial.config = config
+    trial._trial_paths = TrialPaths(config.trials_dir / config.trial_name)
+    trial._task = SimpleNamespace(name="task", checksum="checksum", has_steps=False)
+    trial._agent = SimpleNamespace(
+        to_agent_info=lambda: AgentInfo(name="test", version="1")
+    )
+    trial._environment = SimpleNamespace(
+        env_paths=SimpleNamespace(agent_dir=Path("/logs/agent"))
+    )
+    trial._logger = logging.getLogger(__name__)
+    trial._hooks = {event: [] for event in TrialEvent}
+    trial._setup_environment = AsyncMock()
+    trial._maybe_download_logs = AsyncMock()
+    trial._maybe_populate_agent_context = Mock()
+    trial._collect_artifacts = AsyncMock()
+    trial._stop_agent_environment = AsyncMock()
+    trial._close_logger_handler = Mock()
+    return trial
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("error_type", [ConnectionError, ValueError])
+async def test_start_hook_errors_propagate_without_benchmark_result_or_retry(
+    tmp_path, monkeypatch, error_type
+):
+    config = TrialConfig(
+        task=TaskConfig(path=tmp_path), trial_name="hook", trials_dir=tmp_path
+    )
+    trial = initialized_trial(config)
+    creates = []
+
+    async def create(cls, cfg):
+        creates.append(cfg)
+        return trial
+
+    error = error_type("orchestration hook failed")
+
+    async def failed(event):
+        raise error
+
+    ended = AsyncMock()
+    monkeypatch.setattr(Trial, "create", classmethod(create))
+    queue = TrialQueue(1, RetryConfig(max_retries=1))
+    queue.add_hook(TrialEvent.START, failed)
+    queue.add_hook(TrialEvent.END, ended)
+    with pytest.raises(error_type) as caught:
+        await queue._execute_trial_with_retries(config)
+    assert caught.value is error
+    assert len(creates) == 1
+    assert trial.result.exception_info is None
+    assert not trial._trial_paths.result_path.exists()
+    trial._setup_environment.assert_not_awaited()
+    trial._collect_artifacts.assert_not_awaited()
+    trial._close_logger_handler.assert_called_once()
+    ended.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_completed_replacement_counts_when_start_is_cancelled_waiting_for_lock(
+    tmp_path, monkeypatch
+):
+    config = JobConfig(
+        job_name="job", jobs_dir=tmp_path, agents=[AgentConfig(name="nop")]
+    )
+    job = Job(
+        config,
+        _task_configs=[TaskConfig(path=tmp_path)],
+        _metrics=defaultdict(lambda: [Mean()]),
+    )
+    trial_config = job._trial_configs[0]
+    trial = initialized_trial(trial_config)
+    job._job_result = JobResult(
+        id=job.id,
+        started_at=__import__("datetime").datetime.now(),
+        n_total_trials=1,
+        stats=JobStats(),
+    )
+    waiting = asyncio.Event()
+
+    async def start(event):
+        waiting.set()
+        await job._on_trial_started(event)
+
+    ended = []
+
+    async def end(event):
+        await job._on_trial_completed(event)
+        ended.append(event.result)
+
+    async def create(cls, cfg):
+        return trial
+
+    monkeypatch.setattr(Trial, "create", classmethod(create))
+    # An archived predecessor tells the queue this is attempt 2.
+    predecessor = trial_result(tmp_path, trial_config.trial_name)
+    predecessor.config = trial_config
+    predecessor.canonical = False
+    archive = job.job_dir / ".retry-attempts" / trial_config.trial_name / "attempt-1"
+    archive.mkdir(parents=True)
+    (archive / "result.json").write_text(predecessor.model_dump_json())
+    queue = TrialQueue(1)
+    queue.add_hook(TrialEvent.START, start)
+    queue.add_hook(TrialEvent.END, end)
+    try:
+        await job._trial_completion_lock.acquire()
+        running = asyncio.create_task(queue._execute_trial_with_retries(trial_config))
+        await asyncio.wait_for(waiting.wait(), timeout=5)
+        running.cancel()
+        job._trial_completion_lock.release()
+        with pytest.raises(asyncio.CancelledError):
+            await running
+        saved = json.loads((job.job_dir / "result.json").read_text())["stats"]
+        assert saved["n_retries"] == 1
+        assert saved["n_completed_trials"] == 1
+        assert ended[0].attempt == 2
+        # Repeated completion notification must not increment the attempt twice.
+        await end(
+            TrialHookEvent(
+                event=TrialEvent.END,
+                trial_id=trial_config.trial_name,
+                task_name="task",
+                config=trial_config,
+                result=ended[0],
+            )
+        )
+        assert job._n_retries == 1
+    finally:
+        if job._trial_completion_lock.locked():
+            job._trial_completion_lock.release()
+        job._close_logger_handlers()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("event", [TrialEvent.START, TrialEvent.RETRY])
+async def test_cancelled_threaded_job_write_holds_lock_until_finished(
+    tmp_path, monkeypatch, event
+):
+    import threading
+
+    job = Job(
+        JobConfig(job_name="job", jobs_dir=tmp_path, agents=[AgentConfig(name="nop")]),
+        _task_configs=[TaskConfig(path=tmp_path)],
+        _metrics=defaultdict(lambda: [Mean()]),
+    )
+    config = job._trial_configs[0]
+    result = trial_result(tmp_path, config.trial_name)
+    result.config = config
+    job._job_result = JobResult(
+        id=job.id,
+        started_at=__import__("datetime").datetime.now(),
+        n_total_trials=1,
+        stats=JobStats(),
+    )
+    entered = threading.Event()
+    release = threading.Event()
+    finished = threading.Event()
+    try:
+
+        def blocked_write(**kwargs):
+            entered.set()
+            if not release.wait(timeout=5):
+                raise AssertionError("test did not release worker")
+            job._job_result_path.write_text('{"phase":"old"}')
+            finished.set()
+
+        monkeypatch.setattr(job, "_write_job_result", blocked_write)
+        hook = TrialHookEvent(
+            event=event,
+            trial_id=config.trial_name,
+            task_name="task",
+            config=config,
+            result=result,
+        )
+        callback = (
+            job._on_trial_started if event == TrialEvent.START else job._on_trial_retry
+        )
+        task = asyncio.create_task(callback(hook))
+        assert await asyncio.to_thread(entered.wait, 5)
+        task.cancel()
+
+        async def final_accounting():
+            async with job._trial_completion_lock:
+                assert finished.is_set()
+                job._job_result_path.write_text('{"phase":"final"}')
+
+        final = asyncio.create_task(final_accounting())
+        await asyncio.sleep(0)
+        assert job._trial_completion_lock.locked()
+        assert not task.done()
+        assert not final.done()
+        # A repeated cancellation also must not detach the worker from the lock.
+        task.cancel()
+        await asyncio.sleep(0)
+        assert not task.done()
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        await asyncio.wait_for(final, 5)
+        assert json.loads(job._job_result_path.read_text()) == {"phase": "final"}
+    finally:
+        release.set()
+        job._close_logger_handlers()
+
+
+def test_filtered_cli_resume_keeps_archived_slots_attempt_history_and_ids(
+    tmp_path, monkeypatch
+):
+    from datetime import datetime
+    from pier.cli import jobs
+    from pier.environments.factory import EnvironmentFactory
+    from pier.models.verifier.result import VerifierResult
+
+    config = JobConfig(
+        job_name="job",
+        jobs_dir=tmp_path,
+        n_attempts=3,
+        quiet=True,
+        agents=[AgentConfig(name="nop")],
+    )
+    task_dir = tmp_path / "task"
+    task_dir.mkdir()
+    (task_dir / "instruction.md").write_text("task")
+    task_configs = [TaskConfig(path=task_dir)]
+    job = Job(
+        config, _task_configs=task_configs, _metrics=defaultdict(lambda: [Mean()])
+    )
+    originals = []
+    try:
+        (job.job_dir / "config.json").write_text(config.model_dump_json())
+        job._init_job_lock()
+        job._write_job_lock()
+        for index, trial_config in enumerate(job._trial_configs):
+            result = trial_result(
+                tmp_path,
+                trial_config.trial_name,
+                AgentContext(
+                    n_input_tokens=10, n_cache_tokens=0, n_output_tokens=1, cost_usd=0.1
+                ),
+            )
+            result.config = trial_config
+            result.attempt = 2 if index == 2 else 1
+            if index:
+                result.exception_info = ExceptionInfo.from_exception(
+                    asyncio.CancelledError()
+                )
+            else:
+                result.verifier_result = VerifierResult(rewards={"reward": 1})
+            path = job.job_dir / trial_config.trial_name
+            path.mkdir()
+            (path / "config.json").write_text(trial_config.model_dump_json())
+            (path / "result.json").write_text(result.model_dump_json())
+            originals.append(result)
+        previous = originals[2].model_copy(deep=True)
+        from uuid import uuid4
+
+        previous.id = uuid4()
+        previous.attempt = 1
+        previous.canonical = False
+        archive = job.job_dir / ".retry-attempts" / previous.trial_name / "attempt-1"
+        archive.mkdir(parents=True)
+        (archive / "result.json").write_text(previous.model_dump_json())
+        (job.job_dir / "result.json").write_text(
+            JobResult(
+                id=job.id,
+                started_at=datetime.now(),
+                n_total_trials=3,
+                stats=JobStats.from_trial_results(originals),
+            ).model_dump_json()
+        )
+    finally:
+        job._close_logger_handlers()
+    launched = []
+
+    class Replacement:
+        def __init__(self, cfg):
+            self.config = cfg
+            self.trial_dir = cfg.trials_dir / cfg.trial_name
+            self.hooks = defaultdict(list)
+
+        def add_hook(self, event, hook):
+            self.hooks[event].append(hook)
+
+        async def run(self, **kwargs):
+            self.trial_dir.mkdir()
+            result = trial_result(
+                tmp_path,
+                self.config.trial_name,
+                AgentContext(
+                    n_input_tokens=20, n_cache_tokens=0, n_output_tokens=2, cost_usd=0.2
+                ),
+            )
+            result.config = self.config
+            result.attempt = kwargs["attempt"]
+            result.retry_attempts = list(kwargs["retry_attempts"])
+            result.verifier_result = VerifierResult(rewards={"reward": 1})
+            launched.append(result)
+            for hook in self.hooks[TrialEvent.START]:
+                await hook(
+                    TrialHookEvent(
+                        event=TrialEvent.START,
+                        trial_id=result.trial_name,
+                        task_name=result.task_name,
+                        config=self.config,
+                        result=result,
+                    )
+                )
+            (self.trial_dir / "config.json").write_text(self.config.model_dump_json())
+            return result
+
+    async def create_trial(cls, cfg):
+        return Replacement(cfg)
+
+    async def create_job(cls, cfg):
+        return Job(
+            cfg, _task_configs=task_configs, _metrics=defaultdict(lambda: [Mean()])
+        )
+
+    monkeypatch.setattr(Trial, "create", classmethod(create_trial))
+    monkeypatch.setattr(Job, "create", classmethod(create_job))
+    monkeypatch.setattr(EnvironmentFactory, "run_preflight", lambda **kwargs: None)
+    jobs.resume(job.job_dir, filter_error_types=["CancelledError"])
+    assert {result.trial_name for result in launched} == {
+        originals[1].trial_name,
+        originals[2].trial_name,
+    }
+    for result in launched:
+        original = next(
+            item for item in originals if item.trial_name == result.trial_name
+        )
+        assert result.attempt == original.attempt + 1
+        assert original.id in {item.trial_id for item in result.retry_attempts}
+        assert len(result.retry_attempts) == original.attempt
+    saved = json.loads((job.job_dir / "result.json").read_text())["stats"]
+    assert set(saved["canonical_trials"]) == {result.trial_name for result in originals}
+    assert saved["canonical_trials"][originals[0].trial_name]["id"] == str(
+        originals[0].id
+    )
+    assert saved["n_completed_trials"] == 3
+    assert saved["n_retries"] == 3
+    assert len(saved["retry_attempt_paths"]) == 3

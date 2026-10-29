@@ -82,3 +82,10 @@ Code, Codex, Gemini CLI, mini-swe-agent and both OpenCode adapters, including
 explicit zero-cost observations and incomplete child trees. Partial OpenCode
 session audits now retain best-known values and per-category missing counts,
 returning a non-green audit report instead of raising on absent counters.
+
+Lifecycle review regressions also exercise the real filtered-resume command
+with identical task slots, multi-attempt archives and a retained canonical
+trial; START-lock cancellation reconciles retries again on completion; ordinary
+START-hook faults propagate without benchmark observations; and cancellation
+of blocked executor writes (including repeated cancellation) keeps final job
+accounting serialized until the worker finishes.

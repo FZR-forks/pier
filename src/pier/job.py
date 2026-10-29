@@ -181,6 +181,7 @@ class Job:
     def _maybe_init_existing_job(self):
         self._existing_trial_configs: list[TrialConfig] = []
         self._existing_trial_results: list[TrialResult] = []
+        self._archived_trial_configs: list[TrialConfig] = []
 
         self._previous_trial_results: dict[str, TrialResult] = {}
         self._existing_rewards: EvalsRewardsMap = defaultdict(dict)
@@ -216,6 +217,29 @@ class Job:
                 self._existing_trial_results.append(
                     TrialResult.model_validate_json(trial_paths.result_path.read_text())
                 )
+
+        canonical_names = {result.trial_name for result in self._existing_trial_results}
+        archived_by_name: dict[str, TrialResult] = {}
+        for path in sorted((self.job_dir / ".retry-attempts").glob("*/*/result.json")):
+            try:
+                archived = TrialResult.model_validate_json(path.read_text())
+            except (ValueError, OSError):
+                continue
+            if archived.trial_name in canonical_names:
+                continue
+            if (
+                archived.trial_name != path.parent.parent.name
+                or archived.config.trial_name != archived.trial_name
+            ):
+                raise ValueError(
+                    f"Archived trial identity does not match its path: {path}"
+                )
+            previous = archived_by_name.get(archived.trial_name)
+            if previous is None or archived.attempt > previous.attempt:
+                archived_by_name[archived.trial_name] = archived
+        self._archived_trial_configs = [
+            result.config for result in archived_by_name.values()
+        ]
 
         for trial_result in self._existing_trial_results:
             agent_name = trial_result.agent_info.name
@@ -287,6 +311,7 @@ class Job:
     def _init_remaining_trial_configs(self):
         remaining_trial_configs: list[TrialConfig] = []
         matched_existing_indices: set[int] = set()
+        matched_archived_indices: set[int] = set()
         reconciled_trial_configs: list[TrialConfig] = []
 
         for trial_config in self._trial_configs:
@@ -302,6 +327,23 @@ class Job:
                 None,
             )
             if existing_index is None:
+                # A filtered resume removes the canonical directory before Job
+                # is loaded. Retain the archived slot's name so the queue finds
+                # its attempt history rather than starting an unrelated trial.
+                archived_index = next(
+                    (
+                        index
+                        for index, archived_config in enumerate(
+                            self._archived_trial_configs
+                        )
+                        if index not in matched_archived_indices
+                        and archived_config == trial_config
+                    ),
+                    None,
+                )
+                if archived_index is not None:
+                    matched_archived_indices.add(archived_index)
+                    trial_config = self._archived_trial_configs[archived_index]
                 remaining_trial_configs.append(trial_config)
                 reconciled_trial_configs.append(trial_config)
             else:
@@ -312,6 +354,10 @@ class Job:
 
         if len(matched_existing_indices) != len(self._existing_trial_configs):
             raise ValueError("Existing trial config does not match planned job config.")
+        if len(matched_archived_indices) != len(self._archived_trial_configs):
+            raise ValueError(
+                "Archived trial config does not match a remaining planned trial slot."
+            )
 
         self._trial_configs = reconciled_trial_configs
         self._remaining_trial_configs = remaining_trial_configs
@@ -498,10 +544,25 @@ class Job:
     async def _write_job_result_async(
         self, *, exclude_trial_results: bool = False
     ) -> None:
-        await asyncio.to_thread(
-            self._write_job_result,
-            exclude_trial_results=exclude_trial_results,
+        write = asyncio.create_task(
+            asyncio.to_thread(
+                self._write_job_result,
+                exclude_trial_results=exclude_trial_results,
+            )
         )
+        try:
+            await asyncio.shield(write)
+        except asyncio.CancelledError:
+            # Executor work keeps running after its awaiter is cancelled. Drain
+            # it while the caller still holds _trial_completion_lock, including
+            # repeated cancellation, before any final accounting can write.
+            while not write.done():
+                try:
+                    await asyncio.shield(write)
+                except asyncio.CancelledError:
+                    continue
+            write.result()
+            raise
 
     def _init_job_lock(self) -> None:
         self._job_lock = build_job_lock(
@@ -595,10 +656,7 @@ class Job:
             # Count a replacement only once it actually enters Trial.run.
             # Cancellation in backoff/RETRY callbacks must not invent an attempt.
             if event.result is not None:
-                previous = self._retry_counts_by_trial.get(event.trial_id, 0)
-                started = max(previous, event.result.attempt - 1)
-                self._retry_counts_by_trial[event.trial_id] = started
-                self._n_retries += started - previous
+                self._reconcile_started_attempt(event.result)
             self._running_trial_ids.add(event.trial_id)
             self._refresh_job_progress(updated_at=event.timestamp)
             await self._write_job_result_async(exclude_trial_results=True)
@@ -622,6 +680,9 @@ class Job:
         trial_name = trial_result.trial_name
 
         async with self._trial_completion_lock:
+            # START may have been cancelled while waiting for this lock. A
+            # persisted completed replacement still counts, exactly once.
+            self._reconcile_started_attempt(trial_result)
             previous_result = self._previous_trial_results.get(trial_name)
 
             evals_key, dataset_name = self._evals_key_for_result(trial_result)
@@ -651,6 +712,12 @@ class Job:
 
             self._refresh_job_progress(updated_at=event.timestamp)
             await self._write_job_result_async(exclude_trial_results=True)
+
+    def _reconcile_started_attempt(self, result: TrialResult) -> None:
+        previous = self._retry_counts_by_trial.get(result.trial_name, 0)
+        started = max(previous, result.attempt - 1)
+        self._retry_counts_by_trial[result.trial_name] = started
+        self._n_retries += started - previous
 
     async def _on_trial_retry(self, event: TrialHookEvent) -> None:
         """A discarded infrastructure attempt is overhead, never a result."""

@@ -74,6 +74,10 @@ archive prior observations rather than deleting them.
 Retry counts increment only when a replacement attempt enters execution, not
 while waiting in backoff or notifying retry hooks. Cancellation in a start hook
 still finalizes and persists the initialized canonical observation.
+An ordinary START-hook exception propagates as an orchestration fault instead
+of being graded or retried as a benchmark failure. Filtered resume reuses each
+archived trial slot's name and full attempt history. Cancelled job-result writes
+finish under the accounting lock before cancellation/finalization can write.
 
 Existing historical output is not rewritten automatically. These semantics apply
 to newly generated files; retain the `lock.json` with every benchmark job.
