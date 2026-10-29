@@ -22,7 +22,7 @@ class FinalMetrics(BaseModel):
     )
     total_cost_usd: float | None = Field(
         default=None,
-        description="Total real monetary cost for the entire trajectory, including cost for subagents, if any",
+        description="Harness-reported or estimated cost for the entire trajectory, including subagents. See extra.cost_source; this is not necessarily the provider invoice.",
     )
     total_steps: int | None = Field(
         default=None,

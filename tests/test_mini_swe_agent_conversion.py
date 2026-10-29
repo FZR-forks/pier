@@ -162,6 +162,7 @@ def test_convert_openai_responses_usage_to_atif_metrics():
     assert trajectory.final_metrics.total_cached_tokens == 25
     assert trajectory.final_metrics.total_cost_usd == 0.03
     assert trajectory.final_metrics.extra == {
+        "cost_source": "harness_reported",
         "total_reasoning_tokens": 30,
         "total_text_tokens": 10,
         "peak_context_tokens": 100,
@@ -176,7 +177,7 @@ def test_convert_openai_responses_usage_to_atif_metrics():
     assert agent_steps[0].metrics.prompt_tokens == 100
     assert agent_steps[0].metrics.completion_tokens == 40
     assert agent_steps[0].metrics.cached_tokens == 25
-    assert agent_steps[0].metrics.cost_usd == 0.03
+    assert agent_steps[0].metrics.cost_usd is None
     assert agent_steps[0].metrics.extra is not None
     assert agent_steps[0].metrics.extra["text_tokens"] == 10
     assert agent_steps[0].message == "I will inspect the workspace."

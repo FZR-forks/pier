@@ -34,13 +34,15 @@ def test_archive_retry_attempt_preserves_contents_and_avoids_collisions(tmp_path
 
 
 @pytest.mark.asyncio
-async def test_retry_continues_if_archiving_fails(monkeypatch, tmp_path):
+async def test_retry_preserves_original_if_archiving_fails(monkeypatch, tmp_path):
     failed_trial_dir = tmp_path / "job" / "task__abc123"
     failed_trial_dir.mkdir(parents=True)
     (failed_trial_dir / "trial.log").write_text("failed", encoding="utf-8")
 
     failed_result = SimpleNamespace(
-        exception_info=SimpleNamespace(exception_type="RetryableError")
+        exception_info=SimpleNamespace(exception_type="ConnectionError"),
+        verifier_result=None,
+        model_dump_json=lambda **kwargs: "{}",
     )
     successful_result = SimpleNamespace(exception_info=None)
 
@@ -49,7 +51,7 @@ async def test_retry_continues_if_archiving_fails(monkeypatch, tmp_path):
             self.trial_dir = trial_dir
             self._result = result
 
-        async def run(self):
+        async def run(self, **kwargs):
             return self._result
 
     trials = iter(
@@ -76,8 +78,8 @@ async def test_retry_continues_if_archiving_fails(monkeypatch, tmp_path):
     )
 
     result = await queue._execute_trial_with_retries(
-        SimpleNamespace(trial_name="task__abc123")
+        SimpleNamespace(trial_name="task__abc123", trials_dir=tmp_path / "job")
     )
 
-    assert result is successful_result
-    assert not failed_trial_dir.exists()
+    assert result is failed_result
+    assert failed_trial_dir.exists()

@@ -851,9 +851,8 @@ class TestCostFallback:
         agent._instruction = "Fix the bug"
         context = AgentContext()
         agent.populate_context_post_run(context)
-        assert context.cost_usd == pytest.approx(
-            200 * 1e-6 + 500 * 1e-7 + 200 * 1.25e-6 + 100 * 2e-6 + 500 * 2e-6
-        )
+        assert context.cost_usd == 0.0
+        assert context.cost_source == "harness_reported"
 
     def test_litellm_fallback_prices_known_model(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -888,7 +887,7 @@ class TestCostFallback:
         agent.populate_context_post_run(context)
         assert context.cost_usd == pytest.approx(0.25)
 
-    def test_zero_reported_cost_falls_back_to_litellm(
+    def test_zero_reported_cost_is_preserved(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ):
         self._patch_model_cost(monkeypatch)
@@ -907,4 +906,5 @@ class TestCostFallback:
         agent._instruction = "Fix the bug"
         context = AgentContext()
         agent.populate_context_post_run(context)
-        assert context.cost_usd is not None and context.cost_usd > 0
+        assert context.cost_usd == 0.0
+        assert context.cost_source == "harness_reported"

@@ -181,13 +181,30 @@ class DatasetConfig(BaseModel):
         )
 
 
+RETRYABLE_INFRASTRUCTURE_EXCEPTIONS = frozenset(
+    {
+        "APIConnectionError",
+        "APITimeoutError",
+        "ConnectionError",
+        "ConnectError",
+        "ConnectTimeout",
+        "EnvironmentStartTimeoutError",
+    }
+)
+
+
 class RetryConfig(BaseModel):
     max_retries: int = Field(
         default=0, description="Maximum number of retry attempts", ge=0
     )
     include_exceptions: set[str] | None = Field(
         default=None,
-        description="Exception types to retry on. If None, retries all exceptions.",
+        description=(
+            "Positive allowlist of retryable infrastructure exception types. "
+            "None uses Pier's conservative transport/provisioning allowlist; "
+            "an empty set disables retries. Generic harness exits and completed "
+            "evaluations are never retried."
+        ),
     )
     exclude_exceptions: set[str] | None = Field(
         default_factory=lambda: {
@@ -196,6 +213,7 @@ class RetryConfig(BaseModel):
             "RewardFileNotFoundError",
             "RewardFileEmptyError",
             "VerifierOutputParseError",
+            "CancelledError",
         },
         description="Exception types to NOT retry on. Takes precedence over "
         "include_exceptions.",

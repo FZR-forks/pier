@@ -16,6 +16,7 @@ class TrialEvent(Enum):
     AGENT_START = "agent_start"
     VERIFICATION_START = "verification_start"
     END = "end"
+    RETRY = "retry"
     CANCEL = "cancel"
 
 

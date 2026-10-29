@@ -106,6 +106,7 @@ class Job:
         self._trial_queue.add_hook(TrialEvent.START, self._on_trial_started)
         self._trial_queue.add_hook(TrialEvent.CANCEL, self._on_trial_cancelled)
         self._trial_queue.add_hook(TrialEvent.END, self._on_trial_completed)
+        self._trial_queue.add_hook(TrialEvent.RETRY, self._on_trial_retry)
 
     @classmethod
     async def create(cls, config: JobConfig) -> "Job":
@@ -263,6 +264,10 @@ class Job:
             self._existing_job_result.stats.n_retries
             if self._existing_job_result is not None
             else 0
+        )
+        self._n_retries = max(
+            self._n_retries,
+            sum(1 for _ in (self.job_dir / ".retry-attempts").glob("*/*/result.json")),
         )
 
     def _init_remaining_trial_configs(self):
@@ -438,6 +443,36 @@ class Job:
         self._refresh_metrics_for_eval(evals_key, dataset_name)
 
     def _write_job_result(self, *, exclude_trial_results: bool = False) -> None:
+        # Rebuild qualified usage from the same canonical observations as the
+        # rewards. Archived attempts are explicitly separate experimental spend.
+        from pier.models.agent.usage import ReportedUsage
+
+        observations = [
+            result.reported_usage() for result in self._previous_trial_results.values()
+        ]
+        self._job_result.stats.session_reported_usage = (
+            ReportedUsage.aggregate(observations, source="canonical_trial_observations")
+            if observations
+            else None
+        )
+
+        overhead = []
+        paths = []
+        for path in sorted((self.job_dir / ".retry-attempts").glob("*/*/result.json")):
+            try:
+                result = TrialResult.model_validate_json(path.read_text())
+            except (ValueError, OSError):
+                # Preserve the archive's existence even when usage is unknown.
+                overhead.append(ReportedUsage(source="unreadable_retry_attempt"))
+            else:
+                overhead.append(result.reported_usage())
+            paths.append(path.relative_to(self.job_dir).as_posix())
+        self._job_result.stats.retry_attempt_paths = paths
+        self._job_result.stats.retry_overhead = (
+            ReportedUsage.aggregate(overhead, source="discarded_retry_attempts")
+            if overhead
+            else None
+        )
         if exclude_trial_results:
             result_json = self._job_result.model_dump_json(
                 indent=4,
@@ -597,6 +632,13 @@ class Job:
             self._refresh_job_progress(updated_at=event.timestamp)
             await self._write_job_result_async(exclude_trial_results=True)
 
+    async def _on_trial_retry(self, event: TrialHookEvent) -> None:
+        """A discarded infrastructure attempt is overhead, never a result."""
+        async with self._trial_completion_lock:
+            self._n_retries += 1
+            self._refresh_job_progress(updated_at=event.timestamp)
+            await self._write_job_result_async(exclude_trial_results=True)
+
     async def run(self) -> JobResult:
         """Run all configured trials and return the final aggregated job result."""
         try:
@@ -685,7 +727,9 @@ class Job:
                 )
 
                 if trial_result.verifier_result is not None:
-                    final_rewards[evals_key].append(trial_result.verifier_result.rewards)
+                    final_rewards[evals_key].append(
+                        trial_result.verifier_result.rewards
+                    )
                 else:
                     final_rewards[evals_key].append(None)
 

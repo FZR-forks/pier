@@ -950,11 +950,13 @@ class Trial:
         )
         return artifacts_dir
 
-    async def run(self) -> TrialResult:
+    async def run(self, *, attempt: int = 1, retry_attempts=None) -> TrialResult:
         self._trial_paths.trial_dir.mkdir(parents=True, exist_ok=True)
         self._trial_paths.config_path.write_text(self.config.model_dump_json(indent=4))
 
         self._result = TrialResult(
+            attempt=attempt,
+            retry_attempts=list(retry_attempts or []),
             trial_name=self.config.trial_name,
             task_name=self._task.name,
             task_id=self.config.task.get_task_id(),

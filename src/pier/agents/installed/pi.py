@@ -366,7 +366,7 @@ class Pi(BaseInstalledAgent):
             return []
 
         events: list[dict[str, Any]] = []
-        for line in output_path.read_text().splitlines():
+        for line in output_path.read_text(encoding="utf-8").split("\n"):
             line = line.strip()
             if not line:
                 continue
@@ -555,7 +555,7 @@ class Pi(BaseInstalledAgent):
         prompt_tokens = input_tokens + cache_read + cache_write
 
         metrics: Metrics | None = None
-        if prompt_tokens or output_tokens:
+        if self._usage_record_known(message.get("usage")):
             metrics_extra = {
                 key: value
                 for key, value in {
@@ -568,12 +568,19 @@ class Pi(BaseInstalledAgent):
             metrics = Metrics(
                 prompt_tokens=prompt_tokens,
                 completion_tokens=output_tokens,
-                cached_tokens=cache_read or None,
-                cost_usd=cost_total or None,
+                cached_tokens=cache_read,
+                cost_usd=cost_total
+                if isinstance(usage.get("cost"), dict)
+                and usage["cost"].get("total") is not None
+                else None,
                 extra=metrics_extra or None,
             )
 
         step_extra: dict[str, Any] = {}
+        if isinstance(message.get("usage"), dict) and not self._usage_record_known(
+            message["usage"]
+        ):
+            step_extra["usage_partial"] = message["usage"]
         if stop_reason := message.get("stopReason"):
             step_extra["stop_reason"] = stop_reason
         if error_message := message.get("errorMessage"):
@@ -800,26 +807,49 @@ class Pi(BaseInstalledAgent):
         if not any(step.source != "user" for step in steps):
             return None
 
-        total_cost = totals["cost"] if totals["cost"] > 0 else None
-        if total_cost is None:
-            # A zero result means no usage to price, which is absent rather than free.
-            total_cost = (
-                self._compute_cost_from_pricing(
-                    totals["prompt"],
-                    totals["completion"],
-                    totals["cached"],
-                    totals["cache_write"],
-                    totals["cache_write_1h"],
+        usages = []
+        for record in records:
+            if record["kind"] == "agent":
+                usages.append(record["message"].get("usage"))
+                usages.extend(
+                    result["usage"]
+                    for result in record["tool_results"]
+                    if isinstance(result.get("usage"), dict)
                 )
-                or None
+            else:
+                usages.append(record["result"].get("usage"))
+        usage_known = all(self._usage_record_known(usage) for usage in usages)
+        costs_reported = usage_known and all(
+            isinstance(usage.get("cost"), dict)
+            and usage["cost"].get("total") is not None
+            for usage in usages
+        )
+        # An explicit zero is the harness's observation, not missing data.
+        total_cost = totals["cost"] if costs_reported else None
+        cost_source = "harness_reported" if costs_reported else "pricing_estimate"
+        if total_cost is None and usage_known:
+            total_cost = self._compute_cost_from_pricing(
+                totals["prompt"],
+                totals["completion"],
+                totals["cached"],
+                totals["cache_write"],
+                totals["cache_write_1h"],
             )
 
         final_extra: dict[str, Any] = {}
-        if totals["cache_write"]:
+        final_extra["cost_source"] = (
+            cost_source if total_cost is not None else "unknown"
+        )
+        from pier.utils.rejected_request import rejected_requests_from_errors
+
+        rejected = rejected_requests_from_errors(events, source="pi.errorMessage")
+        if rejected:
+            final_extra["rejected_request_tokens"] = rejected
+        if usage_known:
             final_extra["total_cache_write_tokens"] = totals["cache_write"]
         if totals["cache_write_1h"]:
             final_extra["total_cache_write_1h_tokens"] = totals["cache_write_1h"]
-        if totals["reasoning"]:
+        if usage_known:
             final_extra["total_reasoning_tokens"] = totals["reasoning"]
         if summarization_count:
             final_extra["compacted"] = True
@@ -831,9 +861,9 @@ class Pi(BaseInstalledAgent):
             final_extra["stop_reason"] = stop_reason
 
         final_metrics = FinalMetrics(
-            total_prompt_tokens=totals["prompt"] or None,
-            total_completion_tokens=totals["completion"] or None,
-            total_cached_tokens=totals["cached"] or None,
+            total_prompt_tokens=totals["prompt"] if usage_known else None,
+            total_completion_tokens=totals["completion"] if usage_known else None,
+            total_cached_tokens=totals["cached"] if usage_known else None,
             total_cost_usd=total_cost,
             total_steps=len(steps),
             extra=extra_with_context_metrics(
@@ -853,6 +883,15 @@ class Pi(BaseInstalledAgent):
             ),
             steps=steps,
             final_metrics=final_metrics,
+        )
+
+    @staticmethod
+    def _usage_record_known(usage: Any) -> bool:
+        return isinstance(usage, dict) and all(
+            isinstance(usage.get(key), int)
+            and not isinstance(usage[key], bool)
+            and usage[key] >= 0
+            for key in ("input", "output", "cacheRead", "cacheWrite")
         )
 
     @staticmethod

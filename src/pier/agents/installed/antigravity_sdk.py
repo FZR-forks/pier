@@ -210,6 +210,10 @@ chmod +x /installed-agent/venv/lib/python3.12/site-packages/google/antigravity/b
                 metrics.total_cached_tokens,
             )
             if metrics.total_cost_usd is not None:
+                metrics.extra = {
+                    **(metrics.extra or {}),
+                    "cost_source": "pricing_estimate",
+                }
                 trajectory_path.write_text(
                     format_trajectory_json(trajectory.to_json_dict())
                 )

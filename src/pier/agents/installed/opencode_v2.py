@@ -21,6 +21,7 @@ session, nested by their real ``parentID``.
 import asyncio
 import copy
 import json
+import math
 import os
 import re
 import shlex
@@ -43,6 +44,7 @@ from pier.models.agent.context import AgentContext
 from pier.models.agent.install import AgentInstallSpec, InstallStep
 from pier.models.agent.name import AgentName
 from pier.models.agent.network import NetworkAllowlist
+from pier.models.agent.usage import ReportedUsage
 from pier.models.trajectories import (
     Agent,
     FinalMetrics,
@@ -1537,7 +1539,9 @@ class OpenCodeV2(BaseInstalledAgent):
         if not path.exists():
             return []
         records: list[dict[str, Any]] = []
-        for line in path.read_text().splitlines():
+        # JSON strings may contain literal NEL / Unicode line separators.
+        # str.splitlines() treats those as delimiters and corrupts valid records.
+        for line in path.read_text(encoding="utf-8").split("\n"):
             line = line.strip()
             if not line:
                 continue
@@ -1572,7 +1576,12 @@ class OpenCodeV2(BaseInstalledAgent):
 
         def value(mapping: dict[str, Any], key: str) -> int:
             raw = mapping.get(key)
-            if isinstance(raw, bool) or not isinstance(raw, (int, float)) or raw < 0:
+            if (
+                isinstance(raw, bool)
+                or not isinstance(raw, (int, float))
+                or not math.isfinite(raw)
+                or raw < 0
+            ):
                 return 0
             return int(raw)
 
@@ -1602,6 +1611,7 @@ class OpenCodeV2(BaseInstalledAgent):
         return all(
             not isinstance(value, bool)
             and isinstance(value, (int, float))
+            and math.isfinite(value)
             and value >= 0
             for value in values
         )
@@ -1614,7 +1624,12 @@ class OpenCodeV2(BaseInstalledAgent):
 
         def value(mapping: dict[str, Any], key: str) -> int | None:
             raw = mapping.get(key)
-            if isinstance(raw, bool) or not isinstance(raw, (int, float)) or raw < 0:
+            if (
+                isinstance(raw, bool)
+                or not isinstance(raw, (int, float))
+                or not math.isfinite(raw)
+                or raw < 0
+            ):
                 return None
             return int(raw)
 
@@ -1653,7 +1668,7 @@ class OpenCodeV2(BaseInstalledAgent):
             "cost": 0.0,
         }
         summarization_count = 0
-        incomplete = malformed_messages
+        incomplete = malformed_messages or bool(inspection.get("active"))
         usage_seen = False
         cost_complete = True
         failed_attempts = 0
@@ -1709,7 +1724,10 @@ class OpenCodeV2(BaseInstalledAgent):
                             f"{message.get('id', 'unknown')}:{actual_model}"
                         )
                 step, contribution, message_incomplete = self._compaction_step(message)
-                summarization_count += 1
+                # A failed/running summarizer request is billable evidence,
+                # but did not actually replace the session context.
+                if str(message.get("status") or "completed") == "completed":
+                    summarization_count += 1
                 incomplete = incomplete or message_incomplete
             elif message_type == "idle":
                 if message.get("outcome"):
@@ -1764,6 +1782,7 @@ class OpenCodeV2(BaseInstalledAgent):
                 )
 
         final_extra: dict[str, Any] = {}
+        final_extra["cost_source"] = "harness_reported"
         if usage_seen:
             final_extra["total_cache_write_input_tokens"] = totals["cache_write"]
             final_extra["total_reasoning_tokens"] = totals["reasoning"]
@@ -1782,6 +1801,42 @@ class OpenCodeV2(BaseInstalledAgent):
         if incomplete:
             final_extra["unfinished"] = True
 
+        reported = self._session_reported_usage(session, complete=not incomplete)
+        if reported is not None:
+            final_extra["session_reported_usage"] = reported.model_dump()
+            if not incomplete:
+                comparisons = {
+                    "n_input_tokens": totals["prompt"],
+                    "n_output_tokens": totals["completion"],
+                    "n_cache_tokens": totals["cached"],
+                    "n_cache_write_tokens": totals["cache_write"],
+                    "n_reasoning_tokens": totals["reasoning"],
+                }
+                discrepancies = {
+                    key: {"messages": value, "session": getattr(reported, key)}
+                    for key, value in comparisons.items()
+                    if getattr(reported, key) is not None
+                    and getattr(reported, key) != value
+                }
+                if (
+                    cost_complete
+                    and reported.cost_usd is not None
+                    and not math.isclose(
+                        reported.cost_usd, totals["cost"], rel_tol=1e-9, abs_tol=1e-12
+                    )
+                ):
+                    discrepancies["cost_usd"] = {
+                        "messages": totals["cost"],
+                        "session": reported.cost_usd,
+                    }
+                if discrepancies:
+                    # Neither contradicting source is silently selected as exact.
+                    incomplete = True
+                    final_extra["usage_discrepancies"] = discrepancies
+                    final_extra["session_reported_usage"]["complete"] = False
+                    # Contradictory sources are not a proven lower bound.
+                    final_extra["session_reported_usage"]["lower_bound"] = False
+
         final_metrics = FinalMetrics(
             total_prompt_tokens=totals["prompt"] if usage_seen else None,
             total_completion_tokens=totals["completion"] if usage_seen else None,
@@ -1791,9 +1846,7 @@ class OpenCodeV2(BaseInstalledAgent):
             extra=extra_with_context_metrics(
                 final_extra or None,
                 peak_context_tokens=peak_context_tokens_from_steps(steps),
-                summarization_count=summarization_count
-                if summarization_count
-                else None,
+                summarization_count=summarization_count,
             ),
         )
         if incomplete:
@@ -2324,6 +2377,44 @@ class OpenCodeV2(BaseInstalledAgent):
             len(trajectories) - 1 if subagent_count is None else subagent_count,
         )
 
+    @classmethod
+    def _session_reported_usage(
+        cls, session: dict[str, Any], *, complete: bool
+    ) -> ReportedUsage | None:
+        tokens = cls._partial_usage_fields(session.get("tokens"))
+        cost = session.get("cost")
+        cost = (
+            float(cost)
+            if isinstance(cost, (int, float))
+            and not isinstance(cost, bool)
+            and math.isfinite(cost)
+            and cost >= 0
+            else None
+        )
+        if all(value is None for value in tokens.values()) and cost is None:
+            return None
+
+        def total(*keys: str) -> int | None:
+            values = [tokens[key] for key in keys]
+            # A partial category sum is not an authoritative prompt/output count.
+            return sum(values) if all(value is not None for value in values) else None
+
+        return ReportedUsage(
+            source="opencode.session.tokens/cost",
+            complete=complete
+            and all(value is not None for value in tokens.values())
+            and cost is not None,
+            lower_bound=not complete,
+            n_input_tokens=total("input", "cache_read", "cache_write"),
+            n_output_tokens=total("output", "reasoning"),
+            n_cache_tokens=tokens["cache_read"],
+            n_cache_write_tokens=tokens["cache_write"],
+            n_reasoning_tokens=tokens["reasoning"],
+            cost_usd=cost,
+            cost_source="harness_reported",
+            session_ids=[str(session["id"])],
+        )
+
     def _with_tree_metrics(self, root: Trajectory, subagent_count: int) -> Trajectory:
         """Whole-tree totals on the root, with root-only figures in extra.
 
@@ -2436,7 +2527,38 @@ class OpenCodeV2(BaseInstalledAgent):
         tree_extra["subagent_count"] = subagent_count
         tree_extra["tree_metrics_complete"] = complete
         tree_extra["tree_cost_complete"] = cost_complete
+        tree_extra["cost_source"] = "harness_reported"
+        discrepancies = {
+            str(node.trajectory_id): node.final_metrics.extra["usage_discrepancies"]
+            for node in nodes
+            if node.final_metrics
+            and node.final_metrics.extra
+            and node.final_metrics.extra.get("usage_discrepancies")
+        }
+        if discrepancies:
+            tree_extra["usage_discrepancies"] = discrepancies
         tree_extra["tree_model_provenance_complete"] = model_provenance_complete
+        reported_nodes = [
+            ReportedUsage.model_validate(
+                node.final_metrics.extra["session_reported_usage"]
+            )
+            for node in nodes
+            if node.final_metrics
+            and node.final_metrics.extra
+            and node.final_metrics.extra.get("session_reported_usage")
+        ]
+        if reported_nodes:
+            reported = ReportedUsage.aggregate(
+                reported_nodes, source="opencode.session.tokens/cost"
+            )
+            reported.complete = (
+                reported.complete
+                and complete
+                and len(reported_nodes) == len(nodes)
+                and len(nodes) == subagent_count + 1
+            )
+            reported.lower_bound = not reported.complete and not discrepancies
+            tree_extra["session_reported_usage"] = reported.model_dump()
         if peak_context is not None:
             tree_extra["peak_context_tokens"] = peak_context
         if summarizations is not None:
@@ -2488,6 +2610,12 @@ class OpenCodeV2(BaseInstalledAgent):
         data = root.to_json_dict()
         metrics = data.get("final_metrics") or {}
         extra = dict(metrics.get("extra") or {})
+        if extra.get("session_reported_usage"):
+            extra["session_reported_usage"] = {
+                **extra["session_reported_usage"],
+                "complete": False,
+                "lower_bound": not bool(extra.get("usage_discrepancies")),
+            }
         extra.update(
             {
                 "metrics_complete": False,
@@ -2513,6 +2641,15 @@ class OpenCodeV2(BaseInstalledAgent):
         context: AgentContext, metrics: FinalMetrics | None
     ) -> None:
         """Keep withheld token totals unknown instead of coercing them to zero."""
+        if metrics is not None:
+            extra = metrics.extra or {}
+            context.usage_discrepancies = extra.get("usage_discrepancies")
+            if extra.get("session_reported_usage"):
+                context.session_reported_usage = ReportedUsage.model_validate(
+                    extra["session_reported_usage"]
+                )
+            context.peak_context_tokens = extra.get("peak_context_tokens")
+            context.summarization_count = extra.get("summarization_count")
         if metrics is None or any(
             value is None
             for value in (
@@ -2646,7 +2783,9 @@ class OpenCodeV2(BaseInstalledAgent):
         stream = base / "opencode-v2-cli-stream.jsonl"
         if stream.exists():
             try:
-                lines = stream.read_text(errors="replace").splitlines()
+                lines = stream.read_text(errors="replace").split("\n")
+                if lines and lines[-1] == "":
+                    lines.pop()
             except OSError:
                 lines = []
             if lines:
@@ -2803,7 +2942,10 @@ class OpenCodeV2(BaseInstalledAgent):
                 "Ignoring %d malformed OpenCode V2 session inspection record(s)",
                 len(inspections) - len(valid_inspections),
             )
-        inspections = valid_inspections
+        # Repeated snapshots describe one session, not multiple billable agents.
+        inspections = list(
+            {record["session"]["id"]: record for record in valid_inspections}.values()
+        )
         if not inspections:
             # Only read now: the CLI stream can be large and a successful
             # collection never looks at it.

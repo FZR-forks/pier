@@ -667,7 +667,7 @@ class ClaudeCode(BaseInstalledAgent):
             content = stream_path.read_text(encoding="utf-8")
         except OSError:
             return None
-        for line in content.splitlines():
+        for line in content.split("\n"):
             line = line.strip()
             if not line or not line.startswith("{"):
                 continue
@@ -1126,6 +1126,7 @@ class ClaudeCode(BaseInstalledAgent):
         )
 
         final_extra: dict[str, Any] | None = {}
+        final_extra["cost_source"] = "harness_reported"
         if service_tiers:
             final_extra["service_tiers"] = sorted(service_tiers)
         if cache_creation_seen:

@@ -143,7 +143,7 @@ class OpenCode(BaseInstalledAgent):
             return []
 
         events: list[dict[str, Any]] = []
-        for line in output_path.read_text().splitlines():
+        for line in output_path.read_text(encoding="utf-8").split("\n"):
             line = line.strip()
             if not line:
                 continue
@@ -220,6 +220,8 @@ class OpenCode(BaseInstalledAgent):
         total_input_tokens = 0
         total_output_tokens = 0
         total_cache_read = 0
+        usage_complete = True
+        cost_complete = True
 
         for turn in turns:
             text_parts: list[str] = []
@@ -270,7 +272,18 @@ class OpenCode(BaseInstalledAgent):
             # Extract metrics from step_finish
             finish = turn.get("finish", {})
             tokens = finish.get("tokens", {})
-            cost = finish.get("cost", 0) or 0
+            cost = finish.get("cost")
+            cost_complete = cost_complete and isinstance(cost, (int, float))
+            cache = tokens.get("cache", {})
+            usage_complete = usage_complete and all(
+                isinstance(value, int) and not isinstance(value, bool)
+                for value in (
+                    tokens.get("input"),
+                    tokens.get("output"),
+                    cache.get("read"),
+                    cache.get("write"),
+                )
+            )
             input_tok = tokens.get("input", 0) or 0
             output_tok = tokens.get("output", 0) or 0
             reasoning_tok = tokens.get("reasoning", 0) or 0
@@ -278,18 +291,18 @@ class OpenCode(BaseInstalledAgent):
             cache_read = cache.get("read", 0) or 0
             cache_write = cache.get("write", 0) or 0
 
-            total_cost += cost
-            total_input_tokens += input_tok + cache_read
+            total_cost += cost or 0
+            total_input_tokens += input_tok + cache_read + cache_write
             total_output_tokens += output_tok
             total_cache_read += cache_read
 
             metrics: Metrics | None = None
-            if input_tok or output_tok or cache_read:
+            if isinstance(finish.get("tokens"), dict):
                 metrics = Metrics(
-                    prompt_tokens=input_tok + cache_read,
+                    prompt_tokens=input_tok + cache_read + cache_write,
                     completion_tokens=output_tok,
-                    cached_tokens=cache_read if cache_read else None,
-                    cost_usd=cost if cost else None,
+                    cached_tokens=cache_read,
+                    cost_usd=cost,
                     extra={
                         k: v
                         for k, v in {
@@ -332,13 +345,13 @@ class OpenCode(BaseInstalledAgent):
             return None
 
         final_metrics = FinalMetrics(
-            total_prompt_tokens=total_input_tokens or None,
-            total_completion_tokens=total_output_tokens or None,
-            total_cached_tokens=total_cache_read or None,
-            total_cost_usd=total_cost if total_cost else None,
+            total_prompt_tokens=total_input_tokens if usage_complete else None,
+            total_completion_tokens=total_output_tokens if usage_complete else None,
+            total_cached_tokens=total_cache_read if usage_complete else None,
+            total_cost_usd=total_cost if cost_complete else None,
             total_steps=len(steps),
             extra=extra_with_context_metrics(
-                None,
+                {"cost_source": "harness_reported"},
                 peak_context_tokens=peak_context_tokens_from_steps(steps),
                 summarization_count=None,
             ),

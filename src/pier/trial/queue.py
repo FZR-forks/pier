@@ -4,10 +4,10 @@ from collections.abc import Coroutine
 from pathlib import Path
 from typing import Any
 
-from pier.models.job.config import RetryConfig
+from pier.models.job.config import RETRYABLE_INFRASTRUCTURE_EXCEPTIONS, RetryConfig
 from pier.models.trial.config import TrialConfig
-from pier.models.trial.result import TrialResult
-from pier.trial.hooks import HookCallback, TrialEvent
+from pier.models.trial.result import RetryAttempt, TrialResult
+from pier.trial.hooks import HookCallback, TrialEvent, TrialHookEvent
 from pier.utils.logger import logger
 
 
@@ -70,6 +70,8 @@ class TrialQueue:
 
     def _should_retry_exception(self, exception_type: str) -> bool:
         """Check if an exception should trigger a retry."""
+        if exception_type in {"NonZeroAgentExitCodeError", "CancelledError"}:
+            return False
         if (
             self._retry_config.exclude_exceptions
             and exception_type in self._retry_config.exclude_exceptions
@@ -79,10 +81,10 @@ class TrialQueue:
             )
             return False
 
-        if (
-            self._retry_config.include_exceptions
-            and exception_type not in self._retry_config.include_exceptions
-        ):
+        allowed = self._retry_config.include_exceptions
+        if allowed is None:
+            allowed = RETRYABLE_INFRASTRUCTURE_EXCEPTIONS
+        if exception_type not in allowed:
             self._logger.debug(
                 f"Exception {exception_type} is not in include_exceptions, not retrying"
             )
@@ -121,6 +123,8 @@ class TrialQueue:
     def _setup_hooks(self, trial) -> None:
         """Wire queue-level hooks to the trial."""
         for event, hooks in self._hooks.items():
+            if event in {TrialEvent.END, TrialEvent.RETRY}:
+                continue
             for hook in hooks:
                 trial.add_hook(event, hook)
 
@@ -130,13 +134,64 @@ class TrialQueue:
         """Execute a trial with retry logic."""
         from pier.trial.trial import Trial
 
+        history: list[RetryAttempt] = []
+        for path in sorted(
+            (
+                trial_config.trials_dir / ".retry-attempts" / trial_config.trial_name
+            ).glob("*/result.json")
+        ):
+            previous = TrialResult.model_validate_json(path.read_text())
+            history.append(
+                RetryAttempt(
+                    attempt=previous.attempt,
+                    trial_id=previous.id,
+                    result_path=path.relative_to(trial_config.trials_dir).as_posix(),
+                    exception_type=previous.exception_info.exception_type
+                    if previous.exception_info
+                    else "ManualResume",
+                    reason="previous_archived_attempt",
+                )
+            )
+        first_attempt = max((item.attempt for item in history), default=0) + 1
+
+        async def notify(event: TrialEvent, result: TrialResult) -> None:
+            for hook in self._hooks[event]:
+                await hook(
+                    TrialHookEvent(
+                        event=event,
+                        trial_id=result.trial_name,
+                        task_name=result.task_name,
+                        config=trial_config,
+                        result=result,
+                    )
+                )
+
+        async def finish(result: TrialResult) -> TrialResult:
+            await notify(TrialEvent.END, result)
+            return result
+
         for attempt in range(self._retry_config.max_retries + 1):
             trial = await Trial.create(trial_config)
             self._setup_hooks(trial)
-            result = await trial.run()
+            try:
+                result = await trial.run(
+                    attempt=first_attempt + attempt, retry_attempts=history
+                )
+            except asyncio.CancelledError:
+                # Trial finalization persisted the cancelled observation. It is
+                # still canonical and must reach job accounting before re-raise.
+                await notify(TrialEvent.END, trial.result)
+                raise
+            result.attempt = first_attempt + attempt
+            result.retry_attempts = list(history)
+            result.canonical = True
+            result_path = trial.trial_dir / "result.json"
+            result_path.write_text(result.model_dump_json(indent=4))
 
-            if result.exception_info is None:
-                return result
+            # A graded observation is already a benchmark attempt, even if
+            # cleanup or a recovered harness stream left an exception behind.
+            if result.exception_info is None or result.verifier_result is not None:
+                return await finish(result)
 
             if not self._should_retry_exception(result.exception_info.exception_type):
                 self._logger.debug(
@@ -144,47 +199,63 @@ class TrialQueue:
                     "include_exceptions or the maximum number of retries has been "
                     "reached"
                 )
-                return result
+                return await finish(result)
             if attempt == self._retry_config.max_retries:
                 self._logger.debug(
                     "Not retrying trial because the maximum number of retries has been "
                     "reached"
                 )
-                return result
+                return await finish(result)
 
-            archive_dir: Path | None = None
             try:
-                archive_dir = self._archive_retry_attempt(trial.trial_dir, attempt)
+                archive_dir = self._archive_retry_attempt(
+                    trial.trial_dir, result.attempt - 1
+                )
             except OSError as exc:
                 self._logger.warning(
                     "Could not archive failed attempt for trial %s: %s. "
-                    "Deleting it before retry.",
+                    "Keeping the original observation; not retrying.",
                     trial_config.trial_name,
                     exc,
                 )
-                shutil.rmtree(trial.trial_dir, ignore_errors=True)
+                return await finish(result)
 
+            result.canonical = False
+            result.trial_uri = archive_dir.resolve().as_uri()
+            (archive_dir / "result.json").write_text(result.model_dump_json(indent=4))
+            history.append(
+                RetryAttempt(
+                    attempt=result.attempt,
+                    trial_id=result.id,
+                    result_path=(archive_dir / "result.json")
+                    .relative_to(trial.trial_dir.parent)
+                    .as_posix(),
+                    exception_type=result.exception_info.exception_type,
+                )
+            )
             delay = self._calculate_backoff_delay(attempt)
 
-            if archive_dir is not None:
-                self._logger.debug(
-                    "Trial %s failed with exception %s. Archived failed attempt at %s. "
-                    "Retrying in %.2f seconds...",
-                    trial_config.trial_name,
-                    result.exception_info.exception_type,
-                    archive_dir,
-                    delay,
-                )
-            else:
-                self._logger.debug(
-                    "Trial %s failed with exception %s. Failed attempt could not be "
-                    "archived. Retrying in %.2f seconds...",
-                    trial_config.trial_name,
-                    result.exception_info.exception_type,
-                    delay,
-                )
+            self._logger.debug(
+                "Trial %s failed with exception %s. Archived failed attempt at %s. "
+                "Retrying in %.2f seconds...",
+                trial_config.trial_name,
+                result.exception_info.exception_type,
+                archive_dir,
+                delay,
+            )
 
-            await asyncio.sleep(delay)
+            try:
+                await notify(TrialEvent.RETRY, result)
+                await asyncio.sleep(delay)
+            except asyncio.CancelledError:
+                # No replacement benchmark attempt started. Restore the last
+                # observation as canonical instead of leaving an archive only.
+                shutil.move(str(archive_dir), str(trial.trial_dir))
+                result.canonical = True
+                result.trial_uri = trial.trial_dir.resolve().as_uri()
+                result_path.write_text(result.model_dump_json(indent=4))
+                await notify(TrialEvent.END, result)
+                raise
 
         raise RuntimeError(
             f"Trial {trial_config.trial_name} produced no result. This should never "

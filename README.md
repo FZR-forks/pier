@@ -181,8 +181,12 @@ and delegated child sessions into augmented ATIF, so do not reuse V1's
 session tree to reach two identical terminal snapshots before reporting
 complete usage; that budget defaults to 600 seconds and is overridden with the
 `PIER_OPENCODE_V2_SETTLE_TIMEOUT` environment variable. Timing out preserves
-the trajectory but withholds the aggregate token and cost totals, so raise it
-for very long trials rather than accepting incomplete metrics.
+the trajectory and `agent_result.session_reported_usage` running totals with
+`complete: false` and `lower_bound: true`. Exact aggregate fields remain null
+because an in-flight call or uncollected child can be absent. Contradictions
+between message and session totals are recorded as `usage_discrepancies`, not
+silently resolved by choosing a source. Raise the settle budget for very long
+trials rather than accepting incomplete metrics.
 
 **Pi** resolves `--model` against its own built-in catalog, so a gateway or proxy needs a provider entry in `models.json`. Setting the provider's base-URL env var (`OPENAI_BASE_URL`, `ANTHROPIC_BASE_URL`) generates one automatically, which routes pi's built-in models through the endpoint while keeping their shipped cost and capability metadata. Use `pi_config` to declare a slug that is not in the catalog; supply its `cost` (per million tokens) so pi can price it, otherwise Pier falls back to the LiteLLM price table and leaves `cost_usd` unset for a private slug. `pi_config` is deep-merged over the generated config, and any `baseUrl` in it is added to the network allowlist.
 

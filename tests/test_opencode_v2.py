@@ -1087,9 +1087,9 @@ def test_spec_reference_totals(tmp_path: Path):
                 "cost": 2.0,
                 "tokens": {
                     "input": 100,
-                    "output": 30,
-                    "reasoning": 20,
-                    "cache": {"read": 40, "write": 60},
+                    "output": 40,
+                    "reasoning": 60,
+                    "cache": {"read": 30, "write": 20},
                 },
             },
             "messages": [
@@ -1120,9 +1120,9 @@ def test_spec_reference_totals(tmp_path: Path):
                 "cost": 0.5,
                 "tokens": {
                     "input": 10,
-                    "output": 3,
-                    "reasoning": 2,
-                    "cache": {"read": 4, "write": 6},
+                    "output": 4,
+                    "reasoning": 6,
+                    "cache": {"read": 3, "write": 2},
                 },
             },
             "messages": [
@@ -2182,7 +2182,8 @@ def test_failed_compaction_marks_incomplete(tmp_path: Path):
     assert final["total_prompt_tokens"] == 5
     assert final["total_completion_tokens"] == 0
     assert final["extra"]["failed_attempts"] == 1
-    assert final["extra"]["compacted"] is True
+    assert final["extra"]["summarization_count"] == 0
+    assert not final["extra"].get("compacted", False)
 
 
 # ---------------------------------------------------------------------------
