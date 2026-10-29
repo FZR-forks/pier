@@ -35,6 +35,20 @@ and OpenCode session dump. Full run artifacts remain on the validation host at
 `/tmp/opencode/pier-metrics-live/issue-17-native-usage-final`; do not commit
 credentials or full session prompts as test evidence.
 
+A repeat on PR head (`issue-17-native-usage-pr-head`, revision `3cf8528`) also
+passed all three verifiers and the native audit with zero discrepancies:
+
+| Harness | Input | Cache hits | Output | Peak input | Inference cost USD |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Pi | 6,797 | 3,220 | 201 | 1,835 | 0.001333620 |
+| Codex | 24,919 | 16,248 | 258 | 8,516 | 0.003008388 |
+| OpenCode V2 | 19,133 | 12,254 | 184 | 6,486 | 0.002358024 |
+| Canonical job total | 50,849 | 31,722 | 643 | — | 0.006700032 |
+
+Its artifacts are in the same parent directory, under the repeat job name.
+Later code changes correct Gemini-only token classification and do not alter
+the three adapters used by this smoke.
+
 ## Read-only historical replay
 
 Reconverted saved PA1 native records in memory, without rewriting historical
