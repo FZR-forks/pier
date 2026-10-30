@@ -6,11 +6,20 @@ from uuid import UUID
 from pydantic import BaseModel, Field, model_validator
 
 from pier.models.trial.result import TrialResult
-from pier.models.agent.usage import ReportedUsage
 
 Rewards = dict[str, float | int]
 TrialRewardsMap = dict[str, Rewards | None]
 EvalsRewardsMap = dict[str, TrialRewardsMap]
+
+
+class RetryOverhead(BaseModel):
+    """Discarded attempts, excluded from canonical rewards and usage totals."""
+
+    n_attempts: int = 0
+    n_input_tokens: int | None = None
+    n_cache_tokens: int | None = None
+    n_output_tokens: int | None = None
+    cost_usd: float | None = None
 
 
 class AgentDatasetStats(BaseModel):
@@ -27,11 +36,7 @@ class AgentDatasetStats(BaseModel):
 
 
 class JobStats(BaseModel):
-    canonical_trials: dict[str, dict[str, Any]] = Field(default_factory=dict)
-    n_trials_missing_usage: int = 0
-    session_reported_usage: ReportedUsage | None = None
-    retry_overhead: ReportedUsage | None = None
-    retry_attempt_paths: list[str] = Field(default_factory=list)
+    retry_overhead: RetryOverhead | None = None
     n_completed_trials: int = 0
     n_errored_trials: int = 0
     n_running_trials: int = 0
@@ -45,7 +50,6 @@ class JobStats(BaseModel):
     n_cache_tokens: int | None = None
     n_output_tokens: int | None = None
     cost_usd: float | None = None
-    cost_source: str | None = None
 
     @model_validator(mode="before")
     @classmethod
@@ -85,6 +89,7 @@ class JobStats(BaseModel):
 
         for trial_result in trial_results:
             result.increment(trial_result)
+        result.update_usage(trial_results)
 
         if n_total_trials is not None:
             result.update_progress_counts(
@@ -94,6 +99,30 @@ class JobStats(BaseModel):
             )
 
         return result
+
+    def update_usage(self, trial_results: list[TrialResult]) -> None:
+        """Recompute exact totals from the same observations used for rewards.
+
+        A trial with no agent context never entered inference and contributes
+        nothing. A context with a missing category makes that total unknown.
+        """
+        usage = [
+            trial.compute_token_cost_totals()
+            for trial in trial_results
+            if trial.agent_result is not None
+            or any(step.agent_result is not None for step in trial.step_results or [])
+        ]
+        for index, field in enumerate(
+            ("n_input_tokens", "n_cache_tokens", "n_output_tokens", "cost_usd")
+        ):
+            values = [item[index] for item in usage]
+            setattr(
+                self,
+                field,
+                sum(values)
+                if values and all(value is not None for value in values)
+                else None,
+            )
 
     @classmethod
     def from_counts(
@@ -134,17 +163,6 @@ class JobStats(BaseModel):
         self.n_retries = n_retries
 
     def increment(self, trial_result: TrialResult) -> None:
-        if not trial_result.canonical:
-            raise ValueError(
-                "Discarded attempts cannot contribute to canonical job stats"
-            )
-        if trial_result.trial_name in self.canonical_trials:
-            raise ValueError(f"Duplicate canonical trial: {trial_result.trial_name}")
-        self.canonical_trials[trial_result.trial_name] = {
-            "id": str(trial_result.id),
-            "attempt": trial_result.attempt,
-            "result_path": f"{trial_result.trial_name}/result.json",
-        }
         self.n_completed_trials += 1
 
         agent_name = trial_result.agent_info.name
@@ -158,11 +176,11 @@ class JobStats(BaseModel):
         evals_key = self.format_agent_evals_key(agent_name, model_name, dataset_name)
         eval_stats = self.evals.setdefault(evals_key, AgentDatasetStats())
 
-        eval_stats.n_trials += 1
         if (
             trial_result.verifier_result is not None
             and trial_result.verifier_result.rewards is not None
         ):
+            eval_stats.n_trials += 1
             for key, value in trial_result.verifier_result.rewards.items():
                 reward_stats = eval_stats.reward_stats.setdefault(key, {})
                 reward_stats.setdefault(value, []).append(trial_result.trial_name)
@@ -177,60 +195,17 @@ class JobStats(BaseModel):
                 self.n_cancelled_trials += 1
 
         n_input, n_cache, n_output, cost = trial_result.compute_token_cost_totals()
-        if any(value is None for value in (n_input, n_cache, n_output, cost)):
-            self.n_trials_missing_usage += 1
-        self.canonical_trials[trial_result.trial_name]["usage"] = dict(
-            zip(
-                ("n_input_tokens", "n_cache_tokens", "n_output_tokens", "cost_usd"),
-                (n_input, n_cache, n_output, cost),
-            )
-        )
-        self.canonical_trials[trial_result.trial_name]["cost_source"] = (
-            (trial_result.reported_usage().cost_source or "unknown")
-            if cost is not None
-            else "unknown"
-        )
-        self._refresh_usage_totals()
-
-    def _refresh_usage_totals(self) -> None:
-        for field in (
-            "n_input_tokens",
-            "n_cache_tokens",
-            "n_output_tokens",
-            "cost_usd",
-        ):
-            values = [
-                (item.get("usage") or {}).get(field)
-                for item in self.canonical_trials.values()
-            ]
-            setattr(
-                self,
-                field,
-                sum(values)
-                if values and all(value is not None for value in values)
-                else None,
-            )
-        sources = {
-            item.get("cost_source", "unknown")
-            for item in self.canonical_trials.values()
-            if not (
-                item.get("cost_source") == "no_agent_execution"
-                and (item.get("usage") or {}).get("cost_usd") == 0
-            )
-        }
-        if not sources and self.canonical_trials:
-            sources = {"no_agent_execution"}
-        self.cost_source = (
-            (next(iter(sources)) if len(sources) == 1 else "mixed")
-            if self.cost_usd is not None
-            else "unknown"
-            if sources
-            else None
-        )
+        if n_input is not None:
+            self.n_input_tokens = (self.n_input_tokens or 0) + n_input
+        if n_cache is not None:
+            self.n_cache_tokens = (self.n_cache_tokens or 0) + n_cache
+        if n_output is not None:
+            self.n_output_tokens = (self.n_output_tokens or 0) + n_output
+        if cost is not None:
+            self.cost_usd = (self.cost_usd or 0.0) + cost
 
     def remove_trial(self, trial_result: TrialResult) -> None:
         """Remove a trial's contributions from stats."""
-        self.canonical_trials.pop(trial_result.trial_name, None)
         self.n_completed_trials -= 1
 
         agent_name = trial_result.agent_info.name
@@ -243,11 +218,11 @@ class JobStats(BaseModel):
         evals_key = self.format_agent_evals_key(agent_name, model_name, dataset_name)
         eval_stats = self.evals.setdefault(evals_key, AgentDatasetStats())
 
-        eval_stats.n_trials -= 1
         if (
             trial_result.verifier_result is not None
             and trial_result.verifier_result.rewards is not None
         ):
+            eval_stats.n_trials -= 1
             for key, value in trial_result.verifier_result.rewards.items():
                 trial_list = eval_stats.reward_stats.get(key, {}).get(value, [])
                 if trial_result.trial_name in trial_list:
@@ -264,9 +239,14 @@ class JobStats(BaseModel):
                 self.n_cancelled_trials -= 1
 
         n_input, n_cache, n_output, cost = trial_result.compute_token_cost_totals()
-        if any(value is None for value in (n_input, n_cache, n_output, cost)):
-            self.n_trials_missing_usage -= 1
-        self._refresh_usage_totals()
+        if n_input is not None and self.n_input_tokens is not None:
+            self.n_input_tokens = max(0, self.n_input_tokens - n_input)
+        if n_cache is not None and self.n_cache_tokens is not None:
+            self.n_cache_tokens = max(0, self.n_cache_tokens - n_cache)
+        if n_output is not None and self.n_output_tokens is not None:
+            self.n_output_tokens = max(0, self.n_output_tokens - n_output)
+        if cost is not None and self.cost_usd is not None:
+            self.cost_usd = max(0.0, self.cost_usd - cost)
 
     def update_trial(
         self,

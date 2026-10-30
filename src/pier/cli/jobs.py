@@ -1,4 +1,5 @@
 import json
+import shutil
 import signal
 from datetime import datetime
 from pathlib import Path
@@ -87,22 +88,6 @@ def _format_group_title(evals_key: str, job_result) -> str:
 
 
 def print_job_results_tables(job_result) -> None:
-    if job_result.stats.n_trials_missing_usage:
-        console.print(
-            f"[yellow]Usage/cost is incomplete for "
-            f"{job_result.stats.n_trials_missing_usage} canonical trial(s). "
-            "Missing categories are null; qualified best-known observations are in "
-            "stats.session_reported_usage (inspect complete/lower_bound/contradictory).[/yellow]"
-        )
-    if job_result.stats.cost_source:
-        console.print(
-            f"Cost source: {job_result.stats.cost_source} (not necessarily provider billing)"
-        )
-    if job_result.stats.retry_attempt_paths:
-        console.print(
-            f"Discarded retry attempts: {len(job_result.stats.retry_attempt_paths)}; "
-            "their usage is separate in stats.retry_overhead."
-        )
     for evals_key, dataset_stats in job_result.stats.evals.items():
         console.print(f"[bold]{_format_group_title(evals_key, job_result)}[/bold]")
 
@@ -303,10 +288,8 @@ def start(
         list[str] | None,
         Option(
             "--retry-include",
-            help="Positive allowlist of infrastructure exception types to retry. "
-            "Defaults to conservative transport/provisioning failures. Explicit "
-            "includes override eligibility for harness exits/graded observations; "
-            "exclusions still win and cancellation is never retried (repeatable)",
+            help="Exception types to retry. Defaults to infrastructure failures only; "
+            "explicit includes override eligibility, exclusions take precedence (repeatable)",
             rich_help_panel="Job Settings",
             show_default=False,
         ),
@@ -805,7 +788,7 @@ def resume(
         Option(
             "-f",
             "--filter-error-type",
-            help="Archive trials with these error types before resuming (can be used "
+            help="Remove trials with these error types before resuming (can be used "
             "multiple times)",
             show_default=False,
         ),
@@ -842,20 +825,11 @@ def resume(
                 and trial_result.exception_info.exception_type in filter_error_types_set
             ):
                 console.print(
-                    f"Archiving trial directory with {
+                    f"Removing trial directory with {
                         trial_result.exception_info.exception_type
                     }: {trial_dir.name}"
                 )
-                from pier.trial.queue import TrialQueue
-
-                archive = TrialQueue._archive_retry_attempt(
-                    trial_dir, trial_result.attempt - 1
-                )
-                trial_result.canonical = False
-                trial_result.trial_uri = archive.resolve().as_uri()
-                (archive / "result.json").write_text(
-                    trial_result.model_dump_json(indent=4)
-                )
+                shutil.rmtree(trial_dir)
 
     config = JobConfig.model_validate_json(config_path.read_text())
 

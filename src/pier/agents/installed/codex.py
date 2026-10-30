@@ -72,11 +72,9 @@ class Codex(BaseInstalledAgent):
         config_toml_file: str | None = None,
         restrict_model_catalog: bool = False,
         model_catalog_file: str | None = None,
-        pricing_model_name: str | None = None,
         **kwargs,
     ):
         self._command_model_name = command_model_name
-        self._pricing_model_name = pricing_model_name
         self._config_toml = config_toml
         if config_toml_file:
             self._config_toml = Path(config_toml_file).read_text()
@@ -443,12 +441,7 @@ class Codex(BaseInstalledAgent):
     def _extract_context_metrics(
         raw_events: list[dict[str, Any]],
     ) -> tuple[int | None, int | None]:
-        """Input-only context peak and explicitly recorded compactions.
-
-        Output/reasoning lengths and token drops are not compaction evidence.
-        Codex can emit both event and rollout representations of one compaction;
-        prefer the durable rollout representation when present.
-        """
+        """Peak input only; output/reasoning changes are not compactions."""
         peak_context_tokens: int | None = None
 
         for event in raw_events:
@@ -465,7 +458,7 @@ class Codex(BaseInstalledAgent):
                 continue
 
             context_tokens = last_usage.get("input_tokens")
-            if isinstance(context_tokens, bool) or not isinstance(context_tokens, int):
+            if not isinstance(context_tokens, int) or isinstance(context_tokens, bool):
                 continue
 
             peak_context_tokens = (
@@ -477,8 +470,9 @@ class Codex(BaseInstalledAgent):
 
     @staticmethod
     def _compaction_events(raw_events: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        items = [event for event in raw_events if event.get("type") == "compacted"]
-        return items or [
+        # Codex can emit both forms for the same compaction. Prefer durable
+        # rollout items, using event messages only when those are absent.
+        return [event for event in raw_events if event.get("type") == "compacted"] or [
             event
             for event in raw_events
             if event.get("type") == "event_msg"
@@ -678,12 +672,6 @@ class Codex(BaseInstalledAgent):
         delegate to a different (differently priced) model.
         """
         model_name = model_name or self.model_name
-        if self._pricing_model_name and model_name in {
-            self.model_name,
-            self._command_model_name,
-            self.model_name.split("/", 1)[-1] if self.model_name else None,
-        }:
-            model_name = self._pricing_model_name
         if not model_name:
             return None
 
@@ -1267,16 +1255,6 @@ class Codex(BaseInstalledAgent):
                     codex_turn_id = None
                 elif event_type == "token_count":
                     finish_api_call(payload)
-                elif event_type == "error":
-                    normalized_events.append(
-                        {
-                            "kind": "message",
-                            "role": "system",
-                            "timestamp": timestamp,
-                            "text": str(payload.get("message") or ""),
-                            "extra": {"harness_error": True},
-                        }
-                    )
                 continue
 
             if etype == "turn_context":
@@ -1482,7 +1460,6 @@ class Codex(BaseInstalledAgent):
                 )
 
         final_extra: dict[str, Any] = {}
-        final_extra["cost_source"] = "unknown"
         from pier.utils.rejected_request import rejected_requests_from_errors
 
         rejected = rejected_requests_from_errors(raw_events, source="codex.rollout")
@@ -1518,17 +1495,12 @@ class Codex(BaseInstalledAgent):
                 cache_write_tokens=usage["cache_write_tokens"],
                 model_name=default_model_name,
             )
-            if total_cost_usd is not None:
-                final_extra["cost_source"] = "pricing_estimate"
-            final_extra["reasoning_output_tokens"] = usage["reasoning_tokens"]
+            final_extra["reasoning_output_tokens"] = usage["reasoning_tokens"] or None
             if usage["cache_write_tokens"] is not None:
                 final_extra["total_cache_write_input_tokens"] = usage[
                     "cache_write_tokens"
                 ]
             final_extra["total_tokens"] = usage["total_tokens"] or None
-            final_extra["pricing_model_name"] = (
-                self._pricing_model_name or default_model_name
-            )
 
             total_metrics = FinalMetrics(
                 total_prompt_tokens=usage["prompt_tokens"],
@@ -1538,9 +1510,7 @@ class Codex(BaseInstalledAgent):
                 total_steps=len(steps),
                 extra=final_extra,
             )
-        elif final_extra.get("rejected_request_tokens") or summarization_count:
-            # Context rejection/compaction evidence is useful even if no
-            # request ever returned a cumulative usage snapshot.
+        elif rejected or summarization_count:
             final_extra["metrics_complete"] = False
             total_metrics = FinalMetrics(total_steps=len(steps), extra=final_extra)
 
@@ -1732,8 +1702,6 @@ class Codex(BaseInstalledAgent):
         peak_context: int | None = None
         summarizations: int | None = None
         cache_writes: int | None = None
-        reasoning_tokens: int | None = None
-        reasoning_complete = True
 
         cost_complete = True
         cache_writes_complete = True
@@ -1775,11 +1743,6 @@ class Codex(BaseInstalledAgent):
             if isinstance(node_summarizations, int):
                 summarizations = (summarizations or 0) + node_summarizations
             node_cache_writes = extra.get("total_cache_write_input_tokens")
-            node_reasoning = extra.get("reasoning_output_tokens")
-            if isinstance(node_reasoning, int):
-                reasoning_tokens = (reasoning_tokens or 0) + node_reasoning
-            else:
-                reasoning_complete = False
             if isinstance(node_cache_writes, int):
                 cache_writes = (cache_writes or 0) + node_cache_writes
             else:
@@ -1807,12 +1770,11 @@ class Codex(BaseInstalledAgent):
         tree_extra["tree_metrics_complete"] = complete
         tree_extra["tree_cost_complete"] = cost_complete
         rejected = [
-            observation
+            item
             for node in nodes
-            for observation in (
-                (node.final_metrics.extra or {}).get("rejected_request_tokens", [])
-                if node.final_metrics
-                else []
+            if node.final_metrics
+            for item in (node.final_metrics.extra or {}).get(
+                "rejected_request_tokens", []
             )
         ]
         if rejected:
@@ -1830,9 +1792,6 @@ class Codex(BaseInstalledAgent):
         tree_extra.pop("total_cache_write_input_tokens", None)
         if complete and cache_writes_complete and cache_writes is not None:
             tree_extra["total_cache_write_input_tokens"] = cache_writes
-        tree_extra.pop("reasoning_output_tokens", None)
-        if complete and reasoning_complete and reasoning_tokens is not None:
-            tree_extra["reasoning_output_tokens"] = reasoning_tokens
 
         # An incomplete tree must not publish aggregates that would silently omit
         # (or double count) a thread's usage; keep the root-only view instead.
@@ -1853,9 +1812,6 @@ class Codex(BaseInstalledAgent):
                 "total_cost_usd": None,
                 "total_steps": aggregate_steps,
             }
-        )
-        tree_extra["cost_source"] = (
-            "pricing_estimate" if aggregate["total_cost_usd"] is not None else "unknown"
         )
 
         data = root.to_json_dict()

@@ -45,48 +45,7 @@ def populate_context_from_final_metrics(
     context.n_cache_tokens = metrics.total_cached_tokens
     context.n_output_tokens = metrics.total_completion_tokens
     extra = metrics.extra or {}
-    context.cost_source = (
-        extra.get("cost_source", "unknown")
-        if metrics.total_cost_usd is not None
-        else "unknown"
-    )
-    context.metrics_complete = all(
-        value is not None
-        for value in (
-            metrics.total_prompt_tokens,
-            metrics.total_completion_tokens,
-            metrics.total_cached_tokens,
-        )
-    ) and not (
-        extra.get("metrics_complete") is False
-        or extra.get("tree_metrics_complete") is False
-    )
-    for field, keys in (
-        (
-            "n_cache_write_tokens",
-            (
-                "total_cache_write_input_tokens",
-                "total_cache_write_tokens",
-                "total_cache_creation_input_tokens",
-            ),
-        ),
-        ("n_reasoning_tokens", ("total_reasoning_tokens", "reasoning_output_tokens")),
-    ):
-        setattr(
-            context,
-            field,
-            next(
-                (
-                    extra[key]
-                    for key in keys
-                    if isinstance(extra.get(key), int)
-                    and not isinstance(extra[key], bool)
-                ),
-                None,
-            ),
-        )
-    if extra.get("rejected_request_tokens"):
-        context.rejected_request_tokens = extra["rejected_request_tokens"]
+    context.rejected_request_tokens = extra.get("rejected_request_tokens")
     peak_context_tokens = extra.get("peak_context_tokens")
     summarization_count = extra.get("summarization_count")
     context.peak_context_tokens = (

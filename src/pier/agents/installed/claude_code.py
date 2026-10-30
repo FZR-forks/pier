@@ -1125,11 +1125,7 @@ class ClaudeCode(BaseInstalledAgent):
             1 for event in events if _is_compaction_boundary(event)
         )
 
-        total_cost_usd = self._parse_total_cost_from_stream_json()
         final_extra: dict[str, Any] | None = {}
-        final_extra["cost_source"] = (
-            "harness_reported" if total_cost_usd is not None else "unknown"
-        )
         if service_tiers:
             final_extra["service_tiers"] = sorted(service_tiers)
         if cache_creation_seen:
@@ -1150,7 +1146,7 @@ class ClaudeCode(BaseInstalledAgent):
             total_prompt_tokens=total_prompt_tokens,
             total_completion_tokens=total_completion_tokens,
             total_cached_tokens=total_cached_tokens,
-            total_cost_usd=total_cost_usd,
+            total_cost_usd=self._parse_total_cost_from_stream_json(),
             total_steps=len(steps),
             extra=final_extra,
         )

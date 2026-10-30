@@ -27,7 +27,7 @@ from pier.models.job.config import (
     JobConfig,
 )
 from pier.models.job.lock import LOCK_FILENAME, JobLock, build_job_lock
-from pier.models.job.result import EvalsRewardsMap, JobResult, JobStats
+from pier.models.job.result import EvalsRewardsMap, JobResult, JobStats, RetryOverhead
 from pier.models.trial.config import TaskConfig, TrialConfig
 from pier.models.trial.paths import TrialPaths
 from pier.models.trial.result import TrialResult
@@ -106,7 +106,6 @@ class Job:
         self._trial_queue.add_hook(TrialEvent.START, self._on_trial_started)
         self._trial_queue.add_hook(TrialEvent.CANCEL, self._on_trial_cancelled)
         self._trial_queue.add_hook(TrialEvent.END, self._on_trial_completed)
-        self._trial_queue.add_hook(TrialEvent.RETRY, self._on_trial_retry)
 
     @classmethod
     async def create(cls, config: JobConfig) -> "Job":
@@ -181,7 +180,6 @@ class Job:
     def _maybe_init_existing_job(self):
         self._existing_trial_configs: list[TrialConfig] = []
         self._existing_trial_results: list[TrialResult] = []
-        self._archived_trial_configs: list[TrialConfig] = []
 
         self._previous_trial_results: dict[str, TrialResult] = {}
         self._existing_rewards: EvalsRewardsMap = defaultdict(dict)
@@ -217,50 +215,6 @@ class Job:
                 self._existing_trial_results.append(
                     TrialResult.model_validate_json(trial_paths.result_path.read_text())
                 )
-
-        canonical_names = {result.trial_name for result in self._existing_trial_results}
-        archived_by_name: dict[str, tuple[int, TrialConfig]] = {}
-        for path in sorted((self.job_dir / ".retry-attempts").glob("*/*/result.json")):
-            try:
-                archived = TrialResult.model_validate_json(path.read_text())
-            except (ValueError, OSError):
-                # An interrupted archive rewrite may have lost result.json,
-                # while the original config still safely identifies its slot.
-                try:
-                    archived_config = TrialConfig.model_validate_json(
-                        (path.parent / "config.json").read_text()
-                    )
-                except (ValueError, OSError):
-                    continue
-                name = archived_config.trial_name
-                if name in canonical_names:
-                    continue
-                if name != path.parent.parent.name:
-                    raise ValueError(
-                        f"Archived trial config identity does not match its path: {path}"
-                    )
-                previous = archived_by_name.get(name)
-                if previous is None:
-                    archived_by_name[name] = (0, archived_config)
-                continue
-            if archived.trial_name in canonical_names:
-                continue
-            if (
-                archived.trial_name != path.parent.parent.name
-                or archived.config.trial_name != archived.trial_name
-            ):
-                raise ValueError(
-                    f"Archived trial identity does not match its path: {path}"
-                )
-            previous = archived_by_name.get(archived.trial_name)
-            if previous is None or archived.attempt > previous[0]:
-                archived_by_name[archived.trial_name] = (
-                    archived.attempt,
-                    archived.config,
-                )
-        self._archived_trial_configs = [
-            config for _, config in archived_by_name.values()
-        ]
 
         for trial_result in self._existing_trial_results:
             agent_name = trial_result.agent_info.name
@@ -310,29 +264,10 @@ class Job:
             if self._existing_job_result is not None
             else 0
         )
-        self._retry_counts_by_trial = {
-            result.trial_name: result.attempt - 1
-            for result in self._existing_trial_results
-        }
-        for path in (self.job_dir / ".retry-attempts").glob("*/*/result.json"):
-            try:
-                result = TrialResult.model_validate_json(path.read_text())
-            except (ValueError, OSError):
-                # Preserve legacy/unreadable archives without inventing a
-                # started replacement attempt from their directory names.
-                continue
-            self._retry_counts_by_trial[result.trial_name] = max(
-                self._retry_counts_by_trial.get(result.trial_name, 0),
-                result.attempt - 1,
-            )
-        self._n_retries = max(
-            self._n_retries, sum(self._retry_counts_by_trial.values())
-        )
 
     def _init_remaining_trial_configs(self):
         remaining_trial_configs: list[TrialConfig] = []
         matched_existing_indices: set[int] = set()
-        matched_archived_indices: set[int] = set()
         reconciled_trial_configs: list[TrialConfig] = []
 
         for trial_config in self._trial_configs:
@@ -348,23 +283,6 @@ class Job:
                 None,
             )
             if existing_index is None:
-                # A filtered resume removes the canonical directory before Job
-                # is loaded. Retain the archived slot's name so the queue finds
-                # its attempt history rather than starting an unrelated trial.
-                archived_index = next(
-                    (
-                        index
-                        for index, archived_config in enumerate(
-                            self._archived_trial_configs
-                        )
-                        if index not in matched_archived_indices
-                        and archived_config == trial_config
-                    ),
-                    None,
-                )
-                if archived_index is not None:
-                    matched_archived_indices.add(archived_index)
-                    trial_config = self._archived_trial_configs[archived_index]
                 remaining_trial_configs.append(trial_config)
                 reconciled_trial_configs.append(trial_config)
             else:
@@ -375,10 +293,6 @@ class Job:
 
         if len(matched_existing_indices) != len(self._existing_trial_configs):
             raise ValueError("Existing trial config does not match planned job config.")
-        if len(matched_archived_indices) != len(self._archived_trial_configs):
-            raise ValueError(
-                "Archived trial config does not match a remaining planned trial slot."
-            )
 
         self._trial_configs = reconciled_trial_configs
         self._remaining_trial_configs = remaining_trial_configs
@@ -520,39 +434,12 @@ class Job:
         self._job_result.stats.remove_trial(previous_result)
         if self._is_cancelled_result(previous_result):
             self._cancelled_trial_ids.discard(trial_name)
+        self._n_retries += 1
         self._refresh_metrics_for_eval(evals_key, dataset_name)
 
     def _write_job_result(self, *, exclude_trial_results: bool = False) -> None:
-        # Rebuild qualified usage from the same canonical observations as the
-        # rewards. Archived attempts are explicitly separate experimental spend.
-        from pier.models.agent.usage import ReportedUsage
-
-        observations = [
-            result.reported_usage() for result in self._previous_trial_results.values()
-        ]
-        self._job_result.stats.session_reported_usage = (
-            ReportedUsage.aggregate(observations, source="canonical_trial_observations")
-            if observations
-            else None
-        )
-
-        overhead = []
-        paths = []
-        for path in sorted((self.job_dir / ".retry-attempts").glob("*/*/result.json")):
-            try:
-                result = TrialResult.model_validate_json(path.read_text())
-            except (ValueError, OSError):
-                # Preserve the archive's existence even when usage is unknown.
-                overhead.append(ReportedUsage(source="unreadable_retry_attempt"))
-            else:
-                overhead.append(result.reported_usage())
-            paths.append(path.relative_to(self.job_dir).as_posix())
-        self._job_result.stats.retry_attempt_paths = paths
-        self._job_result.stats.retry_overhead = (
-            ReportedUsage.aggregate(overhead, source="discarded_retry_attempts")
-            if overhead
-            else None
-        )
+        self._job_result.stats.update_usage(list(self._previous_trial_results.values()))
+        self._job_result.stats.retry_overhead = self._retry_overhead()
         if exclude_trial_results:
             result_json = self._job_result.model_dump_json(
                 indent=4,
@@ -562,28 +449,46 @@ class Job:
             result_json = self._job_result.model_dump_json(indent=4)
         self._job_result_path.write_text(result_json)
 
+    def _retry_overhead(self) -> RetryOverhead | None:
+        attempts = []
+        kept_ids = {result.id for result in self._previous_trial_results.values()}
+        for path in sorted((self.job_dir / ".retry-attempts").glob("*/*/result.json")):
+            try:
+                result = TrialResult.model_validate_json(path.read_text())
+                # During backoff the existing hooks still count this result
+                # as current. It becomes overhead when a replacement starts.
+                if result.id in kept_ids:
+                    continue
+                has_context = result.agent_result is not None or any(
+                    step.agent_result is not None for step in result.step_results or []
+                )
+                attempts.append(
+                    result.compute_token_cost_totals()
+                    if has_context
+                    else (0, 0, 0, 0.0)
+                )
+            except (ValueError, OSError):
+                # Count unreadable attempts without inventing zero spend.
+                attempts.append((None, None, None, None))
+        if not attempts:
+            return None
+        totals = {}
+        for index, field in enumerate(
+            ("n_input_tokens", "n_cache_tokens", "n_output_tokens", "cost_usd")
+        ):
+            values = [usage[index] for usage in attempts]
+            totals[field] = (
+                sum(values) if all(value is not None for value in values) else None
+            )
+        return RetryOverhead(n_attempts=len(attempts), **totals)
+
     async def _write_job_result_async(
         self, *, exclude_trial_results: bool = False
     ) -> None:
-        write = asyncio.create_task(
-            asyncio.to_thread(
-                self._write_job_result,
-                exclude_trial_results=exclude_trial_results,
-            )
+        await asyncio.to_thread(
+            self._write_job_result,
+            exclude_trial_results=exclude_trial_results,
         )
-        try:
-            await asyncio.shield(write)
-        except asyncio.CancelledError:
-            # Executor work keeps running after its awaiter is cancelled. Drain
-            # it while the caller still holds _trial_completion_lock, including
-            # repeated cancellation, before any final accounting can write.
-            while not write.done():
-                try:
-                    await asyncio.shield(write)
-                except asyncio.CancelledError:
-                    continue
-            write.result()
-            raise
 
     def _init_job_lock(self) -> None:
         self._job_lock = build_job_lock(
@@ -674,10 +579,6 @@ class Job:
         """Internal hook to update live progress when a trial starts."""
         async with self._trial_completion_lock:
             self._remove_completed_attempt_for_retry(event.trial_id)
-            # Count a replacement only once it actually enters Trial.run.
-            # Cancellation in backoff/RETRY callbacks must not invent an attempt.
-            if event.result is not None:
-                self._reconcile_started_attempt(event.result)
             self._running_trial_ids.add(event.trial_id)
             self._refresh_job_progress(updated_at=event.timestamp)
             await self._write_job_result_async(exclude_trial_results=True)
@@ -701,9 +602,6 @@ class Job:
         trial_name = trial_result.trial_name
 
         async with self._trial_completion_lock:
-            # START may have been cancelled while waiting for this lock. A
-            # persisted completed replacement still counts, exactly once.
-            self._reconcile_started_attempt(trial_result)
             previous_result = self._previous_trial_results.get(trial_name)
 
             evals_key, dataset_name = self._evals_key_for_result(trial_result)
@@ -731,18 +629,6 @@ class Job:
 
             self._refresh_metrics_for_eval(evals_key, dataset_name)
 
-            self._refresh_job_progress(updated_at=event.timestamp)
-            await self._write_job_result_async(exclude_trial_results=True)
-
-    def _reconcile_started_attempt(self, result: TrialResult) -> None:
-        previous = self._retry_counts_by_trial.get(result.trial_name, 0)
-        started = max(previous, result.attempt - 1)
-        self._retry_counts_by_trial[result.trial_name] = started
-        self._n_retries += started - previous
-
-    async def _on_trial_retry(self, event: TrialHookEvent) -> None:
-        """A discarded infrastructure attempt is overhead, never a result."""
-        async with self._trial_completion_lock:
             self._refresh_job_progress(updated_at=event.timestamp)
             await self._write_job_result_async(exclude_trial_results=True)
 

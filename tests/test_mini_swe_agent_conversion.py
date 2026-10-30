@@ -6,6 +6,24 @@ from pier.agents.installed.mini_swe_agent import (
 )
 
 
+def test_missing_usage_remains_unknown_and_reported_zero_cache_remains_zero():
+    for usage, expected in [
+        (None, (None, None, None)),
+        ({"prompt_tokens": 1, "completion_tokens": 1}, (1, 1, 0)),
+    ]:
+        message = {"role": "assistant", "content": "answer"}
+        if usage is not None:
+            message["extra"] = {"response": {"usage": usage}}
+        metrics = convert_mini_swe_agent_to_atif(
+            {"messages": [message]}, "session"
+        ).final_metrics
+        assert (
+            metrics.total_prompt_tokens,
+            metrics.total_completion_tokens,
+            metrics.total_cached_tokens,
+        ) == expected
+
+
 def test_mini_swe_install_refreshes_litellm_cost_map_backup(tmp_path: Path):
     agent = MiniSweAgent(logs_dir=tmp_path, model_name="openai/gpt-5.5")
 
@@ -162,7 +180,6 @@ def test_convert_openai_responses_usage_to_atif_metrics():
     assert trajectory.final_metrics.total_cached_tokens == 25
     assert trajectory.final_metrics.total_cost_usd == 0.03
     assert trajectory.final_metrics.extra == {
-        "cost_source": "harness_reported",
         "total_reasoning_tokens": 30,
         "total_text_tokens": 10,
         "peak_context_tokens": 100,
@@ -177,7 +194,7 @@ def test_convert_openai_responses_usage_to_atif_metrics():
     assert agent_steps[0].metrics.prompt_tokens == 100
     assert agent_steps[0].metrics.completion_tokens == 40
     assert agent_steps[0].metrics.cached_tokens == 25
-    assert agent_steps[0].metrics.cost_usd is None
+    assert agent_steps[0].metrics.cost_usd == 0.03
     assert agent_steps[0].metrics.extra is not None
     assert agent_steps[0].metrics.extra["text_tokens"] == 10
     assert agent_steps[0].message == "I will inspect the workspace."
@@ -195,9 +212,7 @@ def test_convert_chat_message_keeps_reasoning_separate_from_visible_content():
             "info": {
                 "mini_version": "2.2.8",
                 "model_stats": {"instance_cost": 0.01, "api_calls": 1},
-                "config": {
-                    "model": {"model_name": "anthropic/claude-opus-4-7"}
-                },
+                "config": {"model": {"model_name": "anthropic/claude-opus-4-7"}},
             },
             "messages": [
                 {"role": "system", "content": "system"},
@@ -242,9 +257,7 @@ def test_convert_openrouter_byok_uses_upstream_cost_details():
             "info": {
                 "mini_version": "2.2.8",
                 "model_stats": {"instance_cost": 0.0, "api_calls": 1},
-                "config": {
-                    "model": {"model_name": "moonshotai/kimi-k2.6"}
-                },
+                "config": {"model": {"model_name": "moonshotai/kimi-k2.6"}},
             },
             "messages": [
                 {"role": "system", "content": "system"},

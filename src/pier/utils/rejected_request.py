@@ -1,38 +1,30 @@
-"""Extract explicitly reported rejected input sizes, never inferred model usage."""
+"""Explicit rejected input sizes are diagnostics, not successful model usage."""
 
 import re
 from typing import Any
 
 
 def rejected_requests_from_errors(value: Any, *, source: str) -> list[dict[str, Any]]:
-    observations: list[dict[str, Any]] = []
+    observations = []
 
-    def visit(item: Any, in_error: bool = False) -> None:
+    def visit(item: Any, error: bool = False) -> None:
         if isinstance(item, dict):
-            is_error = in_error or item.get("type") in {"error", "turn.failed"}
+            error = error or item.get("type") in {"error", "turn.failed"}
             for key, child in item.items():
                 visit(
                     child,
-                    is_error
+                    error
                     or key
-                    in {
-                        "error",
-                        "errorMessage",
-                        "error_message",
-                        "responseBody",
-                    },
+                    in {"error", "errorMessage", "error_message", "responseBody"},
                 )
         elif isinstance(item, list):
             for child in item:
-                visit(child, in_error)
-        elif isinstance(item, str) and in_error:
-            # LiteLLM's preflight error states the transformed gateway input.
-            patterns = (
+                visit(child, error)
+        elif isinstance(item, str) and error:
+            for pattern in (
                 r"Max Input Tokens\s*[=:]\s*([\d,]+)\s*,\s*Got\s*[=:]\s*([\d,]+)",
-                r"maximum context length is\s*([\d,]+)\s*tokens.*?"
-                r"your messages resulted in\s*([\d,]+)\s*tokens",
-            )
-            for pattern in patterns:
+                r"maximum context length is\s*([\d,]+)\s*tokens.*?your messages resulted in\s*([\d,]+)\s*tokens",
+            ):
                 for match in re.finditer(pattern, item, re.IGNORECASE | re.DOTALL):
                     observation = {
                         "input_tokens": int(match[2].replace(",", "")),

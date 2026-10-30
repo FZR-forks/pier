@@ -129,8 +129,13 @@ def _build_step_metrics(
         return None
 
     step_cost = step_cost_usd
-    # The session's cost cannot be apportioned by output length: prompt/cache
-    # rates vary between calls. Keep an unreported per-call cost unknown.
+    if (
+        step_cost is None
+        and total_cost_usd > 0
+        and total_completion_tokens > 0
+        and completion_tokens > 0
+    ):
+        step_cost = (completion_tokens / total_completion_tokens) * total_cost_usd
 
     extra_metrics: dict[str, Any] = {}
     reasoning_tokens = completion_tokens_details.get("reasoning_tokens") or 0
@@ -148,7 +153,7 @@ def _build_step_metrics(
         prompt_tokens=prompt_tokens,
         completion_tokens=completion_tokens,
         cached_tokens=cached_tokens,
-        cost_usd=step_cost,
+        cost_usd=step_cost if step_cost and step_cost > 0 else None,
         extra=extra_metrics if extra_metrics else None,
     )
 
@@ -306,11 +311,10 @@ def convert_mini_swe_agent_to_atif(
     total_cached_tokens = 0
     total_reasoning_tokens = 0
     total_text_tokens = 0
-    reported_cost = (info.get("model_stats") or {}).get("instance_cost")
-    total_cost_usd = reported_cost if reported_cost is not None else 0.0
+    total_cost_usd = (info.get("model_stats") or {}).get("instance_cost") or 0.0
     total_usage_cost = 0.0
 
-    # First pass: collect native completion usage and reported costs.
+    # First pass: count total completion tokens for cost apportioning
     for message in messages:
         usage = _usage_from_message(message)
         total_completion_tokens += (
@@ -319,8 +323,6 @@ def convert_mini_swe_agent_to_atif(
         total_usage_cost += _cost_from_usage(usage) or 0.0
 
     if total_cost_usd <= 0 and total_usage_cost > 0:
-        # OpenRouter BYOK's instance_cost=0 means no gateway markup; the
-        # upstream_inference_cost remains real spend, not a free model call.
         total_cost_usd = total_usage_cost
 
     # Process messages
@@ -465,13 +467,7 @@ def convert_mini_swe_agent_to_atif(
             _add_observation_to_last_agent_step(steps, output, _logger, i, timestamp)
 
     # Build final metrics
-    final_cost_usd = (
-        total_cost_usd if reported_cost is not None or total_usage_cost > 0 else None
-    )
     final_extra: dict[str, Any] = {}
-    final_extra["cost_source"] = (
-        "harness_reported" if final_cost_usd is not None else "unknown"
-    )
     if total_reasoning_tokens > 0:
         final_extra["total_reasoning_tokens"] = total_reasoning_tokens
     if total_text_tokens > 0:
@@ -482,11 +478,12 @@ def convert_mini_swe_agent_to_atif(
         summarization_count=None,
     )
 
+    usage_seen = any(_usage_from_message(message) for message in messages)
     final_metrics = FinalMetrics(
-        total_prompt_tokens=total_prompt_tokens,
-        total_completion_tokens=total_completion_tokens,
-        total_cached_tokens=total_cached_tokens,
-        total_cost_usd=final_cost_usd,
+        total_prompt_tokens=total_prompt_tokens if usage_seen else None,
+        total_completion_tokens=total_completion_tokens if usage_seen else None,
+        total_cached_tokens=total_cached_tokens if usage_seen else None,
+        total_cost_usd=total_cost_usd if total_cost_usd > 0 else None,
         total_steps=len(steps),
         extra=final_extra,
     )

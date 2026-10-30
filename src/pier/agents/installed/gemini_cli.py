@@ -396,19 +396,16 @@ class GeminiCli(BaseInstalledAgent):
                     thoughts_tokens = tokens.get("thoughts", 0)
                     tool_tokens = tokens.get("tool", 0)
 
-                    # toolUsePromptTokenCount is additional input, not output.
-                    # Gemini CLI persists it as `tool`; hidden thoughts are
-                    # billable output and are added to candidatesTokenCount.
-                    completion_tokens = output_tokens + thoughts_tokens
-                    prompt_tokens = input_tokens + tool_tokens
+                    # Calculate completion tokens (output + thoughts + tool)
+                    completion_tokens = output_tokens + thoughts_tokens + tool_tokens
 
                     # Update totals
-                    total_input_tokens += prompt_tokens
+                    total_input_tokens += input_tokens
                     total_output_tokens += completion_tokens
                     total_cached_tokens += cached_tokens
 
                     metrics = Metrics(
-                        prompt_tokens=prompt_tokens,
+                        prompt_tokens=input_tokens,
                         completion_tokens=completion_tokens,
                         cached_tokens=cached_tokens,
                         extra={
@@ -439,40 +436,21 @@ class GeminiCli(BaseInstalledAgent):
         summarization_count = sum(
             1 for message in messages if self._is_summarization_message(message)
         )
-        usage_complete = all(
-            isinstance(message.get("tokens"), dict)
-            and all(
-                isinstance(message["tokens"].get(key), int)
-                for key in ("input", "output", "cached", "thoughts", "tool")
-            )
-            for message in messages
-            if message.get("type") == "gemini"
-        ) and any(message.get("type") == "gemini" for message in messages)
-        final_extra = {"compacted": True} if summarization_count else {}
-        if not usage_complete:
-            final_extra["metrics_complete"] = False
+        final_extra = {"compacted": True} if summarization_count else None
         final_extra = extra_with_context_metrics(
             final_extra,
             peak_context_tokens=peak_context_tokens_from_steps(steps),
             summarization_count=summarization_count,
         )
-        total_cost_usd = (
-            self._compute_cost_from_pricing(
-                total_input_tokens, total_output_tokens, total_cached_tokens
-            )
-            if usage_complete
-            else None
-        )
-        final_extra["cost_source"] = (
-            "pricing_estimate" if total_cost_usd is not None else "unknown"
-        )
 
         # Build final metrics
         final_metrics = FinalMetrics(
-            total_prompt_tokens=total_input_tokens if usage_complete else None,
-            total_completion_tokens=total_output_tokens if usage_complete else None,
-            total_cached_tokens=total_cached_tokens if usage_complete else None,
-            total_cost_usd=total_cost_usd,
+            total_prompt_tokens=total_input_tokens,
+            total_completion_tokens=total_output_tokens,
+            total_cached_tokens=total_cached_tokens,
+            total_cost_usd=self._compute_cost_from_pricing(
+                total_input_tokens, total_output_tokens, total_cached_tokens
+            ),
             total_steps=len(steps),
             extra=final_extra,
         )
@@ -591,9 +569,7 @@ class GeminiCli(BaseInstalledAgent):
 
         input_rate = pricing.get("input_cost_per_token") or 0.0
         output_rate = pricing.get("output_cost_per_token") or 0.0
-        cache_read_rate = pricing.get("cache_read_input_token_cost", input_rate)
-        if cache_read_rate is None:
-            cache_read_rate = input_rate
+        cache_read_rate = pricing.get("cache_read_input_token_cost") or input_rate
 
         uncached = max(0, (prompt_tokens or 0) - (cached_tokens or 0))
         cached = cached_tokens or 0
@@ -616,6 +592,27 @@ class GeminiCli(BaseInstalledAgent):
         if gemini_trajectory is None:
             self.logger.debug(f"Could not parse Gemini session at {gemini_path}")
             return
+
+        n_input_tokens = 0
+        n_output_tokens = 0
+        n_cache_tokens = 0
+        for message in gemini_trajectory.get("messages", []):
+            if message.get("type") == "gemini":
+                tokens = message.get("tokens") or {}
+                n_input_tokens += tokens.get("input", 0)
+                n_output_tokens += (
+                    tokens.get("output", 0)
+                    + tokens.get("tool", 0)
+                    + tokens.get("thoughts", 0)
+                )
+                n_cache_tokens += tokens.get("cached", 0)
+
+        context.n_input_tokens = n_input_tokens
+        context.n_output_tokens = n_output_tokens
+        context.n_cache_tokens = n_cache_tokens
+        context.cost_usd = self._compute_cost_from_pricing(
+            n_input_tokens, n_output_tokens, n_cache_tokens
+        )
 
         try:
             atif_trajectory = self._convert_gemini_to_atif(gemini_trajectory)

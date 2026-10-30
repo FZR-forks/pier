@@ -828,7 +828,7 @@ def test_m2_peak_context_is_max_and_summarization_is_sum(tmp_path: Path):
     extra = _metrics(trajectory).extra
 
     assert extra is not None
-    # `contexts` above populates total_tokens (input + output), not input.
+    # contexts populates input + output, not the prompt size.
     assert extra["peak_context_tokens"] == 3
     assert extra["summarization_count"] == 3
 

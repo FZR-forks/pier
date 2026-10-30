@@ -122,6 +122,68 @@ def _convert(logs_dir: Path):
     return trajectory
 
 
+@pytest.mark.parametrize("compaction", [None, "compacted", "context_compacted"])
+def test_input_peak_and_explicit_compaction_markers(tmp_path, compaction):
+    events = _thread_events(ROOT, None, model=ROOT_MODEL)
+    for prompt, output in [(20000, 100000), (21000, 1), (100, 1)]:
+        events.append(
+            {
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "answer"}],
+                },
+            }
+        )
+        tokens = _token_count(prompt, output)
+        tokens["payload"]["info"]["last_token_usage"]["total_tokens"] = prompt + output
+        events.append(tokens)
+    if compaction == "compacted":
+        events += [
+            {"type": "compacted", "payload": {}},
+            {"type": "event_msg", "payload": {"type": "context_compacted"}},
+        ]
+    elif compaction:
+        events.append({"type": "event_msg", "payload": {"type": compaction}})
+    trajectory = Codex(
+        logs_dir=tmp_path, model_name=ROOT_MODEL
+    )._convert_session_file_to_trajectory(tmp_path / "root.jsonl", events)
+    extra = trajectory.final_metrics.extra
+    assert (
+        extra["peak_context_tokens"]
+        == max(step.metrics.prompt_tokens for step in trajectory.steps if step.metrics)
+        == 21000
+    )
+    assert extra["summarization_count"] == (1 if compaction else 0)
+    assert sum(
+        bool((step.extra or {}).get("compaction")) for step in trajectory.steps
+    ) == (1 if compaction else 0)
+
+
+def test_rejected_input_without_provider_usage_stays_separate(tmp_path):
+    events = _thread_events(ROOT, None, model=ROOT_MODEL)
+    events.append(
+        {
+            "type": "event_msg",
+            "payload": {
+                "type": "error",
+                "message": "Max Input Tokens=1048576, Got=1054336",
+            },
+        }
+    )
+    trajectory = Codex(
+        logs_dir=tmp_path, model_name=ROOT_MODEL
+    )._convert_session_file_to_trajectory(tmp_path / "root.jsonl", events)
+    assert trajectory.final_metrics.total_prompt_tokens is None
+    assert trajectory.final_metrics.extra["metrics_complete"] is False
+    assert trajectory.final_metrics.extra.get("peak_context_tokens") is None
+    assert (
+        trajectory.final_metrics.extra["rejected_request_tokens"][0]["input_tokens"]
+        == 1054336
+    )
+
+
 def test_populate_context_discovers_rollouts_across_midnight(tmp_path: Path) -> None:
     _write_rollout(
         tmp_path,

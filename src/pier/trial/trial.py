@@ -950,16 +950,12 @@ class Trial:
         )
         return artifacts_dir
 
-    async def run(
-        self, *, attempt: int = 1, retry_attempts=None, retry_history_errors=None
-    ) -> TrialResult:
+    async def run(self, *, attempt: int = 1) -> TrialResult:
         self._trial_paths.trial_dir.mkdir(parents=True, exist_ok=True)
         self._trial_paths.config_path.write_text(self.config.model_dump_json(indent=4))
 
         self._result = TrialResult(
             attempt=attempt,
-            retry_attempts=list(retry_attempts or []),
-            retry_history_errors=list(retry_history_errors or []),
             trial_name=self.config.trial_name,
             task_name=self._task.name,
             task_id=self.config.task.get_task_id(),
@@ -971,13 +967,9 @@ class Trial:
             source=self.config.task.source,
         )
 
-        start_hooks_completed = False
-        cancelled = False
+        await self._invoke_hooks(TrialEvent.START)
+
         try:
-            # START hooks can be cancelled too: every initialized observation
-            # must pass through finalization and reach result.json.
-            await self._invoke_hooks(TrialEvent.START)
-            start_hooks_completed = True
             await self._setup_environment()
             await self._environment.run_healthcheck()
             self._environment.default_user = self._task.config.agent.user
@@ -1032,7 +1024,6 @@ class Trial:
                     self._environment.default_user = None
 
         except asyncio.CancelledError as e:
-            cancelled = True
             self._logger.debug(f"Trial {self.config.trial_name} cancelled")
             if self.result.exception_info is None:
                 self.result.exception_info = ExceptionInfo.from_exception(e)
@@ -1052,10 +1043,6 @@ class Trial:
             raise e
 
         except Exception as e:
-            if not start_hooks_completed:
-                # A callback fault is an orchestration error, not an evaluated
-                # system failure. Propagate it without grading or retrying.
-                raise
             self._logger.debug(f"Trial {self.config.trial_name} failed: {e}")
 
             await self._maybe_download_logs(
@@ -1074,10 +1061,7 @@ class Trial:
                 await self._collect_artifacts()
 
         finally:
-            try:
-                if start_hooks_completed or cancelled:
-                    await self._cleanup_and_finalize()
-            finally:
-                self._close_logger_handler()
+            await self._cleanup_and_finalize()
+            self._close_logger_handler()
 
         return self.result

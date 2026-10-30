@@ -1,117 +1,44 @@
-# Trustworthy benchmark metrics
+# Collected usage and retry results
 
-Pier reports native harness observations. It does not retokenize prompts, infer
-missing usage from text length, or treat unknown usage as zero. Provider prompt
-cache reads and writes are in scope. Gateway request rewriting, gateway response
-caching and gateway-specific billing are not part of these metrics.
+Pier preserves native harness usage. Input includes provider cache reads and
+creation; reasoning is part of the harness's billable output. Missing totals
+remain null rather than being converted to zero. Explicitly reported zero token
+totals remain zero. A trial/job category is null if an agent that ran did not
+report that category; a trial without an agent context contributes nothing.
 
-## Token and cost semantics
+Codex `peak_context_tokens` is the largest step prompt/input count, not input +
+output. Compaction counts use explicit `compacted` items (or `context_compacted`
+events when items are absent), and the trajectory contains corresponding system
+markers. Changing output or reasoning length cannot create a compaction.
 
-- `n_input_tokens` / `prompt_tokens` includes fresh input, cache reads and cache
-  creation exactly once. `n_cache_tokens` is the cache-hit subset, not extra input.
-- `n_output_tokens` / `completion_tokens` includes billable reasoning output.
-  Native harnesses differ: Codex and Pi already include reasoning in output;
-  Both OpenCode adapters split it out, so Pier adds it once. Gemini's tool-prompt count is
-  additional input, not generated output.
-- Cache creation and reasoning totals are promoted when reported. Unknown
-  categories stay null; an explicitly reported zero stays zero.
-- Pi custom model entries with omitted cost rates generate placeholder zero
-  costs. Those are not free inference: Pier uses its standard-provider pricing
-  fallback, or leaves cost unknown if the slug cannot be priced. Explicitly
-  configured zero rates remain zero.
-- `cost_source` distinguishes `harness_reported` from `pricing_estimate` (or
-  `mixed`/`unknown` in an aggregate). Harness prices and configured standard
-  provider prices must be correct for the model being evaluated. Pier does not
-  replace these figures with a gateway invoice or a gateway's response-cache cost.
-  A null/withheld cost always has `unknown` provenance, including incomplete
-  session trees. A separately retained running session cost can still be
-  `harness_reported` even when the exact whole-run cost is unknown.
-- Codex custom slugs can use `kwargs.pricing_model_name` to explicitly select
-  the standard provider's LiteLLM price-table entry without changing the model
-  sent to the harness. This only reprices that selected model, not differently
-  priced subagents. Cache discounts and cache-creation prices are preserved.
-- Per-call costs are unknown when only a session cost exists; session cost is
-  never allocated to calls by output length.
+OpenCode V2 saved running totals are retained in
+`agent_result.session_reported_usage` and `final_metrics.extra.session_reported_usage`.
+They have `source`, `complete`, and input/cache/output/cost fields. When
+`complete: false`, these are available observations only: an in-flight request
+or uncollected child may be missing. Exact run totals remain null. Missing
+categories are not filled with zero. Root session usage covers collected child
+sessions once each, identified by their native IDs.
 
-`peak_context_tokens` is the maximum observed model input, never input + output.
-Rejected requests have separate `rejected_request_tokens` observations carrying
-their source and measurement type; those are not billed usage or successful
-context peaks. Codex compactions are counted from explicit native events and
-appear as system trajectory markers. Failed OpenCode summarizer requests retain
-their usage but do not count as successful context compactions.
+`rejected_request_tokens` records input sizes explicitly reported in errors,
+including their source. They are separate from successful input usage and peak
+context: a gateway may have transformed the rejected request.
 
-## Incomplete observations
+Whole-trial retries still default to zero. If enabled without an explicit
+`include_exceptions`, only the infrastructure allowlist is eligible. An empty
+include set disables eligibility; explicit include/exclude configuration is
+honored, with exclusions taking precedence. A generic nonzero harness exit is
+not an infrastructure classification and is not retried by default.
 
-OpenCode V2's saved running totals survive timeout, interruption and partial
-collection as `agent_result.session_reported_usage` and in trajectory final
-metrics extras. `complete: false` means they must not be substituted for exact
-trial totals. `lower_bound: true` indicates recorded usage can omit an in-flight
-request or child. `usage_discrepancies` exposes contradictory native totals.
-The qualification `contradictory: true` survives trial and job aggregation and
-prevents a claimed lower bound even if other trials are interrupted. Unqualified
-partial observations do not become proven lower bounds just by being summed.
+The kept trial is the ordinary job child directory. Discarded infrastructure
+attempts stay under `.retry-attempts/<trial>/attempt-N/`; `TrialResult.attempt`
+identifies the attempt within that execution. Failed archival preserves the original observation
+instead of deleting it and rerunning. Job rewards and primary usage totals use
+the queue's kept results. `stats.retry_overhead` separately records archived
+attempt count and usage; an unreadable archive counts but makes its totals
+unknown. Existing lifecycle hooks and explicit resume behavior are unchanged.
 
-Job `stats.session_reported_usage` aggregates the same canonical trial
-observations. It carries completeness, lower-bound qualification, per-category
-`missing_observations`, source and cost provenance. Ordinary job token/cost
-fields are null for a category if any canonical trial lacks that category;
-they never silently sum around an unknown trial. The same rule applies to
-multi-step trial totals. CLI output warns about missing usage.
-An initialized, finalized trial whose agent execution never started has zero
-agent usage, labelled `no_agent_execution`, rather than missing model data.
-`evals.*.n_trials` counts every canonical trial, including ungraded failures;
-`reward_stats` separately identifies graded observations.
-
-## Attempts and provenance
-
-Pier defaults to zero whole-trial retries. When retries are enabled without
-`retry.include_exceptions`, eligibility uses a conservative positive
-infrastructure allowlist.
-Generic nonzero harness exits, timeouts, context overflow, interactive questions,
-deterministic failures, and already graded trials do not automatically receive
-another model attempt by default. `retry.include_exceptions` is an explicit user
-policy: it can opt an exception (including a generic nonzero exit or graded
-observation with an exception) back into retries. An empty set disables
-eligibility. Exclusions take precedence; cancellation is never retried.
-Explicit retries are labelled `explicit_retry_policy` in attempt history rather
-than being presented as automatically classified infrastructure failures.
-
-Each trial has `attempt`, `canonical`, and `retry_attempts` (IDs and archive
-paths). `stats.canonical_trials` identifies exactly the observations underlying
-job metrics. Completion hooks see canonical results only; discarded attempts
-emit `TrialEvent.RETRY`. Retry usage is separately labelled `stats.retry_overhead`
-with `retry_attempt_paths`. Archive failure preserves the original observation
-and stops retrying instead of deleting evidence. Explicit resume filters also
-archive prior observations rather than deleting them.
-Retry counts increment only when a replacement attempt enters execution, not
-while waiting in backoff or notifying retry hooks. Cancellation in a start hook
-still finalizes and persists the initialized canonical observation.
-An ordinary START-hook exception propagates as an orchestration fault instead
-of being graded or retried as a benchmark failure. Filtered resume reuses each
-archived trial slot's name and full attempt history. Cancelled job-result writes
-finish under the accounting lock before cancellation/finalization can write.
-Unreadable archived observations are preserved with null IDs and
-`retry_history_errors` rather than aborting every concurrent trial on resume.
-
-Existing historical output is not rewritten automatically. These semantics apply
-to newly generated files; retain the `lock.json` with every benchmark job.
-
-## Reconciliation
-
-Run the regression suite with `uv run pytest -q tests`. Example task verifiers
-under `examples/tasks` are sandbox tests, not part of the host unit suite.
-
-For a simple Pi/Codex/OpenCode V2 smoke job, independently compare native records,
-trajectory metrics, trial fields, context peaks and canonical job totals:
-
-```sh
-uv run python scripts/audit_native_usage.py /path/to/job > native-audit.json
-```
-
-This command is read-only and exits nonzero for a discrepancy or unsupported
-native structure. It does not fetch billing, alter observations or perform data
-corrections. It records source hashes so audit evidence can be traced back to
-the saved harness files. Native values that are deliberately withheld in exact
-Pier totals are listed as `native_available_but_withheld`. The script checks
-canonical observations, not discarded retry overhead; retry-overhead accounting
-is covered by lifecycle regression tests.
+These are inference observations, not gateway invoices. Standard provider
+prices and upstream LLM caching are in scope; gateway billing, gateway response
+caches and request rewriting are not used to adjust these figures. Live
+reconciliation evidence is attached to the PR rather than shipped as an audit
+subsystem. No historical benchmark output is rewritten.

@@ -5,7 +5,6 @@ from uuid import UUID, uuid4
 from pydantic import BaseModel, Field
 
 from pier.models.agent.context import AgentContext
-from pier.models.agent.usage import ReportedUsage
 from pier.models.task.id import GitTaskId, LocalTaskId, PackageTaskId
 from pier.models.trial.config import TrialConfig
 from pier.models.verifier.result import VerifierResult
@@ -67,14 +66,6 @@ class StepResult(BaseModel):
     verifier: TimingInfo | None = None
 
 
-class RetryAttempt(BaseModel):
-    attempt: int
-    trial_id: UUID | None
-    result_path: str
-    exception_type: str
-    reason: str = "allowlisted_infrastructure_failure"
-
-
 class TrialResult(BaseModel):
     id: UUID = Field(default_factory=uuid4)
     task_name: str
@@ -97,22 +88,6 @@ class TrialResult(BaseModel):
     n_agent_steps: int | None = None
     step_results: list[StepResult] | None = None
     attempt: int = Field(default=1, ge=1)
-    canonical: bool = True
-    retry_attempts: list[RetryAttempt] = Field(default_factory=list)
-    retry_history_errors: list[str] = Field(default_factory=list)
-
-    def _agent_never_started(self) -> bool:
-        """Only initialized/finalized trials can establish no agent execution."""
-        return (
-            self.started_at is not None
-            and self.finished_at is not None
-            and self.agent_result is None
-            and self.agent_execution is None
-            and all(
-                step.agent_result is None and step.agent_execution is None
-                for step in self.step_results or []
-            )
-        )
 
     def agent_step_count(self) -> int | None:
         if self.n_agent_steps is not None:
@@ -125,24 +100,27 @@ class TrialResult(BaseModel):
         if not self.step_results:
             return None
 
-        values = [
-            step.agent_result.n_agent_steps if step.agent_result else None
-            for step in self.step_results
-        ]
-        return sum(values) if all(value is not None for value in values) else None
+        total = 0
+        found = False
+        for step_result in self.step_results:
+            agent_result = step_result.agent_result
+            if agent_result is None or agent_result.n_agent_steps is None:
+                continue
+            found = True
+            total += agent_result.n_agent_steps
+        return total if found else None
 
     def compute_token_cost_totals(
         self,
     ) -> tuple[int | None, int | None, int | None, float | None]:
         """Sum (n_input_tokens, n_cache_tokens, n_output_tokens, cost_usd)."""
-        if self._agent_never_started():
-            return 0, 0, 0, 0.0
         if self.agent_result is not None:
             contexts = [self.agent_result]
         elif self.step_results:
             contexts = [
-                step_result.agent_result or AgentContext()
+                step_result.agent_result
                 for step_result in self.step_results
+                if step_result.agent_result is not None
             ]
         else:
             contexts = []
@@ -150,74 +128,16 @@ class TrialResult(BaseModel):
         if not contexts:
             return None, None, None, None
 
-        def total(field: str):
+        # Do not present a partial multi-step sum as the complete trial total.
+        totals = []
+        for field in (
+            "n_input_tokens",
+            "n_cache_tokens",
+            "n_output_tokens",
+            "cost_usd",
+        ):
             values = [getattr(context, field) for context in contexts]
-            # Multi-step trials must not publish partial sums as full totals.
-            return sum(values) if all(value is not None for value in values) else None
-
-        return tuple(
-            total(field)
-            for field in (
-                "n_input_tokens",
-                "n_cache_tokens",
-                "n_output_tokens",
-                "cost_usd",
+            totals.append(
+                sum(values) if all(value is not None for value in values) else None
             )
-        )
-
-    def reported_usage(self) -> ReportedUsage:
-        """Best-known usage, explicitly qualified and never used as exact totals."""
-        if self._agent_never_started():
-            return ReportedUsage(
-                source="trial.agent_not_started",
-                complete=True,
-                n_input_tokens=0,
-                n_cache_tokens=0,
-                n_output_tokens=0,
-                n_cache_write_tokens=0,
-                n_reasoning_tokens=0,
-                cost_usd=0,
-                cost_source="no_agent_execution",
-            )
-        contexts = (
-            [self.agent_result]
-            if self.agent_result is not None
-            else [
-                step.agent_result or AgentContext() for step in self.step_results or []
-            ]
-        )
-        observations = []
-        for context in contexts:
-            if context.session_reported_usage is not None:
-                reported = context.session_reported_usage.model_copy(deep=True)
-                if context.usage_discrepancies:
-                    reported.contradictory = True
-                    reported.complete = reported.lower_bound = False
-                observations.append(reported)
-            else:
-                observations.append(
-                    ReportedUsage(
-                        source="trial.agent_result",
-                        complete=all(
-                            value is not None
-                            for value in (
-                                context.n_input_tokens,
-                                context.n_cache_tokens,
-                                context.n_output_tokens,
-                                context.cost_usd,
-                            )
-                        )
-                        and context.metrics_complete is not False,
-                        lower_bound=context.metrics_complete is False
-                        and not bool(context.usage_discrepancies),
-                        contradictory=bool(context.usage_discrepancies),
-                        n_input_tokens=context.n_input_tokens,
-                        n_cache_tokens=context.n_cache_tokens,
-                        n_output_tokens=context.n_output_tokens,
-                        cost_usd=context.cost_usd,
-                        cost_source=context.cost_source,
-                        n_cache_write_tokens=context.n_cache_write_tokens,
-                        n_reasoning_tokens=context.n_reasoning_tokens,
-                    )
-                )
-        return ReportedUsage.aggregate(observations, source="trial_observations")
+        return tuple(totals)

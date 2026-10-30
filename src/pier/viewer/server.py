@@ -130,7 +130,7 @@ def _uncached_input(n_input: int | None, n_cache: int | None) -> int | None:
     if n_input is None:
         return None
     if n_cache is None:
-        return None
+        return n_input
     return max(0, n_input - n_cache)
 
 
@@ -2164,32 +2164,32 @@ def _register_job_endpoints(app: FastAPI, jobs_dir: Path) -> None:
             )
             avg_input_tokens = (
                 stats["total_input_tokens"] / stats["input_tokens_count"]
-                if stats["input_tokens_count"] == stats["n_trials"]
+                if stats["input_tokens_count"] > 0
                 else None
             )
             avg_cached_input_tokens = (
                 stats["total_cached_input_tokens"] / stats["cached_input_tokens_count"]
-                if stats["cached_input_tokens_count"] == stats["n_trials"]
+                if stats["cached_input_tokens_count"] > 0
                 else None
             )
             avg_output_tokens = (
                 stats["total_output_tokens"] / stats["output_tokens_count"]
-                if stats["output_tokens_count"] == stats["n_trials"]
+                if stats["output_tokens_count"] > 0
                 else None
             )
             avg_cost_usd = (
                 stats["total_cost_usd"] / stats["cost_usd_count"]
-                if stats["cost_usd_count"] == stats["n_trials"]
+                if stats["cost_usd_count"] > 0
                 else None
             )
             avg_peak_context_tokens = (
                 stats["total_peak_context_tokens"] / stats["peak_context_tokens_count"]
-                if stats["peak_context_tokens_count"] == stats["n_trials"]
+                if stats["peak_context_tokens_count"] > 0
                 else None
             )
             avg_agent_steps = (
                 stats["total_agent_steps"] / stats["agent_steps_count"]
-                if stats["agent_steps_count"] == stats["n_trials"]
+                if stats["agent_steps_count"] > 0
                 else None
             )
 
@@ -2678,10 +2678,6 @@ def _register_job_endpoints(app: FastAPI, jobs_dir: Path) -> None:
             count = stats[count_key]  # type: ignore[literal-required]
             if count <= 0:
                 return None
-            if count_key in {"input_tokens_count", "cached_input_tokens_count",
-                             "output_tokens_count", "cost_usd_count",
-                             "peak_context_tokens_count", "agent_steps_count"} and count != stats["n_trials"]:
-                return None
             total = stats[total_key]  # type: ignore[literal-required]
             return total / count
 
@@ -2717,7 +2713,7 @@ def _register_job_endpoints(app: FastAPI, jobs_dir: Path) -> None:
                 ),
                 avg_cost_usd=average("total_cost_usd", "cost_usd_count", stats),
                 total_cost_usd=(
-                    stats["total_cost_usd"] if stats["cost_usd_count"] == stats["n_trials"] else None
+                    stats["total_cost_usd"] if stats["cost_usd_count"] > 0 else None
                 ),
                 avg_peak_context_tokens=average(
                     "total_peak_context_tokens", "peak_context_tokens_count", stats

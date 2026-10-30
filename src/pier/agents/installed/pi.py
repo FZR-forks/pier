@@ -1,6 +1,5 @@
 import copy
 import json
-import math
 import shlex
 from datetime import datetime, timezone
 from typing import Any
@@ -268,38 +267,6 @@ class Pi(BaseInstalledAgent):
         return (
             f'mkdir -p "$(dirname {self._MODELS_JSON_PATH})" && '
             f"printf '%s\\n' {escaped} > {self._MODELS_JSON_PATH}"
-        )
-
-    def _has_model_cost_metadata(self, message: dict[str, Any] | None = None) -> bool:
-        """Custom model entries default omitted rates to zero in Pi.
-
-        Built-in models retain Pi's shipped rates. A custom entry must actually
-        supply rates before its zero calculated cost can mean a free inference.
-        """
-        message = message or {}
-        provider = message.get("provider") or self._provider()
-        model = message.get("model") or (self.model_name or "").split("/", 1)[-1]
-        entry = (self._pi_config.get("providers") or {}).get(provider) or {}
-        for candidate in entry.get("models") or []:
-            if isinstance(candidate, dict) and candidate.get("id") == model:
-                rates = candidate.get("cost")
-                return isinstance(rates, dict) and all(
-                    isinstance(rates.get(key), (int, float))
-                    and not isinstance(rates[key], bool)
-                    and math.isfinite(rates[key])
-                    and rates[key] >= 0
-                    for key in ("input", "output", "cacheRead", "cacheWrite")
-                )
-        return True
-
-    def _has_reported_cost(
-        self, usage: Any, message: dict[str, Any] | None = None
-    ) -> bool:
-        if not isinstance(usage, dict) or not isinstance(usage.get("cost"), dict):
-            return False
-        cost = usage["cost"].get("total")
-        return cost is not None and (
-            cost != 0 or self._has_model_cost_metadata(message)
         )
 
     def _build_register_skills_command(self) -> str | None:
@@ -588,7 +555,7 @@ class Pi(BaseInstalledAgent):
         prompt_tokens = input_tokens + cache_read + cache_write
 
         metrics: Metrics | None = None
-        if self._usage_record_known(message.get("usage")):
+        if prompt_tokens or output_tokens:
             metrics_extra = {
                 key: value
                 for key, value in {
@@ -602,17 +569,11 @@ class Pi(BaseInstalledAgent):
                 prompt_tokens=prompt_tokens,
                 completion_tokens=output_tokens,
                 cached_tokens=cache_read,
-                cost_usd=cost_total
-                if self._has_reported_cost(usage, message)
-                else None,
+                cost_usd=cost_total or None,
                 extra=metrics_extra or None,
             )
 
         step_extra: dict[str, Any] = {}
-        if isinstance(message.get("usage"), dict) and not self._usage_record_known(
-            message["usage"]
-        ):
-            step_extra["usage_partial"] = message["usage"]
         if stop_reason := message.get("stopReason"):
             step_extra["stop_reason"] = stop_reason
         if error_message := message.get("errorMessage"):
@@ -839,56 +800,31 @@ class Pi(BaseInstalledAgent):
         if not any(step.source != "user" for step in steps):
             return None
 
-        usages = []
-        cost_observations = []
-        for record in records:
-            if record["kind"] == "agent":
-                usages.append(record["message"].get("usage"))
-                cost_observations.append(
-                    self._has_reported_cost(usages[-1], record["message"])
+        total_cost = totals["cost"] if totals["cost"] > 0 else None
+        if total_cost is None:
+            # A zero result means no usage to price, which is absent rather than free.
+            total_cost = (
+                self._compute_cost_from_pricing(
+                    totals["prompt"],
+                    totals["completion"],
+                    totals["cached"],
+                    totals["cache_write"],
+                    totals["cache_write_1h"],
                 )
-                usages.extend(
-                    result["usage"]
-                    for result in record["tool_results"]
-                    if isinstance(result.get("usage"), dict)
-                )
-                cost_observations.extend(
-                    self._has_reported_cost(result["usage"], result)
-                    for result in record["tool_results"]
-                    if isinstance(result.get("usage"), dict)
-                )
-            else:
-                usages.append(record["result"].get("usage"))
-                cost_observations.append(self._has_reported_cost(usages[-1]))
-        usage_known = all(self._usage_record_known(usage) for usage in usages)
-        costs_reported = usage_known and all(cost_observations)
-        # Keep explicit zero rates, but not a custom model's omitted-rate
-        # placeholder zeros (those need standard inference pricing or unknown).
-        total_cost = totals["cost"] if costs_reported else None
-        cost_source = "harness_reported" if costs_reported else "pricing_estimate"
-        if total_cost is None and usage_known:
-            total_cost = self._compute_cost_from_pricing(
-                totals["prompt"],
-                totals["completion"],
-                totals["cached"],
-                totals["cache_write"],
-                totals["cache_write_1h"],
+                or None
             )
 
         final_extra: dict[str, Any] = {}
-        final_extra["cost_source"] = (
-            cost_source if total_cost is not None else "unknown"
-        )
         from pier.utils.rejected_request import rejected_requests_from_errors
 
         rejected = rejected_requests_from_errors(events, source="pi.errorMessage")
         if rejected:
             final_extra["rejected_request_tokens"] = rejected
-        if usage_known:
+        if totals["cache_write"]:
             final_extra["total_cache_write_tokens"] = totals["cache_write"]
         if totals["cache_write_1h"]:
             final_extra["total_cache_write_1h_tokens"] = totals["cache_write_1h"]
-        if usage_known:
+        if totals["reasoning"]:
             final_extra["total_reasoning_tokens"] = totals["reasoning"]
         if summarization_count:
             final_extra["compacted"] = True
@@ -899,11 +835,30 @@ class Pi(BaseInstalledAgent):
         if stop_reason := self._final_stop_reason(records):
             final_extra["stop_reason"] = stop_reason
 
+        usages = []
+        for record in records:
+            if record["kind"] == "agent":
+                usages.append(record["message"].get("usage"))
+                usages.extend(
+                    item["usage"]
+                    for item in record["tool_results"]
+                    if isinstance(item.get("usage"), dict)
+                )
+            else:
+                usages.append(record["result"].get("usage"))
+        usage_known = all(
+            isinstance(item, dict)
+            and all(
+                isinstance(item.get(key), int)
+                for key in ("input", "output", "cacheRead", "cacheWrite")
+            )
+            for item in usages
+        )
         final_metrics = FinalMetrics(
             total_prompt_tokens=totals["prompt"] if usage_known else None,
             total_completion_tokens=totals["completion"] if usage_known else None,
             total_cached_tokens=totals["cached"] if usage_known else None,
-            total_cost_usd=total_cost,
+            total_cost_usd=total_cost if usage_known else None,
             total_steps=len(steps),
             extra=extra_with_context_metrics(
                 final_extra or None,
@@ -922,15 +877,6 @@ class Pi(BaseInstalledAgent):
             ),
             steps=steps,
             final_metrics=final_metrics,
-        )
-
-    @staticmethod
-    def _usage_record_known(usage: Any) -> bool:
-        return isinstance(usage, dict) and all(
-            isinstance(usage.get(key), int)
-            and not isinstance(usage[key], bool)
-            and usage[key] >= 0
-            for key in ("input", "output", "cacheRead", "cacheWrite")
         )
 
     @staticmethod

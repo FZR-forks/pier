@@ -199,12 +199,7 @@ class RetryConfig(BaseModel):
     )
     include_exceptions: set[str] | None = Field(
         default=None,
-        description=(
-            "Positive allowlist of retryable infrastructure exception types. "
-            "None uses Pier's conservative transport/provisioning allowlist; "
-            "an empty set disables retries. Generic harness exits and graded "
-            "evaluations require an explicit include. Cancellation is never retried."
-        ),
+        description="Exception types to retry. None uses the infrastructure allowlist; an empty set disables retries.",
     )
     exclude_exceptions: set[str] | None = Field(
         default_factory=lambda: {
@@ -213,7 +208,6 @@ class RetryConfig(BaseModel):
             "RewardFileNotFoundError",
             "RewardFileEmptyError",
             "VerifierOutputParseError",
-            "CancelledError",
         },
         description="Exception types to NOT retry on. Takes precedence over "
         "include_exceptions.",

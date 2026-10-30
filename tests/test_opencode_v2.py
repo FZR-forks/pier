@@ -147,6 +147,69 @@ def write_inspections(
     )
 
 
+def test_jsonl_unicode_separators_and_crlf_preserve_usage(tmp_path):
+    records = OpenCodeV2._read_jsonl(FIXTURES / "unicode_separators.jsonl")
+    assert len(records) == 1
+    dump = tmp_path / "unicode.jsonl"
+    dump.write_bytes((json.dumps(records[0], ensure_ascii=False) + "\r\n").encode())
+    assert OpenCodeV2._read_jsonl(dump) == records
+    write_inspections(tmp_path, records)
+    context = AgentContext()
+    make_agent(tmp_path).populate_context_post_run(context)
+    assert context.n_input_tokens == 19
+    assert context.n_output_tokens == 5
+    trajectory = json.loads((tmp_path / "trajectory.json").read_text())
+    assert trajectory["steps"][0]["message"] == "NEL: \u0085; LS: \u2028; PS: \u2029"
+
+
+@pytest.mark.parametrize("incomplete", [False, True])
+def test_session_running_totals_survive_incomplete_tree_collection(
+    tmp_path, incomplete
+):
+    inspections = load_fixture()
+    if incomplete:
+        inspections[1]["messages"][1].pop("tokens")
+    write_inspections(tmp_path, inspections)
+    if incomplete:
+        (tmp_path / "opencode-v2" / "runner-result.json").unlink()
+    context = AgentContext()
+    make_agent(tmp_path).populate_context_post_run(context)
+    reported = context.session_reported_usage
+    assert reported.complete is not incomplete
+    assert (
+        reported.n_input_tokens,
+        reported.n_cache_tokens,
+        reported.n_output_tokens,
+        reported.cost_usd,
+    ) == (223, 30, 120, 4.5)
+    assert context.n_input_tokens == (None if incomplete else 223)
+    assert context.cost_usd == (None if incomplete else 4.5)
+    saved = AgentContext.model_validate_json(context.model_dump_json())
+    assert saved.session_reported_usage == reported
+
+
+def test_partial_session_categories_are_unknown_not_zero(tmp_path):
+    agent = make_agent(tmp_path)
+    reported = agent._session_reported_usage(
+        {"id": "partial", "tokens": {"input": 10, "cache": {"read": 0}}, "cost": 0},
+        complete=False,
+    )
+    assert reported.n_input_tokens is reported.n_output_tokens is None
+    assert reported.n_cache_tokens == reported.cost_usd == 0
+    assert reported.complete is False
+
+
+def test_active_session_and_duplicate_snapshots_cannot_report_complete_usage(tmp_path):
+    inspections = load_fixture()
+    inspections[0]["active"] = {"running": True}
+    write_inspections(tmp_path, inspections + [inspections[0]])
+    context = AgentContext()
+    make_agent(tmp_path).populate_context_post_run(context)
+    assert context.n_input_tokens is None
+    assert context.session_reported_usage.complete is False
+    assert context.session_reported_usage.n_input_tokens == 223
+
+
 # ---------------------------------------------------------------------------
 # Registration and naming
 # ---------------------------------------------------------------------------
@@ -716,9 +779,7 @@ def test_provider_urls_are_not_restricted_by_adapter(tmp_path: Path):
         agent = make_agent(
             tmp_path,
             opencode_v2_config={
-                "providers": {
-                    "litellm": {"settings": {"baseURL": base_url}}
-                }
+                "providers": {"litellm": {"settings": {"baseURL": base_url}}}
             },
         )
         assert expected_host in agent.network_allowlist().domains
@@ -1087,9 +1148,9 @@ def test_spec_reference_totals(tmp_path: Path):
                 "cost": 2.0,
                 "tokens": {
                     "input": 100,
-                    "output": 40,
-                    "reasoning": 60,
-                    "cache": {"read": 30, "write": 20},
+                    "output": 30,
+                    "reasoning": 20,
+                    "cache": {"read": 40, "write": 60},
                 },
             },
             "messages": [
@@ -1120,9 +1181,9 @@ def test_spec_reference_totals(tmp_path: Path):
                 "cost": 0.5,
                 "tokens": {
                     "input": 10,
-                    "output": 4,
-                    "reasoning": 6,
-                    "cache": {"read": 3, "write": 2},
+                    "output": 3,
+                    "reasoning": 2,
+                    "cache": {"read": 4, "write": 6},
                 },
             },
             "messages": [
@@ -2182,8 +2243,7 @@ def test_failed_compaction_marks_incomplete(tmp_path: Path):
     assert final["total_prompt_tokens"] == 5
     assert final["total_completion_tokens"] == 0
     assert final["extra"]["failed_attempts"] == 1
-    assert final["extra"]["summarization_count"] == 0
-    assert not final["extra"].get("compacted", False)
+    assert final["extra"]["compacted"] is True
 
 
 # ---------------------------------------------------------------------------

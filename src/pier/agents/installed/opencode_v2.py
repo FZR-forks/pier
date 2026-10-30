@@ -21,7 +21,6 @@ session, nested by their real ``parentID``.
 import asyncio
 import copy
 import json
-import math
 import os
 import re
 import shlex
@@ -41,10 +40,10 @@ from pier.agents.installed.opencode import OpenCode
 from pier.agents.network import allowlist_from_urls, collect_url_values
 from pier.environments.base import BaseEnvironment
 from pier.models.agent.context import AgentContext
+from pier.models.agent.session_usage import SessionUsage
 from pier.models.agent.install import AgentInstallSpec, InstallStep
 from pier.models.agent.name import AgentName
 from pier.models.agent.network import NetworkAllowlist
-from pier.models.agent.usage import ReportedUsage
 from pier.models.trajectories import (
     Agent,
     FinalMetrics,
@@ -1539,8 +1538,8 @@ class OpenCodeV2(BaseInstalledAgent):
         if not path.exists():
             return []
         records: list[dict[str, Any]] = []
-        # JSON strings may contain literal NEL / Unicode line separators.
-        # str.splitlines() treats those as delimiters and corrupts valid records.
+        # NEL and Unicode line/paragraph separators are valid inside JSON
+        # strings, not JSONL delimiters.
         for line in path.read_text(encoding="utf-8").split("\n"):
             line = line.strip()
             if not line:
@@ -1576,12 +1575,7 @@ class OpenCodeV2(BaseInstalledAgent):
 
         def value(mapping: dict[str, Any], key: str) -> int:
             raw = mapping.get(key)
-            if (
-                isinstance(raw, bool)
-                or not isinstance(raw, (int, float))
-                or not math.isfinite(raw)
-                or raw < 0
-            ):
+            if isinstance(raw, bool) or not isinstance(raw, (int, float)) or raw < 0:
                 return 0
             return int(raw)
 
@@ -1611,7 +1605,6 @@ class OpenCodeV2(BaseInstalledAgent):
         return all(
             not isinstance(value, bool)
             and isinstance(value, (int, float))
-            and math.isfinite(value)
             and value >= 0
             for value in values
         )
@@ -1624,12 +1617,7 @@ class OpenCodeV2(BaseInstalledAgent):
 
         def value(mapping: dict[str, Any], key: str) -> int | None:
             raw = mapping.get(key)
-            if (
-                isinstance(raw, bool)
-                or not isinstance(raw, (int, float))
-                or not math.isfinite(raw)
-                or raw < 0
-            ):
+            if isinstance(raw, bool) or not isinstance(raw, (int, float)) or raw < 0:
                 return None
             return int(raw)
 
@@ -1724,10 +1712,7 @@ class OpenCodeV2(BaseInstalledAgent):
                             f"{message.get('id', 'unknown')}:{actual_model}"
                         )
                 step, contribution, message_incomplete = self._compaction_step(message)
-                # A failed/running summarizer request is billable evidence,
-                # but did not actually replace the session context.
-                if str(message.get("status") or "completed") == "completed":
-                    summarization_count += 1
+                summarization_count += 1
                 incomplete = incomplete or message_incomplete
             elif message_type == "idle":
                 if message.get("outcome"):
@@ -1782,7 +1767,9 @@ class OpenCodeV2(BaseInstalledAgent):
                 )
 
         final_extra: dict[str, Any] = {}
-        final_extra["cost_source"] = "unknown"
+        reported = self._session_reported_usage(session, complete=not incomplete)
+        if reported is not None:
+            final_extra["session_reported_usage"] = reported.model_dump()
         if usage_seen:
             final_extra["total_cache_write_input_tokens"] = totals["cache_write"]
             final_extra["total_reasoning_tokens"] = totals["reasoning"]
@@ -1801,43 +1788,6 @@ class OpenCodeV2(BaseInstalledAgent):
         if incomplete:
             final_extra["unfinished"] = True
 
-        reported = self._session_reported_usage(session, complete=not incomplete)
-        if reported is not None:
-            final_extra["session_reported_usage"] = reported.model_dump()
-            if not incomplete:
-                comparisons = {
-                    "n_input_tokens": totals["prompt"],
-                    "n_output_tokens": totals["completion"],
-                    "n_cache_tokens": totals["cached"],
-                    "n_cache_write_tokens": totals["cache_write"],
-                    "n_reasoning_tokens": totals["reasoning"],
-                }
-                discrepancies = {
-                    key: {"messages": value, "session": getattr(reported, key)}
-                    for key, value in comparisons.items()
-                    if getattr(reported, key) is not None
-                    and getattr(reported, key) != value
-                }
-                if (
-                    cost_complete
-                    and reported.cost_usd is not None
-                    and not math.isclose(
-                        reported.cost_usd, totals["cost"], rel_tol=1e-9, abs_tol=1e-12
-                    )
-                ):
-                    discrepancies["cost_usd"] = {
-                        "messages": totals["cost"],
-                        "session": reported.cost_usd,
-                    }
-                if discrepancies:
-                    # Neither contradicting source is silently selected as exact.
-                    incomplete = True
-                    final_extra["usage_discrepancies"] = discrepancies
-                    final_extra["session_reported_usage"]["complete"] = False
-                    final_extra["session_reported_usage"]["contradictory"] = True
-                    # Contradictory sources are not a proven lower bound.
-                    final_extra["session_reported_usage"]["lower_bound"] = False
-
         final_metrics = FinalMetrics(
             total_prompt_tokens=totals["prompt"] if usage_seen else None,
             total_completion_tokens=totals["completion"] if usage_seen else None,
@@ -1847,7 +1797,9 @@ class OpenCodeV2(BaseInstalledAgent):
             extra=extra_with_context_metrics(
                 final_extra or None,
                 peak_context_tokens=peak_context_tokens_from_steps(steps),
-                summarization_count=summarization_count,
+                summarization_count=summarization_count
+                if summarization_count
+                else None,
             ),
         )
         if incomplete:
@@ -1857,8 +1809,6 @@ class OpenCodeV2(BaseInstalledAgent):
             final_metrics.total_completion_tokens = None
             final_metrics.total_cached_tokens = None
             final_metrics.total_cost_usd = None
-        if final_metrics.total_cost_usd is not None:
-            final_metrics.extra["cost_source"] = "harness_reported"
         if self._restrict_model and self.model_name and not model_provenance_complete:
             final_metrics.extra = dict(final_metrics.extra or {})
             final_metrics.extra["model_provenance_complete"] = False
@@ -2383,39 +2333,31 @@ class OpenCodeV2(BaseInstalledAgent):
     @classmethod
     def _session_reported_usage(
         cls, session: dict[str, Any], *, complete: bool
-    ) -> ReportedUsage | None:
+    ) -> SessionUsage | None:
         tokens = cls._partial_usage_fields(session.get("tokens"))
         cost = session.get("cost")
         cost = (
             float(cost)
             if isinstance(cost, (int, float))
             and not isinstance(cost, bool)
-            and math.isfinite(cost)
             and cost >= 0
             else None
         )
-        if all(value is None for value in tokens.values()) and cost is None:
+        if cost is None and all(value is None for value in tokens.values()):
             return None
 
-        def total(*keys: str) -> int | None:
+        def total(*keys):
             values = [tokens[key] for key in keys]
-            # A partial category sum is not an authoritative prompt/output count.
             return sum(values) if all(value is not None for value in values) else None
 
-        return ReportedUsage(
-            source="opencode.session.tokens/cost",
+        return SessionUsage(
             complete=complete
-            and all(value is not None for value in tokens.values())
+            and cls._usage_record_complete(session.get("tokens"))
             and cost is not None,
-            lower_bound=not complete,
             n_input_tokens=total("input", "cache_read", "cache_write"),
             n_output_tokens=total("output", "reasoning"),
             n_cache_tokens=tokens["cache_read"],
-            n_cache_write_tokens=tokens["cache_write"],
-            n_reasoning_tokens=tokens["reasoning"],
             cost_usd=cost,
-            cost_source="harness_reported" if cost is not None else "unknown",
-            session_ids=[str(session["id"])],
         )
 
     def _with_tree_metrics(self, root: Trajectory, subagent_count: int) -> Trajectory:
@@ -2530,43 +2472,35 @@ class OpenCodeV2(BaseInstalledAgent):
         tree_extra["subagent_count"] = subagent_count
         tree_extra["tree_metrics_complete"] = complete
         tree_extra["tree_cost_complete"] = cost_complete
-        tree_extra["cost_source"] = (
-            "harness_reported"
-            if complete and cost_complete and total_cost is not None
-            else "unknown"
-        )
-        discrepancies = {
-            str(node.trajectory_id): node.final_metrics.extra["usage_discrepancies"]
-            for node in nodes
-            if node.final_metrics
-            and node.final_metrics.extra
-            and node.final_metrics.extra.get("usage_discrepancies")
-        }
-        if discrepancies:
-            tree_extra["usage_discrepancies"] = discrepancies
         tree_extra["tree_model_provenance_complete"] = model_provenance_complete
-        reported_nodes = [
-            ReportedUsage.model_validate(
-                node.final_metrics.extra["session_reported_usage"]
+        reported = [
+            SessionUsage.model_validate(
+                (node.final_metrics.extra or {})["session_reported_usage"]
             )
             for node in nodes
             if node.final_metrics
-            and node.final_metrics.extra
-            and node.final_metrics.extra.get("session_reported_usage")
+            and (node.final_metrics.extra or {}).get("session_reported_usage")
         ]
-        if reported_nodes:
-            reported = ReportedUsage.aggregate(
-                reported_nodes, source="opencode.session.tokens/cost"
-            )
-            reported.complete = (
-                reported.complete
-                and complete
-                and len(reported_nodes) == len(nodes)
-                and len(nodes) == subagent_count + 1
-            )
-            reported.contradictory = reported.contradictory or bool(discrepancies)
-            reported.lower_bound = not reported.complete and not reported.contradictory
-            tree_extra["session_reported_usage"] = reported.model_dump()
+        if reported:
+            # Known session totals remain useful even when collection omitted
+            # another session. Missing categories within a session stay unknown.
+            totals_reported = {}
+            for field in (
+                "n_input_tokens",
+                "n_cache_tokens",
+                "n_output_tokens",
+                "cost_usd",
+            ):
+                values = [getattr(item, field) for item in reported]
+                totals_reported[field] = (
+                    sum(values) if all(value is not None for value in values) else None
+                )
+            tree_extra["session_reported_usage"] = SessionUsage(
+                complete=complete
+                and len(reported) == len(nodes) == subagent_count + 1
+                and all(item.complete for item in reported),
+                **totals_reported,
+            ).model_dump()
         if peak_context is not None:
             tree_extra["peak_context_tokens"] = peak_context
         if summarizations is not None:
@@ -2622,14 +2556,6 @@ class OpenCodeV2(BaseInstalledAgent):
             extra["session_reported_usage"] = {
                 **extra["session_reported_usage"],
                 "complete": False,
-                "lower_bound": not (
-                    extra["session_reported_usage"].get("contradictory")
-                    or bool(extra.get("usage_discrepancies"))
-                ),
-                "contradictory": bool(
-                    extra["session_reported_usage"].get("contradictory")
-                    or extra.get("usage_discrepancies")
-                ),
             }
         extra.update(
             {
@@ -2637,7 +2563,6 @@ class OpenCodeV2(BaseInstalledAgent):
                 "tree_metrics_complete": False,
                 "tree_cost_complete": False,
                 "collection_incomplete": True,
-                "cost_source": "unknown",
             }
         )
         metrics.update(
@@ -2657,31 +2582,10 @@ class OpenCodeV2(BaseInstalledAgent):
         context: AgentContext, metrics: FinalMetrics | None
     ) -> None:
         """Keep withheld token totals unknown instead of coercing them to zero."""
-        if metrics is not None:
-            extra = metrics.extra or {}
-            context.cost_source = (
-                extra.get("cost_source", "unknown")
-                if metrics.total_cost_usd is not None
-                else "unknown"
+        if metrics is not None and (metrics.extra or {}).get("session_reported_usage"):
+            context.session_reported_usage = SessionUsage.model_validate(
+                metrics.extra["session_reported_usage"]
             )
-            context.usage_discrepancies = extra.get("usage_discrepancies")
-            context.metrics_complete = all(
-                value is not None
-                for value in (
-                    metrics.total_prompt_tokens,
-                    metrics.total_completion_tokens,
-                    metrics.total_cached_tokens,
-                )
-            ) and not (
-                extra.get("metrics_complete") is False
-                or extra.get("tree_metrics_complete") is False
-            )
-            if extra.get("session_reported_usage"):
-                context.session_reported_usage = ReportedUsage.model_validate(
-                    extra["session_reported_usage"]
-                )
-            context.peak_context_tokens = extra.get("peak_context_tokens")
-            context.summarization_count = extra.get("summarization_count")
         if metrics is None or any(
             value is None
             for value in (
@@ -2816,7 +2720,7 @@ class OpenCodeV2(BaseInstalledAgent):
         if stream.exists():
             try:
                 lines = stream.read_text(errors="replace").split("\n")
-                if lines and lines[-1] == "":
+                if lines and not lines[-1]:
                     lines.pop()
             except OSError:
                 lines = []
@@ -2974,7 +2878,6 @@ class OpenCodeV2(BaseInstalledAgent):
                 "Ignoring %d malformed OpenCode V2 session inspection record(s)",
                 len(inspections) - len(valid_inspections),
             )
-        # Repeated snapshots describe one session, not multiple billable agents.
         inspections = list(
             {record["session"]["id"]: record for record in valid_inspections}.values()
         )
@@ -3045,7 +2948,6 @@ class OpenCodeV2(BaseInstalledAgent):
                 final_metrics=FinalMetrics(
                     total_steps=1,
                     extra={
-                        "cost_source": "unknown",
                         "metrics_complete": False,
                         "tree_metrics_complete": False,
                         "tree_cost_complete": False,
