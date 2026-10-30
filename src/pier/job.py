@@ -219,11 +219,29 @@ class Job:
                 )
 
         canonical_names = {result.trial_name for result in self._existing_trial_results}
-        archived_by_name: dict[str, TrialResult] = {}
+        archived_by_name: dict[str, tuple[int, TrialConfig]] = {}
         for path in sorted((self.job_dir / ".retry-attempts").glob("*/*/result.json")):
             try:
                 archived = TrialResult.model_validate_json(path.read_text())
             except (ValueError, OSError):
+                # An interrupted archive rewrite may have lost result.json,
+                # while the original config still safely identifies its slot.
+                try:
+                    archived_config = TrialConfig.model_validate_json(
+                        (path.parent / "config.json").read_text()
+                    )
+                except (ValueError, OSError):
+                    continue
+                name = archived_config.trial_name
+                if name in canonical_names:
+                    continue
+                if name != path.parent.parent.name:
+                    raise ValueError(
+                        f"Archived trial config identity does not match its path: {path}"
+                    )
+                previous = archived_by_name.get(name)
+                if previous is None:
+                    archived_by_name[name] = (0, archived_config)
                 continue
             if archived.trial_name in canonical_names:
                 continue
@@ -235,10 +253,13 @@ class Job:
                     f"Archived trial identity does not match its path: {path}"
                 )
             previous = archived_by_name.get(archived.trial_name)
-            if previous is None or archived.attempt > previous.attempt:
-                archived_by_name[archived.trial_name] = archived
+            if previous is None or archived.attempt > previous[0]:
+                archived_by_name[archived.trial_name] = (
+                    archived.attempt,
+                    archived.config,
+                )
         self._archived_trial_configs = [
-            result.config for result in archived_by_name.values()
+            config for _, config in archived_by_name.values()
         ]
 
         for trial_result in self._existing_trial_results:

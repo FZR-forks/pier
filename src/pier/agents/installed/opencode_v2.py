@@ -1834,6 +1834,7 @@ class OpenCodeV2(BaseInstalledAgent):
                     incomplete = True
                     final_extra["usage_discrepancies"] = discrepancies
                     final_extra["session_reported_usage"]["complete"] = False
+                    final_extra["session_reported_usage"]["contradictory"] = True
                     # Contradictory sources are not a proven lower bound.
                     final_extra["session_reported_usage"]["lower_bound"] = False
 
@@ -2563,7 +2564,8 @@ class OpenCodeV2(BaseInstalledAgent):
                 and len(reported_nodes) == len(nodes)
                 and len(nodes) == subagent_count + 1
             )
-            reported.lower_bound = not reported.complete and not discrepancies
+            reported.contradictory = reported.contradictory or bool(discrepancies)
+            reported.lower_bound = not reported.complete and not reported.contradictory
             tree_extra["session_reported_usage"] = reported.model_dump()
         if peak_context is not None:
             tree_extra["peak_context_tokens"] = peak_context
@@ -2620,7 +2622,14 @@ class OpenCodeV2(BaseInstalledAgent):
             extra["session_reported_usage"] = {
                 **extra["session_reported_usage"],
                 "complete": False,
-                "lower_bound": not bool(extra.get("usage_discrepancies")),
+                "lower_bound": not (
+                    extra["session_reported_usage"].get("contradictory")
+                    or bool(extra.get("usage_discrepancies"))
+                ),
+                "contradictory": bool(
+                    extra["session_reported_usage"].get("contradictory")
+                    or extra.get("usage_discrepancies")
+                ),
             }
         extra.update(
             {

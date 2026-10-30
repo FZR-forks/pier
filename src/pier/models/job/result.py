@@ -213,7 +213,13 @@ class JobStats(BaseModel):
         sources = {
             item.get("cost_source", "unknown")
             for item in self.canonical_trials.values()
+            if not (
+                item.get("cost_source") == "no_agent_execution"
+                and (item.get("usage") or {}).get("cost_usd") == 0
+            )
         }
+        if not sources and self.canonical_trials:
+            sources = {"no_agent_execution"}
         self.cost_source = (
             (next(iter(sources)) if len(sources) == 1 else "mixed")
             if self.cost_usd is not None

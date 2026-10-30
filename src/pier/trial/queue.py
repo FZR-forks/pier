@@ -1,4 +1,5 @@
 import asyncio
+import re
 import shutil
 from collections.abc import Coroutine
 from pathlib import Path
@@ -70,7 +71,7 @@ class TrialQueue:
 
     def _should_retry_exception(self, exception_type: str) -> bool:
         """Check if an exception should trigger a retry."""
-        if exception_type in {"NonZeroAgentExitCodeError", "CancelledError"}:
+        if exception_type == "CancelledError":
             return False
         if (
             self._retry_config.exclude_exceptions
@@ -135,12 +136,32 @@ class TrialQueue:
         from pier.trial.trial import Trial
 
         history: list[RetryAttempt] = []
+        history_errors: list[str] = []
         for path in sorted(
             (
                 trial_config.trials_dir / ".retry-attempts" / trial_config.trial_name
             ).glob("*/result.json")
         ):
-            previous = TrialResult.model_validate_json(path.read_text())
+            try:
+                previous = TrialResult.model_validate_json(path.read_text())
+            except (ValueError, OSError):
+                relative_path = path.relative_to(trial_config.trials_dir).as_posix()
+                history_errors.append(relative_path)
+                self._logger.warning(
+                    "Unreadable archived attempt at %s; retaining unknown history", path
+                )
+                number = re.fullmatch(r"attempt-(\d+)(?:-\d+)?", path.parent.name)
+                if number and int(number[1]) > 0:
+                    history.append(
+                        RetryAttempt(
+                            attempt=int(number[1]),
+                            trial_id=None,
+                            result_path=relative_path,
+                            exception_type="Unknown",
+                            reason="unreadable_archived_attempt",
+                        )
+                    )
+                continue
             history.append(
                 RetryAttempt(
                     attempt=previous.attempt,
@@ -175,7 +196,9 @@ class TrialQueue:
             self._setup_hooks(trial)
             try:
                 result = await trial.run(
-                    attempt=first_attempt + attempt, retry_attempts=history
+                    attempt=first_attempt + attempt,
+                    retry_attempts=history,
+                    retry_history_errors=history_errors,
                 )
             except asyncio.CancelledError:
                 # Trial finalization persisted the cancelled observation. It is
@@ -184,13 +207,19 @@ class TrialQueue:
                 raise
             result.attempt = first_attempt + attempt
             result.retry_attempts = list(history)
+            result.retry_history_errors = list(history_errors)
             result.canonical = True
             result_path = trial.trial_dir / "result.json"
             result_path.write_text(result.model_dump_json(indent=4))
 
             # A graded observation is already a benchmark attempt, even if
             # cleanup or a recovered harness stream left an exception behind.
-            if result.exception_info is None or result.verifier_result is not None:
+            if result.exception_info is None:
+                return await finish(result)
+            if (
+                result.verifier_result is not None
+                and self._retry_config.include_exceptions is None
+            ):
                 return await finish(result)
 
             if not self._should_retry_exception(result.exception_info.exception_type):
@@ -231,6 +260,9 @@ class TrialQueue:
                     .relative_to(trial.trial_dir.parent)
                     .as_posix(),
                     exception_type=result.exception_info.exception_type,
+                    reason="explicit_retry_policy"
+                    if self._retry_config.include_exceptions is not None
+                    else "allowlisted_infrastructure_failure",
                 )
             )
             delay = self._calculate_backoff_delay(attempt)

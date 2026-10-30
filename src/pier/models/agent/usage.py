@@ -16,6 +16,7 @@ class ReportedUsage(BaseModel):
     cost_usd: float | None = Field(default=None, ge=0)
     cost_source: str | None = None
     lower_bound: bool = False
+    contradictory: bool = False
     missing_observations: dict[str, int] = Field(default_factory=dict)
     session_ids: list[str] = Field(default_factory=list)
 
@@ -46,20 +47,22 @@ class ReportedUsage(BaseModel):
                 item.missing_observations.get(field, int(getattr(item, field) is None))
                 for item in observations
             )
-        cost_sources = {item.cost_source or "unknown" for item in observations}
+        # No inference occurred: a known-zero contribution is neutral when
+        # describing the provenance of costs from agents that actually ran.
+        cost_sources = {
+            item.cost_source or "unknown"
+            for item in observations
+            if not (item.cost_source == "no_agent_execution" and item.cost_usd == 0)
+        } or {"no_agent_execution"}
+        contradictory = any(item.contradictory for item in observations)
+        complete = not contradictory and all(item.complete for item in observations)
         return cls(
             source=source,
-            complete=bool(observations) and all(item.complete for item in observations),
-            lower_bound=any(item.lower_bound for item in observations)
-            or any(
-                missing[field]
-                for field in (
-                    "n_input_tokens",
-                    "n_cache_tokens",
-                    "n_output_tokens",
-                    "cost_usd",
-                )
-            ),
+            complete=complete,
+            contradictory=contradictory,
+            lower_bound=not complete
+            and not contradictory
+            and all(item.complete or item.lower_bound for item in observations),
             cost_source=(
                 next(iter(cost_sources)) if len(cost_sources) == 1 else "mixed"
             )

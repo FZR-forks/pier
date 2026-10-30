@@ -59,6 +59,46 @@ def codex_usage_snapshot(events):
     return usage
 
 
+def opencode_session_usage(session):
+    """Independent native mapping: do not audit the adapter with itself."""
+    tokens = session.get("tokens") if isinstance(session.get("tokens"), dict) else {}
+    cache = tokens.get("cache") if isinstance(tokens.get("cache"), dict) else {}
+
+    def counter(mapping, key):
+        value = mapping.get(key)
+        return (
+            int(value)
+            if isinstance(value, (int, float))
+            and not isinstance(value, bool)
+            and math.isfinite(value)
+            and value >= 0
+            and int(value) == value
+            else None
+        )
+
+    def total(values):
+        return sum(values) if all(value is not None for value in values) else None
+
+    cost = session.get("cost")
+    if (
+        not isinstance(cost, (int, float))
+        or isinstance(cost, bool)
+        or not math.isfinite(cost)
+        or cost < 0
+    ):
+        cost = None
+    return {
+        "n_input_tokens": total(
+            [counter(tokens, "input"), counter(cache, "read"), counter(cache, "write")]
+        ),
+        "n_cache_tokens": counter(cache, "read"),
+        "n_output_tokens": total(
+            [counter(tokens, "output"), counter(tokens, "reasoning")]
+        ),
+        "cost_usd": cost,
+    }
+
+
 def audit(job_dir):
     errors, trials = [], []
     stats = json.loads((job_dir / "result.json").read_text())["stats"]
@@ -131,11 +171,9 @@ def audit(job_dir):
         native = {}
         native_best_known = None
         native_missing_observations = {}
+        native_available_but_withheld = []
         sources = []
         if name == "opencode-v2":
-            from pier.agents.installed.opencode_v2 import OpenCodeV2
-            from pier.models.agent.usage import ReportedUsage
-
             sources = [agent_dir / "opencode-v2" / "opencode-v2-sessions.jsonl"]
             if not sources[0].exists():
                 sources = [
@@ -149,19 +187,21 @@ def audit(job_dir):
                 and record["session"].get("id")
             }
             observations = [
-                OpenCodeV2._session_reported_usage(session, complete=False)
-                or ReportedUsage(
-                    source="opencode.session.tokens/cost", session_ids=[sid]
-                )
-                for sid, session in sessions.items()
+                opencode_session_usage(session) for session in sessions.values()
             ]
             check(bool(observations), "no native session usage observations")
-            observed = ReportedUsage.aggregate(
-                observations, source="opencode.session.tokens/cost"
-            )
             fields = ("n_input_tokens", "n_cache_tokens", "n_output_tokens", "cost_usd")
-            native_best_known = {key: getattr(observed, key) for key in fields}
-            native_missing_observations = observed.missing_observations
+            native_best_known = {}
+            for key in fields:
+                values = [item[key] for item in observations]
+                native_best_known[key] = (
+                    sum(value for value in values if value is not None)
+                    if any(value is not None for value in values)
+                    else None
+                )
+                native_missing_observations[key] = sum(
+                    value is None for value in values
+                )
             native = {
                 key: value if not native_missing_observations.get(key) else None
                 for key, value in native_best_known.items()
@@ -281,6 +321,8 @@ def audit(job_dir):
                     math.isclose(value, context[key], rel_tol=1e-9, abs_tol=1e-12),
                     key + " differs from native usage",
                 )
+            else:
+                native_available_but_withheld.append(key)
         trials.append(
             {
                 "trial": label,
@@ -301,6 +343,7 @@ def audit(job_dir):
                 "native": native,
                 "native_best_known": native_best_known,
                 "native_missing_observations": native_missing_observations,
+                "native_available_but_withheld": native_available_but_withheld,
                 "sources_sha256": {
                     str(p.relative_to(job_dir)): hashlib.sha256(
                         p.read_bytes()

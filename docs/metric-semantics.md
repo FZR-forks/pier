@@ -11,7 +11,7 @@ caching and gateway-specific billing are not part of these metrics.
   creation exactly once. `n_cache_tokens` is the cache-hit subset, not extra input.
 - `n_output_tokens` / `completion_tokens` includes billable reasoning output.
   Native harnesses differ: Codex and Pi already include reasoning in output;
-  OpenCode V2 splits it out, so Pier adds it once. Gemini's tool-prompt count is
+  Both OpenCode adapters split it out, so Pier adds it once. Gemini's tool-prompt count is
   additional input, not generated output.
 - Cache creation and reasoning totals are promoted when reported. Unknown
   categories stay null; an explicitly reported zero stays zero.
@@ -47,6 +47,9 @@ collection as `agent_result.session_reported_usage` and in trajectory final
 metrics extras. `complete: false` means they must not be substituted for exact
 trial totals. `lower_bound: true` indicates recorded usage can omit an in-flight
 request or child. `usage_discrepancies` exposes contradictory native totals.
+The qualification `contradictory: true` survives trial and job aggregation and
+prevents a claimed lower bound even if other trials are interrupted. Unqualified
+partial observations do not become proven lower bounds just by being summed.
 
 Job `stats.session_reported_usage` aggregates the same canonical trial
 observations. It carries completeness, lower-bound qualification, per-category
@@ -54,15 +57,24 @@ observations. It carries completeness, lower-bound qualification, per-category
 fields are null for a category if any canonical trial lacks that category;
 they never silently sum around an unknown trial. The same rule applies to
 multi-step trial totals. CLI output warns about missing usage.
+An initialized, finalized trial whose agent execution never started has zero
+agent usage, labelled `no_agent_execution`, rather than missing model data.
+`evals.*.n_trials` counts every canonical trial, including ungraded failures;
+`reward_stats` separately identifies graded observations.
 
 ## Attempts and provenance
 
-Whole-trial retries use a conservative positive infrastructure allowlist.
+Pier defaults to zero whole-trial retries. When retries are enabled without
+`retry.include_exceptions`, eligibility uses a conservative positive
+infrastructure allowlist.
 Generic nonzero harness exits, timeouts, context overflow, interactive questions,
 deterministic failures, and already graded trials do not automatically receive
-another model attempt. `retry.include_exceptions` can specify explicit
-infrastructure exception types; an empty set disables eligibility. Exclusions
-take precedence, and generic harness exits/cancellation remain non-retryable.
+another model attempt by default. `retry.include_exceptions` is an explicit user
+policy: it can opt an exception (including a generic nonzero exit or graded
+observation with an exception) back into retries. An empty set disables
+eligibility. Exclusions take precedence; cancellation is never retried.
+Explicit retries are labelled `explicit_retry_policy` in attempt history rather
+than being presented as automatically classified infrastructure failures.
 
 Each trial has `attempt`, `canonical`, and `retry_attempts` (IDs and archive
 paths). `stats.canonical_trials` identifies exactly the observations underlying
@@ -78,6 +90,8 @@ An ordinary START-hook exception propagates as an orchestration fault instead
 of being graded or retried as a benchmark failure. Filtered resume reuses each
 archived trial slot's name and full attempt history. Cancelled job-result writes
 finish under the accounting lock before cancellation/finalization can write.
+Unreadable archived observations are preserved with null IDs and
+`retry_history_errors` rather than aborting every concurrent trial on resume.
 
 Existing historical output is not rewritten automatically. These semantics apply
 to newly generated files; retain the `lock.json` with every benchmark job.
@@ -97,4 +111,7 @@ uv run python scripts/audit_native_usage.py /path/to/job > native-audit.json
 This command is read-only and exits nonzero for a discrepancy or unsupported
 native structure. It does not fetch billing, alter observations or perform data
 corrections. It records source hashes so audit evidence can be traced back to
-the saved harness files.
+the saved harness files. Native values that are deliberately withheld in exact
+Pier totals are listed as `native_available_but_withheld`. The script checks
+canonical observations, not discarded retry overhead; retry-overhead accounting
+is covered by lifecycle regression tests.

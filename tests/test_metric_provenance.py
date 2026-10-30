@@ -202,12 +202,12 @@ def test_evaluated_failures_never_retried_by_default(error):
     assert not TrialQueue(1, RetryConfig(max_retries=1))._should_retry_exception(error)
 
 
-def test_retry_allowlist_is_positive_and_excludes_generic_harness_exit():
+def test_retry_allowlist_is_positive_and_honors_explicit_harness_exit():
     assert TrialQueue(1)._should_retry_exception("ConnectionError")
     assert not TrialQueue(
         1, RetryConfig(include_exceptions=set())
     )._should_retry_exception("ConnectionError")
-    assert not TrialQueue(
+    assert TrialQueue(
         1, RetryConfig(include_exceptions={"NonZeroAgentExitCodeError"})
     )._should_retry_exception("NonZeroAgentExitCodeError")
 

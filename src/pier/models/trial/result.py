@@ -69,7 +69,7 @@ class StepResult(BaseModel):
 
 class RetryAttempt(BaseModel):
     attempt: int
-    trial_id: UUID
+    trial_id: UUID | None
     result_path: str
     exception_type: str
     reason: str = "allowlisted_infrastructure_failure"
@@ -99,6 +99,20 @@ class TrialResult(BaseModel):
     attempt: int = Field(default=1, ge=1)
     canonical: bool = True
     retry_attempts: list[RetryAttempt] = Field(default_factory=list)
+    retry_history_errors: list[str] = Field(default_factory=list)
+
+    def _agent_never_started(self) -> bool:
+        """Only initialized/finalized trials can establish no agent execution."""
+        return (
+            self.started_at is not None
+            and self.finished_at is not None
+            and self.agent_result is None
+            and self.agent_execution is None
+            and all(
+                step.agent_result is None and step.agent_execution is None
+                for step in self.step_results or []
+            )
+        )
 
     def agent_step_count(self) -> int | None:
         if self.n_agent_steps is not None:
@@ -121,6 +135,8 @@ class TrialResult(BaseModel):
         self,
     ) -> tuple[int | None, int | None, int | None, float | None]:
         """Sum (n_input_tokens, n_cache_tokens, n_output_tokens, cost_usd)."""
+        if self._agent_never_started():
+            return 0, 0, 0, 0.0
         if self.agent_result is not None:
             contexts = [self.agent_result]
         elif self.step_results:
@@ -151,6 +167,18 @@ class TrialResult(BaseModel):
 
     def reported_usage(self) -> ReportedUsage:
         """Best-known usage, explicitly qualified and never used as exact totals."""
+        if self._agent_never_started():
+            return ReportedUsage(
+                source="trial.agent_not_started",
+                complete=True,
+                n_input_tokens=0,
+                n_cache_tokens=0,
+                n_output_tokens=0,
+                n_cache_write_tokens=0,
+                n_reasoning_tokens=0,
+                cost_usd=0,
+                cost_source="no_agent_execution",
+            )
         contexts = (
             [self.agent_result]
             if self.agent_result is not None
@@ -161,7 +189,11 @@ class TrialResult(BaseModel):
         observations = []
         for context in contexts:
             if context.session_reported_usage is not None:
-                observations.append(context.session_reported_usage)
+                reported = context.session_reported_usage.model_copy(deep=True)
+                if context.usage_discrepancies:
+                    reported.contradictory = True
+                    reported.complete = reported.lower_bound = False
+                observations.append(reported)
             else:
                 observations.append(
                     ReportedUsage(
@@ -178,6 +210,7 @@ class TrialResult(BaseModel):
                         and context.metrics_complete is not False,
                         lower_bound=context.metrics_complete is False
                         and not bool(context.usage_discrepancies),
+                        contradictory=bool(context.usage_discrepancies),
                         n_input_tokens=context.n_input_tokens,
                         n_cache_tokens=context.n_cache_tokens,
                         n_output_tokens=context.n_output_tokens,

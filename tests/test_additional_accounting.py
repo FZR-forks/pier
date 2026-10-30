@@ -106,6 +106,9 @@ def test_opencode_v1_cache_creation_is_in_prompt_and_zero_cost_is_data(tmp_path)
     assert trajectory.final_metrics.total_prompt_tokens == 80
     assert trajectory.final_metrics.total_cached_tokens == 30
     assert trajectory.final_metrics.total_cost_usd == 0
+    assert trajectory.final_metrics.total_completion_tokens == 25
+    assert trajectory.steps[0].metrics.completion_tokens == 25
+    assert trajectory.final_metrics.extra["total_reasoning_tokens"] == 5
 
 
 def test_mini_swe_never_fabricates_per_call_cost_by_output_fraction():

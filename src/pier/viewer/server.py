@@ -159,8 +159,6 @@ def _extract_reasoning_effort(result: TrialResult) -> str | None:
     kwargs = result.config.agent.kwargs or {}
 
     value = kwargs.get("reasoning_effort")
-    if value is None:
-        value = kwargs.get("variant") or kwargs.get("thinking")
     if value is not None:
         return str(value)
 

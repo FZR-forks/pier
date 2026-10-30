@@ -46,8 +46,10 @@ passed all three verifiers and the native audit with zero discrepancies:
 | Canonical job total | 50,849 | 31,722 | 643 | — | 0.006700032 |
 
 Its artifacts are in the same parent directory, under the repeat job name.
-Later code changes correct Gemini-only token classification and do not alter
-the three adapters used by this smoke.
+This live evidence is specifically from `3cf8528`, not the later review head.
+Subsequent adapter/completeness and lifecycle changes were checked with unit
+tests and read-only replay of saved native artifacts; they were not all part
+of that live invocation.
 
 ## Read-only historical replay
 
@@ -89,3 +91,32 @@ trial; START-lock cancellation reconciles retries again on completion; ordinary
 START-hook faults propagate without benchmark observations; and cancellation
 of blocked executor writes (including repeated cancellation) keeps final job
 accounting serialized until the worker finishes.
+
+## Independent Opus review follow-up live run
+
+On 2026-10-30 the Opus-reviewed follow-up working tree (based on `010bcbd`)
+was tested again as `issue-17-opus-review-validation`. All three DeepSeek Low
+trials passed on attempt 1, with no exception or retry. The independent native
+audit reported `ok: true`, no missing categories and no withheld native values.
+
+| Harness | Input | Cache hits | Output | Peak input | Inference cost USD |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Pi | 3,268 | 1,438 | 105 | 1,700 | 0.000683628 |
+| Codex | 42,545 | 33,180 | 535 | 8,847 | 0.003650580 |
+| OpenCode V2 | 19,139 | 12,032 | 164 | 6,482 | 0.002401092 |
+| Canonical job total | 64,952 | 46,650 | 804 | — | 0.006735300 |
+
+Artifacts remain under `/tmp/opencode/pier-metrics-live/issue-17-opus-review-validation`.
+The subsequent neutral-zero cost-source fix applies only to jobs with trials
+whose agents never started, not this run. PA1's checkout remains unchanged.
+
+An independent Opus 5.5 High review additionally led to explicit retry-policy
+overrides being honored (safe defaults retained), contradiction qualification
+surviving aggregate usage, unreadable retry archives remaining visible without
+crashing a job, and known-zero usage for trials that never entered agent
+execution. The unrelated reasoning-effort viewer fallback was removed. The
+OpenCode audit mapping is independent of the adapter, and the V1 reasoning
+output fix was verified against `opencode-ai` v1.18.25 `Session.getUsage`:
+`tokens.output = outputTokens - reasoningTokens`, with reasoning separately
+charged as output. These are generic Pier fixes; PA1 sources and data were not
+modified.

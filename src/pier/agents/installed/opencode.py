@@ -220,6 +220,7 @@ class OpenCode(BaseInstalledAgent):
         total_input_tokens = 0
         total_output_tokens = 0
         total_cache_read = 0
+        total_reasoning_tokens = 0
         usage_complete = True
         cost_complete = True
 
@@ -293,14 +294,17 @@ class OpenCode(BaseInstalledAgent):
 
             total_cost += cost or 0
             total_input_tokens += input_tok + cache_read + cache_write
-            total_output_tokens += output_tok
+            # OpenCode V1 getUsage persists visible output separately from
+            # reasoning (tokens.output = outputTokens - reasoningTokens).
+            total_output_tokens += output_tok + reasoning_tok
+            total_reasoning_tokens += reasoning_tok
             total_cache_read += cache_read
 
             metrics: Metrics | None = None
             if isinstance(finish.get("tokens"), dict):
                 metrics = Metrics(
                     prompt_tokens=input_tok + cache_read + cache_write,
-                    completion_tokens=output_tok,
+                    completion_tokens=output_tok + reasoning_tok,
                     cached_tokens=cache_read,
                     cost_usd=cost,
                     extra={
@@ -351,7 +355,12 @@ class OpenCode(BaseInstalledAgent):
             total_cost_usd=total_cost if cost_complete else None,
             total_steps=len(steps),
             extra=extra_with_context_metrics(
-                {"cost_source": "harness_reported" if cost_complete else "unknown"},
+                {
+                    "cost_source": "harness_reported" if cost_complete else "unknown",
+                    "total_reasoning_tokens": total_reasoning_tokens
+                    if usage_complete
+                    else None,
+                },
                 peak_context_tokens=peak_context_tokens_from_steps(steps),
                 summarization_count=None,
             ),

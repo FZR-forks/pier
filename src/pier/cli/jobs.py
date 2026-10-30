@@ -91,8 +91,8 @@ def print_job_results_tables(job_result) -> None:
         console.print(
             f"[yellow]Usage/cost is incomplete for "
             f"{job_result.stats.n_trials_missing_usage} canonical trial(s). "
-            "Missing categories are null; best-known lower bounds are in "
-            "stats.session_reported_usage.[/yellow]"
+            "Missing categories are null; qualified best-known observations are in "
+            "stats.session_reported_usage (inspect complete/lower_bound/contradictory).[/yellow]"
         )
     if job_result.stats.cost_source:
         console.print(
@@ -304,8 +304,9 @@ def start(
         Option(
             "--retry-include",
             help="Positive allowlist of infrastructure exception types to retry. "
-            "Defaults to conservative transport/provisioning failures; generic "
-            "harness exits and graded observations are not retried (repeatable)",
+            "Defaults to conservative transport/provisioning failures. Explicit "
+            "includes override eligibility for harness exits/graded observations; "
+            "exclusions still win and cancellation is never retried (repeatable)",
             rich_help_panel="Job Settings",
             show_default=False,
         ),

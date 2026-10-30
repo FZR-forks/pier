@@ -202,8 +202,8 @@ class RetryConfig(BaseModel):
         description=(
             "Positive allowlist of retryable infrastructure exception types. "
             "None uses Pier's conservative transport/provisioning allowlist; "
-            "an empty set disables retries. Generic harness exits and completed "
-            "evaluations are never retried."
+            "an empty set disables retries. Generic harness exits and graded "
+            "evaluations require an explicit include. Cancellation is never retried."
         ),
     )
     exclude_exceptions: set[str] | None = Field(
