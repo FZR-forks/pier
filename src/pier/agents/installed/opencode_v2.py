@@ -1712,7 +1712,8 @@ class OpenCodeV2(BaseInstalledAgent):
                             f"{message.get('id', 'unknown')}:{actual_model}"
                         )
                 step, contribution, message_incomplete = self._compaction_step(message)
-                summarization_count += 1
+                if str(message.get("status") or "completed") == "completed":
+                    summarization_count += 1
                 incomplete = incomplete or message_incomplete
             elif message_type == "idle":
                 if message.get("outcome"):
@@ -1797,9 +1798,7 @@ class OpenCodeV2(BaseInstalledAgent):
             extra=extra_with_context_metrics(
                 final_extra or None,
                 peak_context_tokens=peak_context_tokens_from_steps(steps),
-                summarization_count=summarization_count
-                if summarization_count
-                else None,
+                summarization_count=summarization_count,
             ),
         )
         if incomplete:
@@ -2473,34 +2472,11 @@ class OpenCodeV2(BaseInstalledAgent):
         tree_extra["tree_metrics_complete"] = complete
         tree_extra["tree_cost_complete"] = cost_complete
         tree_extra["tree_model_provenance_complete"] = model_provenance_complete
-        reported = [
-            SessionUsage.model_validate(
-                (node.final_metrics.extra or {})["session_reported_usage"]
-            )
-            for node in nodes
-            if node.final_metrics
-            and (node.final_metrics.extra or {}).get("session_reported_usage")
-        ]
+        reported = self._collected_session_usage(
+            nodes, complete=complete and len(nodes) == subagent_count + 1
+        )
         if reported:
-            # Known session totals remain useful even when collection omitted
-            # another session. Missing categories within a session stay unknown.
-            totals_reported = {}
-            for field in (
-                "n_input_tokens",
-                "n_cache_tokens",
-                "n_output_tokens",
-                "cost_usd",
-            ):
-                values = [getattr(item, field) for item in reported]
-                totals_reported[field] = (
-                    sum(values) if all(value is not None for value in values) else None
-                )
-            tree_extra["session_reported_usage"] = SessionUsage(
-                complete=complete
-                and len(reported) == len(nodes) == subagent_count + 1
-                and all(item.complete for item in reported),
-                **totals_reported,
-            ).model_dump()
+            tree_extra["session_reported_usage"] = reported.model_dump()
         if peak_context is not None:
             tree_extra["peak_context_tokens"] = peak_context
         if summarizations is not None:
@@ -2545,6 +2521,42 @@ class OpenCodeV2(BaseInstalledAgent):
         )
         data["notes"] = f"{notes}\n{note}" if notes else note
         return Trajectory.model_validate(data)
+
+    @staticmethod
+    def _collected_session_usage(
+        trajectories: list[Trajectory], *, complete: bool
+    ) -> SessionUsage | None:
+        # Collection can contain a valid descendant whose intermediate parent
+        # is missing. Its native session usage still belongs to the observation,
+        # independently of whether its trajectory can be attached to the root.
+        reported = [
+            SessionUsage.model_validate(
+                node.final_metrics.extra["session_reported_usage"]
+            )
+            for node in trajectories
+            if node.final_metrics
+            and node.final_metrics.extra
+            and node.final_metrics.extra.get("session_reported_usage")
+        ]
+        if not reported:
+            return None
+        totals = {}
+        for field in (
+            "n_input_tokens",
+            "n_cache_tokens",
+            "n_output_tokens",
+            "cost_usd",
+        ):
+            values = [getattr(item, field) for item in reported]
+            totals[field] = (
+                sum(values) if all(value is not None for value in values) else None
+            )
+        return SessionUsage(
+            complete=complete
+            and len(reported) == len(trajectories)
+            and all(item.complete for item in reported),
+            **totals,
+        )
 
     @staticmethod
     def _mark_collection_incomplete(root: Trajectory) -> Trajectory:
@@ -3026,6 +3038,22 @@ class OpenCodeV2(BaseInstalledAgent):
             or not attachment_complete
         ):
             embedded = self._mark_collection_incomplete(embedded)
+
+        # Use every validated, deduplicated collected session, not just the
+        # connected portion of the reconstructed trajectory tree.
+        reported = self._collected_session_usage(
+            trajectories,
+            complete=not (
+                (embedded.final_metrics.extra or {}).get("collection_incomplete")
+                or (embedded.final_metrics.extra or {}).get("tree_metrics_complete")
+                is False
+            ),
+        )
+        if reported:
+            embedded.final_metrics.extra = {
+                **(embedded.final_metrics.extra or {}),
+                "session_reported_usage": reported.model_dump(),
+            }
 
         trajectory_path = self.logs_dir / "trajectory.json"
         try:

@@ -734,6 +734,88 @@ class TestErrorSurfacing:
 
 
 class TestCostFallback:
+    @pytest.mark.parametrize("missing", ["assistant", "tool", "compaction"])
+    def test_partial_cost_records_are_not_summed_as_complete(
+        self, tmp_path, missing, monkeypatch
+    ):
+        paid = assistant_message(input=10, output=2, cost=0.1)
+        unknown = assistant_message(input=5, output=1, cost=0.2)
+        unknown["usage"].pop("cost")
+        events = [{"type": "turn_end", "message": paid, "toolResults": []}]
+        if missing == "assistant":
+            events.append({"type": "turn_end", "message": unknown})
+        elif missing == "tool":
+            paid["content"] = [
+                {"type": "toolCall", "id": "call-1", "name": "read", "arguments": {}}
+            ]
+            events[0]["toolResults"] = [tool_result() | {"usage": unknown["usage"]}]
+        else:
+            events.append(
+                {
+                    "type": "compaction_end",
+                    "result": {"summary": "summary", "usage": unknown["usage"]},
+                }
+            )
+        # A known estimate must not silently replace a partially collected
+        # native total and mix reported/estimated components without a label.
+        monkeypatch.setattr(Pi, "_compute_cost_from_pricing", lambda *args: 99)
+        trajectory = Pi(
+            logs_dir=tmp_path, model_name="test/test"
+        )._convert_events_to_trajectory(events)
+        assert trajectory.final_metrics.total_prompt_tokens == 15
+        assert trajectory.final_metrics.total_cost_usd is None
+        if missing == "assistant":
+            assert trajectory.steps[-1].metrics.cost_usd is None
+        if missing == "compaction":
+            assert trajectory.steps[-1].extra["compaction"]["usage"]["cost_usd"] is None
+
+    def test_explicit_zero_model_prices_are_preserved(self, tmp_path, monkeypatch):
+        self._patch_model_cost(monkeypatch)
+        agent = Pi(
+            logs_dir=tmp_path,
+            model_name="anthropic/claude-haiku-4-5",
+            pi_config={
+                "providers": {
+                    "anthropic": {
+                        "models": [
+                            {
+                                "id": "claude-haiku-4-5",
+                                "cost": {
+                                    "input": 0,
+                                    "output": 0,
+                                    "cacheRead": 0,
+                                    "cacheWrite": 0,
+                                },
+                            }
+                        ]
+                    }
+                }
+            },
+        )
+        trajectory = agent._convert_events_to_trajectory(
+            [
+                {
+                    "type": "turn_end",
+                    "message": assistant_message(input=1000, output=500, cost=0),
+                }
+            ]
+        )
+        assert trajectory.final_metrics.total_cost_usd == 0
+        assert trajectory.steps[0].metrics.cost_usd == 0
+
+    @pytest.mark.parametrize(
+        "value", [None, "unknown", True, -1, float("nan"), float("inf")]
+    )
+    def test_invalid_cost_is_unknown_without_destroying_tokens(self, tmp_path, value):
+        message = assistant_message(input=10, output=2, cost=0.1)
+        message["usage"]["cost"]["total"] = value
+        trajectory = Pi(
+            logs_dir=tmp_path, model_name="test/test"
+        )._convert_events_to_trajectory([{"type": "turn_end", "message": message}])
+        assert trajectory.final_metrics.total_prompt_tokens == 10
+        assert trajectory.final_metrics.total_cost_usd is None
+        assert trajectory.steps[0].metrics.cost_usd is None
+
     @staticmethod
     def _patch_model_cost(monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setattr(

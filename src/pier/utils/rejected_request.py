@@ -9,7 +9,10 @@ def rejected_requests_from_errors(value: Any, *, source: str) -> list[dict[str, 
 
     def visit(item: Any, error: bool = False) -> None:
         if isinstance(item, dict):
-            error = error or item.get("type") in {"error", "turn.failed"}
+            kind = item.get("type")
+            error = error or (
+                isinstance(kind, str) and kind in {"error", "turn.failed"}
+            )
             for key, child in item.items():
                 visit(
                     child,
@@ -26,9 +29,16 @@ def rejected_requests_from_errors(value: Any, *, source: str) -> list[dict[str, 
                 r"maximum context length is\s*([\d,]+)\s*tokens.*?your messages resulted in\s*([\d,]+)\s*tokens",
             ):
                 for match in re.finditer(pattern, item, re.IGNORECASE | re.DOTALL):
+                    try:
+                        limit = int(match[1].replace(",", ""))
+                        size = int(match[2].replace(",", ""))
+                    except ValueError:
+                        # Diagnostics must not prevent conversion of valid
+                        # usage when a malformed/oversized count is reported.
+                        continue
                     observation = {
-                        "input_tokens": int(match[2].replace(",", "")),
-                        "limit_tokens": int(match[1].replace(",", "")),
+                        "input_tokens": size,
+                        "limit_tokens": limit,
                         "source": source,
                         "measurement": "provider_or_gateway_reported",
                     }

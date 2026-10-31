@@ -73,6 +73,9 @@ async def test_retry_keeps_observation_if_archiving_fails(monkeypatch, tmp_path)
     failed_result = SimpleNamespace(
         exception_info=SimpleNamespace(exception_type="ConnectionError"),
         attempt=1,
+        verifier_result=None,
+        verifier=None,
+        step_results=None,
     )
     successful_result = SimpleNamespace(exception_info=None)
 
@@ -187,3 +190,40 @@ async def test_retry_numbers_and_archived_evidence_identify_canonical_result(
     )
     assert archived.id == failed.id and archived.attempt == 1
     assert kept.id == success.id and kept.attempt == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stage", ["verifier_finished", "graded_step"])
+async def test_completed_evaluation_stage_suppresses_retry(
+    tmp_path, monkeypatch, stage
+):
+    from pier.models.trial.result import TimingInfo, StepResult
+    from pier.models.verifier.result import VerifierResult
+
+    failed = trial_result(tmp_path, "ConnectionError")
+    if stage == "verifier_finished":
+        failed.verifier = TimingInfo(finished_at=datetime.now())
+    else:
+        failed.step_results = [
+            StepResult(
+                step_name="graded",
+                verifier_result=VerifierResult(rewards={"reward": 0}),
+            )
+        ]
+
+    class FakeTrial:
+        async def run(self, *, attempt):
+            return failed
+
+    calls = []
+
+    async def create(cls, cfg):
+        calls.append(cfg)
+        return FakeTrial()
+
+    monkeypatch.setattr(Trial, "create", classmethod(create))
+    kept = await TrialQueue(
+        1, RetryConfig(max_retries=1, include_exceptions={"ConnectionError"})
+    )._execute_trial_with_retries(failed.config)
+    assert kept.id == failed.id
+    assert len(calls) == 1

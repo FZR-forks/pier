@@ -1,6 +1,8 @@
 import pytest
+import json
 
 from pier.agents.installed.pi import Pi
+from pier.models.agent.context import AgentContext
 from pier.utils.rejected_request import rejected_requests_from_errors
 
 
@@ -44,3 +46,42 @@ def test_pi_rejection_does_not_inflate_input_peak(tmp_path):
         trajectory.final_metrics.extra["rejected_request_tokens"][0]["input_tokens"]
         == 1054336
     )
+
+
+@pytest.mark.parametrize("kind", [["object", "null"], {"unexpected": True}, None, 42])
+def test_unexpected_nested_json_types_cannot_destroy_pi_usage(tmp_path, kind):
+    message = {
+        "role": "assistant",
+        "content": [{"type": "text", "text": "answer"}],
+        "usage": {
+            "input": 10,
+            "output": 2,
+            "cacheRead": 0,
+            "cacheWrite": 0,
+            "cost": {"total": 0.25},
+        },
+        "toolSchema": {"type": kind},
+    }
+    (tmp_path / "pi.txt").write_text(
+        json.dumps({"type": "turn_end", "message": message}) + "\n"
+    )
+    context = AgentContext()
+    Pi(logs_dir=tmp_path, model_name="test/test").populate_context_post_run(context)
+    assert (
+        context.n_input_tokens,
+        context.n_cache_tokens,
+        context.n_output_tokens,
+        context.cost_usd,
+    ) == (10, 0, 2, 0.25)
+    assert (tmp_path / "trajectory.json").exists()
+
+
+def test_oversized_or_malformed_diagnostic_counts_do_not_crash():
+    for size in ["," * 20, "9" * 5000]:
+        assert (
+            rejected_requests_from_errors(
+                {"type": "error", "message": f"Max Input Tokens=100, Got={size}"},
+                source="test",
+            )
+            == []
+        )

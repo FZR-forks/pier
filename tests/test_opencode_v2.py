@@ -210,6 +210,47 @@ def test_active_session_and_duplicate_snapshots_cannot_report_complete_usage(tmp
     assert context.session_reported_usage.n_input_tokens == 223
 
 
+@pytest.mark.parametrize("missing_parent", [False, True])
+def test_all_collected_session_usage_survives_missing_intermediate_parent(
+    tmp_path, missing_parent
+):
+    inspections = load_fixture()
+    if missing_parent:
+        inspections[1]["session"]["parentID"] = "missing-intermediate"
+    write_inspections(tmp_path, inspections + [copy.deepcopy(inspections[1])])
+    manifest = tmp_path / "opencode-v2" / "runner-result.json"
+    manifest.write_text(
+        json.dumps(
+            {
+                "root_id": inspections[0]["session"]["id"],
+                "collection_complete": not missing_parent,
+                "discovered_session_ids": [
+                    item["session"]["id"] for item in inspections
+                ]
+                + (["missing-intermediate"] if missing_parent else []),
+            }
+        )
+    )
+    context = AgentContext()
+    make_agent(tmp_path).populate_context_post_run(context)
+    usage = context.session_reported_usage
+    assert (
+        usage.n_input_tokens,
+        usage.n_cache_tokens,
+        usage.n_output_tokens,
+        usage.cost_usd,
+    ) == (223, 30, 120, 4.5)
+    assert usage.complete is not missing_parent
+    trajectory = json.loads((tmp_path / "trajectory.json").read_text())
+    assert (
+        trajectory["final_metrics"]["extra"]["session_reported_usage"]
+        == usage.model_dump()
+    )
+    if missing_parent:
+        assert context.n_input_tokens is context.cost_usd is None
+        assert not trajectory.get("subagent_trajectories")
+
+
 # ---------------------------------------------------------------------------
 # Registration and naming
 # ---------------------------------------------------------------------------
@@ -2243,7 +2284,8 @@ def test_failed_compaction_marks_incomplete(tmp_path: Path):
     assert final["total_prompt_tokens"] == 5
     assert final["total_completion_tokens"] == 0
     assert final["extra"]["failed_attempts"] == 1
-    assert final["extra"]["compacted"] is True
+    assert final["extra"]["summarization_count"] == 0
+    assert not final["extra"].get("compacted", False)
 
 
 # ---------------------------------------------------------------------------

@@ -130,12 +130,41 @@ class TrialQueue:
         """Execute a trial with retry logic."""
         from pier.trial.trial import Trial
 
+        pending_archive: Path | None = None
         for attempt in range(self._retry_config.max_retries + 1):
-            trial = await Trial.create(trial_config)
+            try:
+                trial = await Trial.create(trial_config)
+            except (asyncio.CancelledError, Exception):
+                # No replacement started; restore the observation referenced
+                # by the job summary if loading the next trial was interrupted.
+                if pending_archive is not None:
+                    trial_dir = trial_config.trials_dir / trial_config.trial_name
+                    if trial_dir.exists():
+                        # Only scratch created by the replacement constructor;
+                        # its agent never ran. Restore the intact observation.
+                        shutil.rmtree(trial_dir)
+                    shutil.move(str(pending_archive), str(trial_dir))
+                raise
+            pending_archive = None
             self._setup_hooks(trial)
             result = await trial.run(attempt=attempt + 1)
 
             if result.exception_info is None:
+                return result
+
+            # Once evaluation completed, even an allowlisted cleanup failure
+            # is not permission to buy another model attempt/change the reward.
+            if (
+                result.verifier_result is not None
+                or (
+                    result.verifier is not None
+                    and result.verifier.finished_at is not None
+                )
+                or any(
+                    step.verifier_result is not None
+                    for step in result.step_results or []
+                )
+            ):
                 return result
 
             if not self._should_retry_exception(result.exception_info.exception_type):
@@ -152,10 +181,16 @@ class TrialQueue:
                 )
                 return result
 
+            delay = self._calculate_backoff_delay(attempt)
+            # Keep the current canonical directory in place throughout backoff.
+            # Cancellation here must leave the summary's observation resumable.
+            await asyncio.sleep(delay)
+
             try:
                 archive_dir = self._archive_retry_attempt(
                     trial.trial_dir, result.attempt - 1
                 )
+                pending_archive = archive_dir
             except OSError as exc:
                 self._logger.warning(
                     "Could not archive failed attempt for trial %s: %s. "
@@ -165,18 +200,14 @@ class TrialQueue:
                 )
                 return result
 
-            delay = self._calculate_backoff_delay(attempt)
-
             self._logger.debug(
                 "Trial %s failed with exception %s. Archived failed attempt at %s. "
-                "Retrying in %.2f seconds...",
+                "Retrying after %.2f seconds...",
                 trial_config.trial_name,
                 result.exception_info.exception_type,
                 archive_dir,
                 delay,
             )
-
-            await asyncio.sleep(delay)
 
         raise RuntimeError(
             f"Trial {trial_config.trial_name} produced no result. This should never "

@@ -1,5 +1,6 @@
 import copy
 import json
+import math
 import shlex
 from datetime import datetime, timezone
 from typing import Any
@@ -279,6 +280,36 @@ class Pi(BaseInstalledAgent):
             f"$HOME/.agents/skills/ 2>/dev/null || true"
         )
 
+    def _explicit_zero_pricing(self) -> bool:
+        """An explicit free model is different from Pi's omitted-rate zeros."""
+        provider, _, model = (self.model_name or "").partition("/")
+        entry = (self._pi_config.get("providers") or {}).get(provider) or {}
+        return any(
+            item.get("id") == model
+            and isinstance(item.get("cost"), dict)
+            and all(
+                isinstance(item["cost"].get(key), (int, float))
+                and not isinstance(item["cost"][key], bool)
+                and item["cost"][key] == 0
+                for key in ("input", "output", "cacheRead", "cacheWrite")
+            )
+            for item in entry.get("models") or []
+            if isinstance(item, dict)
+        )
+
+    @staticmethod
+    def _reported_cost(usage: Any) -> float | None:
+        cost = usage.get("cost") if isinstance(usage, dict) else None
+        value = cost.get("total") if isinstance(cost, dict) else None
+        return (
+            float(value)
+            if isinstance(value, (int, float))
+            and not isinstance(value, bool)
+            and math.isfinite(value)
+            and value >= 0
+            else None
+        )
+
     def network_allowlist(self) -> NetworkAllowlist:
         provider = self._provider()
         if provider is None:
@@ -536,9 +567,7 @@ class Pi(BaseInstalledAgent):
                 tool_cache_write += int(tool_usage.get("cacheWrite") or 0)
                 tool_cache_write_1h += int(tool_usage.get("cacheWrite1h") or 0)
                 tool_reasoning += int(tool_usage.get("reasoning") or 0)
-                cost = tool_usage.get("cost")
-                if isinstance(cost, dict):
-                    tool_cost += float(cost.get("total") or 0.0)
+                tool_cost += self._reported_cost(tool_usage) or 0.0
 
         input_tokens = int(usage.get("input") or 0)
         output_tokens = int(usage.get("output") or 0)
@@ -546,9 +575,7 @@ class Pi(BaseInstalledAgent):
         cache_write = int(usage.get("cacheWrite") or 0)
         cache_write_1h = int(usage.get("cacheWrite1h") or 0)
         reasoning_tokens = int(usage.get("reasoning") or 0)
-        cost_total = 0.0
-        if isinstance(usage.get("cost"), dict):
-            cost_total = float(usage["cost"].get("total") or 0.0)
+        cost_total = self._reported_cost(usage) or 0.0
 
         # pi reports `input` net of cache, so the full prompt is the sum of all
         # three components (matching provider-reported prompt_tokens).
@@ -569,7 +596,9 @@ class Pi(BaseInstalledAgent):
                 prompt_tokens=prompt_tokens,
                 completion_tokens=output_tokens,
                 cached_tokens=cache_read,
-                cost_usd=cost_total or None,
+                cost_usd=self._reported_cost(usage)
+                if cost_total or self._explicit_zero_pricing()
+                else None,
                 extra=metrics_extra or None,
             )
 
@@ -628,9 +657,7 @@ class Pi(BaseInstalledAgent):
         cache_write = int(usage.get("cacheWrite") or 0)
         cache_write_1h = int(usage.get("cacheWrite1h") or 0)
         reasoning_tokens = int(usage.get("reasoning") or 0)
-        cost_total = 0.0
-        if isinstance(usage.get("cost"), dict):
-            cost_total = float(usage["cost"].get("total") or 0.0)
+        cost_total = self._reported_cost(usage) or 0.0
         prompt_tokens = input_tokens + cache_read + cache_write
 
         compaction_extra = {
@@ -654,7 +681,7 @@ class Pi(BaseInstalledAgent):
                 "cache_write_tokens": cache_write,
                 "cache_write_1h_tokens": cache_write_1h,
                 "reasoning_tokens": reasoning_tokens,
-                "cost_usd": cost_total,
+                "cost_usd": self._reported_cost(usage),
             }
 
         step_kwargs: dict[str, Any] = {
@@ -800,20 +827,6 @@ class Pi(BaseInstalledAgent):
         if not any(step.source != "user" for step in steps):
             return None
 
-        total_cost = totals["cost"] if totals["cost"] > 0 else None
-        if total_cost is None:
-            # A zero result means no usage to price, which is absent rather than free.
-            total_cost = (
-                self._compute_cost_from_pricing(
-                    totals["prompt"],
-                    totals["completion"],
-                    totals["cached"],
-                    totals["cache_write"],
-                    totals["cache_write_1h"],
-                )
-                or None
-            )
-
         final_extra: dict[str, Any] = {}
         from pier.utils.rejected_request import rejected_requests_from_errors
 
@@ -854,6 +867,18 @@ class Pi(BaseInstalledAgent):
             )
             for item in usages
         )
+        costs = [self._reported_cost(item) for item in usages]
+        total_cost = sum(costs) if all(value is not None for value in costs) else None
+        if total_cost == 0 and not self._explicit_zero_pricing() and usage_known:
+            # Pi defaults absent custom-model rates to zero. Preserve explicit
+            # free pricing, otherwise retain the standard-price fallback.
+            total_cost = self._compute_cost_from_pricing(
+                totals["prompt"],
+                totals["completion"],
+                totals["cached"],
+                totals["cache_write"],
+                totals["cache_write_1h"],
+            )
         final_metrics = FinalMetrics(
             total_prompt_tokens=totals["prompt"] if usage_known else None,
             total_completion_tokens=totals["completion"] if usage_known else None,
