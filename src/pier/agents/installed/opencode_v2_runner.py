@@ -1478,12 +1478,15 @@ def _compaction_buffer(settings: dict[str, Any], *, allow_percent: bool) -> Any:
     buffer = None
     for key in ("reserved", "buffer"):
         value = settings.get(key)
+        # JSON has one number type: `1000.0` is an integer to OpenCode.
+        if isinstance(value, float) and value.is_integer():
+            value = int(value)
         if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
             buffer = value
         elif (
             allow_percent
             and isinstance(value, str)
-            and re.fullmatch(r"[1-9]\d?(\.\d+)?%", value)
+            and re.fullmatch(r"[1-9][0-9]?(\.[0-9]+)?%", value)
         ):
             buffer = value
     return buffer

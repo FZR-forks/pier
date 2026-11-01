@@ -2199,6 +2199,58 @@ def test_compaction_counted_once(tmp_path: Path):
     }
 
 
+def test_session_usage_without_a_message_is_added(tmp_path: Path):
+    """A discarded background compaction summary is billed to the session only."""
+    assistant = {
+        "type": "assistant",
+        "id": "msg_a1",
+        "agent": "build",
+        "model": {"id": "m", "providerID": "p"},
+        "time": {"created": 2, "completed": 3},
+        "finish": "stop",
+        "cost": 0.1,
+        "tokens": {
+            "input": 10,
+            "output": 5,
+            "reasoning": 0,
+            "cache": {"read": 20, "write": 0},
+        },
+        "content": [{"type": "text", "text": "ok"}],
+    }
+    inspection = {
+        "session": {
+            "id": "ses_bg000000000000000000000001",
+            "cost": 0.3,
+            "tokens": {
+                "input": 60,
+                "output": 25,
+                "reasoning": 0,
+                "cache": {"read": 30, "write": 0},
+            },
+        },
+        "messages": [
+            {"type": "user", "id": "msg_u1", "text": "go", "time": {"created": 1}},
+            assistant,
+        ],
+        "active": None,
+        "terminal": None,
+    }
+    agent = make_agent(tmp_path)
+    write_inspections(tmp_path, [inspection])
+    agent.populate_context_post_run(AgentContext())
+
+    final = json.loads((tmp_path / "trajectory.json").read_text())["final_metrics"]
+    assert final["total_prompt_tokens"] == 90
+    assert final["total_completion_tokens"] == 25
+    assert final["total_cached_tokens"] == 30
+    assert final["total_cost_usd"] == pytest.approx(0.3)
+    unattributed = final["extra"]["unattributed_usage"]
+    assert unattributed["prompt_tokens"] == 60
+    assert unattributed["completion_tokens"] == 20
+    assert unattributed["cached_tokens"] == 10
+    assert unattributed["cost_usd"] == pytest.approx(0.2)
+
+
 def test_compaction_wrapper_reference_is_not_counted_again(tmp_path: Path):
     """A linked wrapper is deduped by record ID, never by equal token totals."""
     inspection = {
@@ -3465,6 +3517,13 @@ def test_preflight_reports_opencode_compaction_ceiling(
             244800,
         ),
         ({"context": 272000, "output": 128000}, {"buffer": "100%"}, 231200),
+        # JSON's integral floats are integers; only ASCII digits form a percent.
+        (
+            {"context": 100000, "input": 90000, "output": 8192},
+            {"reserved": 4000, "buffer": 1000.0},
+            89000,
+        ),
+        ({"context": 100000, "output": 8192}, {"buffer": "1\u0662%"}, 84000),
         # A buffer that leaves no room is ignored.
         ({"context": 272000, "output": 128000}, {"buffer": 300000}, 231200),
         ({"context": 272000, "output": 128000}, {"auto": False}, None),

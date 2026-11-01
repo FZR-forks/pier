@@ -1,3 +1,4 @@
+import subprocess
 import json
 import re
 from pathlib import Path
@@ -208,10 +209,24 @@ class TestRunCommand:
     ):
         await self._run(agent, fake_environment)
         command = fake_environment.commands[-1]
-        assert (
-            '| grep -Ev \'"type":"(message_update|entry_appended|agent_end)"\' '
-            in command
-        )
+        start = command.index("2>&1 ") + len("2>&1 ")
+        pipeline = command[start : command.index("| stdbuf")]
+        lines = [
+            '{"type":"message_update","usage":{}}',
+            '{"type":"agent_end","messages":[]}',
+            '{"type":"entry_appended","entry":{"type":"message","id":"a"}}',
+            '{"type":"entry_appended","entry":{"type":"usage","id":"b"}}',
+            '{"type":"turn_end","message":{}}',
+        ]
+        kept = subprocess.run(
+            ["bash", "-c", f"cat {pipeline}"],
+            input="\n".join(lines) + "\n",
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.splitlines()
+        # Pi 1.x cache-warming usage arrives only as a `usage` entry.
+        assert kept == [lines[3], lines[4]]
 
     @pytest.mark.asyncio
     async def test_offline_env_is_set_and_overridable(
@@ -668,6 +683,34 @@ class TestCompaction:
         assert final["total_cost_usd"] == pytest.approx(0.006)
         assert final["extra"]["total_cache_write_tokens"] == 30
         assert final["extra"]["total_cache_write_1h_tokens"] == 12
+
+    def test_cache_warming_usage_is_billed_into_totals(self, agent: Pi):
+        """Pi 1.x cache warming bills requests recorded only as usage entries."""
+        message = assistant_message(response_id="r1", input=100, output=10, cost=0.001)
+        warm = {
+            "type": "usage",
+            "id": "w1",
+            "kind": "cache_warm",
+            "usage": usage(input=50, output=1, cost=0.0005),
+        }
+        events = [
+            {"type": "session", "id": "s1"},
+            {"type": "message_end", "message": message},
+            # Warming runs while tools execute, between message_end and turn_end;
+            # a repeated entry is counted once.
+            {"type": "entry_appended", "entry": warm},
+            {"type": "entry_appended", "entry": warm},
+            {"type": "turn_end", "message": message, "toolResults": []},
+        ]
+        trajectory = self._convert(agent, events)["trajectory"]
+        final = trajectory["final_metrics"]
+        assert final["total_prompt_tokens"] == 150
+        assert final["total_completion_tokens"] == 11
+        assert final["total_cost_usd"] == pytest.approx(0.0015)
+        assert final["extra"]["usage_entries"] == {
+            "cache_warm": {"count": 1, "prompt_tokens": 50, "completion_tokens": 1}
+        }
+        assert [s["source"] for s in trajectory["steps"]] == ["user", "agent"]
 
     def test_aborted_compaction_is_not_counted(self, agent: Pi):
         trajectory = self._convert(agent, self._events_with_compaction(aborted=True))[

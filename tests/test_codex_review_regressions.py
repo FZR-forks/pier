@@ -657,3 +657,49 @@ def test_unreported_cache_writes_stay_absent_from_metrics(tmp_path: Path) -> Non
 )
 def test_tool_output_blob_text(raw, expected) -> None:
     assert Codex._parse_output_blob(raw)[0] == expected
+
+
+def _usage_record(input_tokens: int, output_tokens: int) -> dict[str, object]:
+    usage = {
+        "input_tokens": input_tokens,
+        "cached_input_tokens": 0,
+        "cache_write_input_tokens": 0,
+        "output_tokens": output_tokens,
+        "reasoning_output_tokens": 0,
+        "total_tokens": input_tokens + output_tokens,
+    }
+    return {
+        "type": "token_usage_record",
+        "payload": {"usage": usage, "thread_token_usage": usage},
+    }
+
+
+def test_completed_response_usage_survives_timeout_inside_tool(tmp_path: Path):
+    """Codex records a response's usage before its tool runs, and its
+    `token_count` only after; a timeout in between must not lose either."""
+    events = _thread_events(ROOT, (100, 10), model=ROOT_MODEL)
+    events[-1:-1] = [_usage_record(100, 10)]
+    events += [
+        _usage_record(150, 20),
+        {
+            "type": "response_item",
+            "payload": {
+                "type": "custom_tool_call",
+                "call_id": "call-1",
+                "name": "exec",
+                "input": "await tools.exec_command({cmd: 'sleep 60'})",
+            },
+        },
+    ]
+    _write_rollout(tmp_path, f"rollout-{ROOT}.jsonl", events)
+
+    trajectory = _convert(tmp_path)
+
+    final = trajectory.final_metrics
+    assert (final.total_prompt_tokens, final.total_completion_tokens) == (250, 30)
+    agent_steps = [step for step in trajectory.steps if step.source == "agent"]
+    assert [step.metrics.prompt_tokens for step in agent_steps] == [100, 150]
+    assert agent_steps[-1].tool_calls[0].function_name == "exec"
+    # The tool never returned, so its result has no content.
+    results = agent_steps[-1].observation.results if agent_steps[-1].observation else []
+    assert all(result.content is None for result in results)

@@ -351,7 +351,20 @@ class Codex(BaseInstalledAgent):
         """
         final_total_usage: dict[str, Any] | None = None
         saw_context_full_snapshot = False
+        # Codex >= 0.16x writes a `token_usage_record` as soon as a response
+        # completes but defers its `token_count` until pending tools resolve.
+        # Responses after the last snapshot (e.g. a timeout inside a tool) are
+        # billed but only present as records, so their usage is added on top.
+        unreported: dict[str, int] = {}
         for event in reversed(raw_events):
+            if event.get("type") == "token_usage_record":
+                record = event.get("payload")
+                record_usage = record.get("usage") if isinstance(record, dict) else None
+                if isinstance(record_usage, dict):
+                    for key, value in record_usage.items():
+                        if isinstance(value, int) and not isinstance(value, bool):
+                            unreported[key] = unreported.get(key, 0) + value
+                continue
             if event.get("type") != "event_msg":
                 continue
             payload = event.get("payload")
@@ -395,10 +408,21 @@ class Codex(BaseInstalledAgent):
             # A full-history child may overflow before making its first successful
             # request. Its seeded parent baseline is then still the final known
             # cumulative usage, which means zero child-local usage.
-            if saw_context_full_snapshot and initial_total_usage is not None:
+            if (saw_context_full_snapshot or unreported) and (
+                initial_total_usage is not None
+            ):
                 final_total_usage = initial_total_usage
+            elif unreported:
+                final_total_usage = {}
             else:
                 return None, True
+        if unreported:
+            final_total_usage = {
+                key: (final_total_usage.get(key) or 0) + unreported.get(key, 0)
+                if key in unreported or key in final_total_usage
+                else None
+                for key in {*final_total_usage, *unreported}
+            }
 
         field_map = {
             "prompt_tokens": "input_tokens",
@@ -1207,6 +1231,7 @@ class Codex(BaseInstalledAgent):
         api_call_index = 1
         current_api_call_id = f"api_call_{api_call_index}"
         api_call_metrics: dict[str, dict[str, Any]] = {}
+        pending_usage_record: dict[str, Any] | None = None
         saw_model_output_in_api_call = False
         tool_order_counter = 0
         compactions = {id(event) for event in self._compaction_events(raw_events)}
@@ -1217,10 +1242,11 @@ class Codex(BaseInstalledAgent):
 
         def finish_api_call(token_count_payload: dict[str, Any]) -> None:
             nonlocal api_call_index, current_api_call_id, saw_model_output_in_api_call
-            nonlocal tool_order_counter
+            nonlocal tool_order_counter, pending_usage_record
 
             if not saw_model_output_in_api_call:
                 return
+            pending_usage_record = None
 
             metrics = self._metrics_from_token_count_payload(token_count_payload)
             if metrics:
@@ -1260,6 +1286,11 @@ class Codex(BaseInstalledAgent):
                     codex_turn_id = None
                 elif event_type == "token_count":
                     finish_api_call(payload)
+                continue
+
+            if etype == "token_usage_record" and isinstance(payload, dict):
+                if isinstance(payload.get("usage"), dict):
+                    pending_usage_record = payload["usage"]
                 continue
 
             if etype == "turn_context":
@@ -1414,6 +1445,16 @@ class Codex(BaseInstalledAgent):
                 normalized_events.append(call_info)
                 pending_reasoning = None
                 continue
+
+        # A run that stopped inside a tool: the call never got its output and
+        # the response its `token_count`, but both happened and were billed.
+        normalized_events.extend(pending_calls.values())
+        if saw_model_output_in_api_call and pending_usage_record is not None:
+            metrics = self._metrics_from_token_count_payload(
+                {"info": {"last_token_usage": pending_usage_record}}
+            )
+            if metrics:
+                api_call_metrics[current_api_call_id] = metrics
 
         for event in normalized_events:
             api_call_id = event.get("api_call_id")

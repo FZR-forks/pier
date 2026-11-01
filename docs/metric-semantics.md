@@ -23,6 +23,19 @@ these observed totals; inability to attach them to the trajectory tree keeps
 `complete: false`. Failed summarizer requests retain usage, but only completed
 compactions increment `summarization_count`.
 
+Billed requests that have no message of their own are part of the totals:
+Claude Code compaction summaries (from the stream's cumulative `modelUsage`),
+OpenCode V2 background summaries that were never applied (from the complete
+session counters), Pi cache-warming requests (`usage` session entries) and
+Codex responses whose `token_count` never arrived (`token_usage_record`). Steps
+are not invented for them. Claude Code and OpenCode V2 record the difference as
+`final_metrics.extra.unattributed_usage`, and Pi records per-kind
+`usage_entries`. The native totals are adopted only when every component
+(uncached input, cache reads, output) is at least the steps' figure. Otherwise
+the step sums stay, and Claude Code records `native_usage_mismatch`. A compacted
+Claude Code run without native totals (for example a timeout) is flagged with
+`compaction_usage_missing`.
+
 `rejected_request_tokens` records input sizes explicitly reported in errors,
 including their source. They are separate from successful input usage and peak
 context: a gateway may have transformed the rejected request.

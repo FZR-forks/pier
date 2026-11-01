@@ -654,19 +654,19 @@ class ClaudeCode(BaseInstalledAgent):
             finalize(group)
         return result
 
-    def _parse_total_cost_from_stream_json(self) -> float | None:
-        """Extract authoritative `total_cost_usd` from Claude Code's stdout stream.
+    def _stream_results(self) -> list[dict[str, Any]]:
+        """The ``result`` events of Claude Code's stream-json stdout.
 
-        Claude Code's `--output-format=stream-json --print` mode emits a final
-        ``{"type":"result", ..., "total_cost_usd": <float>, ...}`` line to stdout,
-        which Pier tees to ``<logs_dir>/claude-code.txt``. Returns ``None`` if
-        the file is missing, malformed, or the result event lacks the field.
+        Claude Code's `--output-format=stream-json --print` mode emits
+        ``{"type":"result", ...}`` lines to stdout, which Pier tees to
+        ``<logs_dir>/claude-code.txt``. Each carries the session's cumulative
+        ``total_cost_usd`` and ``modelUsage``.
         """
         stream_path = self.logs_dir / "claude-code.txt"
         try:
             content = stream_path.read_text(encoding="utf-8")
         except OSError:
-            return None
+            return []
         results: list[dict[str, Any]] = []
         for line in content.split("\n"):
             line = line.strip()
@@ -678,6 +678,15 @@ class ClaudeCode(BaseInstalledAgent):
                 continue
             if isinstance(event, dict) and event.get("type") == "result":
                 results.append(event)
+        return results
+
+    def _parse_total_cost_from_stream_json(self) -> float | None:
+        """Extract authoritative `total_cost_usd` from Claude Code's stdout stream.
+
+        Returns ``None`` if the file is missing, malformed, or the result event
+        lacks the field.
+        """
+        results = self._stream_results()
         if not results:
             return None
         # `costBasis: "unknown"` (newer Claude Code) means no price matched the
@@ -698,6 +707,43 @@ class ClaudeCode(BaseInstalledAgent):
             return float(cost)
         except (TypeError, ValueError):
             return None
+
+    def _stream_usage_totals(self) -> dict[str, int] | None:
+        """Session-wide token totals from the last ``result``'s ``modelUsage``.
+
+        They include requests the session transcript has no message for, such
+        as the summary call of each compaction.
+        """
+        results = self._stream_results()
+        model_usage = results[-1].get("modelUsage") if results else None
+        if not isinstance(model_usage, dict) or not model_usage:
+            return None
+        totals = {"prompt": 0, "completion": 0, "cached": 0}
+        for usage in model_usage.values():
+            if not isinstance(usage, dict):
+                return None
+            fields = {
+                key: usage.get(key)
+                for key in (
+                    "inputTokens",
+                    "outputTokens",
+                    "cacheReadInputTokens",
+                    "cacheCreationInputTokens",
+                )
+            }
+            if not all(
+                isinstance(value, int) and not isinstance(value, bool)
+                for value in fields.values()
+            ):
+                return None
+            totals["prompt"] += (
+                fields["inputTokens"]
+                + fields["cacheReadInputTokens"]
+                + fields["cacheCreationInputTokens"]
+            )
+            totals["completion"] += fields["outputTokens"]
+            totals["cached"] += fields["cacheReadInputTokens"]
+        return totals
 
     @staticmethod
     def _first_event_model(
@@ -1148,6 +1194,46 @@ class ClaudeCode(BaseInstalledAgent):
             final_extra["total_cache_read_input_tokens"] = cache_read_total
         if summarization_count:
             final_extra["compacted"] = True
+        # Compaction summary calls are billed but absent from the transcript;
+        # the session's own cumulative totals include them.
+        native = self._stream_usage_totals()
+        step_totals = {
+            "prompt": total_prompt_tokens or 0,
+            "completion": total_completion_tokens or 0,
+            "cached": total_cached_tokens or 0,
+        }
+        unattributed = (
+            {key: native[key] - step_totals[key] for key in native}
+            if native is not None
+            else None
+        )
+        # Only missing requests are added: every component, uncached input
+        # included, must be at least the steps' own figure.
+        consistent = bool(
+            unattributed
+            and min(unattributed.values()) >= 0
+            and unattributed["prompt"] >= unattributed["cached"]
+        )
+        if unattributed and consistent and any(unattributed.values()):
+            total_prompt_tokens = native["prompt"]
+            total_completion_tokens = native["completion"]
+            total_cached_tokens = native["cached"]
+            final_extra["unattributed_usage"] = {
+                "prompt_tokens": unattributed["prompt"],
+                "completion_tokens": unattributed["completion"],
+                "cached_tokens": unattributed["cached"],
+            }
+        elif unattributed and not consistent:
+            # The transcript disagrees with the session totals beyond missing
+            # requests; keep the step sums and expose both.
+            final_extra["native_usage_mismatch"] = {
+                "prompt_tokens": native["prompt"],
+                "completion_tokens": native["completion"],
+                "cached_tokens": native["cached"],
+            }
+        elif native is None and summarization_count:
+            # No session totals (e.g. a timeout): the summary calls are missing.
+            final_extra["compaction_usage_missing"] = True
         if not final_extra:
             final_extra = None
         final_extra = extra_with_context_metrics(
