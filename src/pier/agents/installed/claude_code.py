@@ -679,6 +679,15 @@ class ClaudeCode(BaseInstalledAgent):
                 cost = event.get("total_cost_usd")
                 if cost is None:
                     return None
+                # `costBasis: "unknown"` (newer Claude Code) means no price
+                # matched the model ID and the cost is a guess at the default
+                # model's rate, so it is not a measurement.
+                model_usage = event.get("modelUsage")
+                if isinstance(model_usage, dict) and any(
+                    isinstance(usage, dict) and usage.get("costBasis") == "unknown"
+                    for usage in model_usage.values()
+                ):
+                    return None
                 try:
                     return float(cost)
                 except (TypeError, ValueError):
@@ -1281,6 +1290,11 @@ class ClaudeCode(BaseInstalledAgent):
             ),
             "FORCE_AUTO_BACKGROUND_TASKS": "1",
             "ENABLE_BACKGROUND_TASKS": "1",
+            # Newer Claude Code retries a flagged request on another model, also
+            # for gateway model names it does not recognize. That would move a
+            # benchmark run off its model (see the pinning below); agent.env can
+            # still re-enable it.
+            "CLAUDE_CODE_DISABLE_REFUSAL_FALLBACK": "1",
         }
 
         # Bedrock configuration: pass through AWS credentials and region

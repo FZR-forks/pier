@@ -206,6 +206,11 @@ class Codex(BaseInstalledAgent):
             metadata = parsed.get("metadata")
             return output, metadata if isinstance(metadata, dict) else None
 
+        if isinstance(parsed, list):
+            # Newer Codex records tool output as Responses content items, e.g.
+            # code-mode `exec` results as a list of `input_text` blocks.
+            return Codex._extract_message_text(parsed), None
+
         return str(parsed), None
 
     @staticmethod

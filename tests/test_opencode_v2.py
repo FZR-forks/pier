@@ -3359,7 +3359,11 @@ def test_preflight_rejects_subagent_model_when_restricted(tmp_path: Path, monkey
 
 
 def _preflight_with_limits(
-    tmp_path: Path, monkeypatch, resolved_limit: dict, compaction: dict | None = None
+    tmp_path: Path,
+    monkeypatch,
+    resolved_limit: dict,
+    compaction: dict | None = None,
+    version: tuple[int, int, int] | None = (2, 0, 8),
 ) -> dict:
     config: dict = {
         "providers": {
@@ -3400,6 +3404,7 @@ def _preflight_with_limits(
         model_spec="litellm/gpt-5.6-luna#low",
         config_file=str(config_path),
         restrict_model=True,
+        opencode_version=version,
         timeout=0.01,
     )
 
@@ -3440,6 +3445,57 @@ def test_preflight_reports_opencode_compaction_ceiling(
 ):
     result = _preflight_with_limits(tmp_path, monkeypatch, resolved_limit, compaction)
     assert result["compaction_prompt_ceiling"] == expected
+
+
+@pytest.mark.parametrize(
+    ("resolved_limit", "compaction", "expected"),
+    [
+        # OpenCode 2.2.5 keeps 15%, and at least 16k, of the window free.
+        ({"context": 1000000, "output": 384000}, None, 850000),
+        ({"context": 272000, "input": 144000, "output": 128000}, None, 122400),
+        ({"context": 40000, "output": 8192}, None, 24000),
+        ({"context": 30000, "output": 8192}, None, 25500),
+        ({"context": 272000, "output": 128000}, {"buffer": "20%"}, 217600),
+        ({"context": 272000, "output": 128000}, {"buffer": 0}, 272000),
+        # Native `buffer` wins over legacy `reserved`; invalid values are skipped.
+        ({"context": 272000, "output": 128000}, {"reserved": 40000}, 232000),
+        (
+            {"context": 272000, "output": 128000},
+            {"reserved": 40000, "buffer": "10%"},
+            244800,
+        ),
+        ({"context": 272000, "output": 128000}, {"buffer": "100%"}, 231200),
+        # A buffer that leaves no room is ignored.
+        ({"context": 272000, "output": 128000}, {"buffer": 300000}, 231200),
+        ({"context": 272000, "output": 128000}, {"auto": False}, None),
+    ],
+)
+def test_preflight_reports_current_opencode_compaction_ceiling(
+    tmp_path: Path, monkeypatch, resolved_limit, compaction, expected
+):
+    result = _preflight_with_limits(
+        tmp_path, monkeypatch, resolved_limit, compaction, version=(2, 2, 5)
+    )
+    assert result["compaction_prompt_ceiling"] == expected
+
+
+@pytest.mark.parametrize("version", [None, (2, 0, 19), (2, 2, 4)])
+def test_preflight_does_not_guess_unmirrored_compaction_ceiling(
+    tmp_path: Path, monkeypatch, version
+):
+    result = _preflight_with_limits(
+        tmp_path,
+        monkeypatch,
+        {"context": 272000, "output": 128000},
+        version=version,
+    )
+    assert result["compaction_prompt_ceiling"] is None
+
+
+def test_parse_opencode_version():
+    assert runner_module._parse_version("opencode v2.2.5") == (2, 2, 5)
+    assert runner_module._parse_version("2.0.8\n") == (2, 0, 8)
+    assert runner_module._parse_version("unavailable: OSError") is None
 
 
 def test_preflight_rejects_limits_without_prompt_budget(tmp_path: Path, monkeypatch):

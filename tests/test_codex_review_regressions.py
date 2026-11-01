@@ -638,3 +638,22 @@ def test_unreported_cache_writes_stay_absent_from_metrics(tmp_path: Path) -> Non
     for step in trajectory.steps:
         if step.metrics:
             assert "cache_write_input_tokens" not in (step.metrics.extra or {})
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        # Codex 0.166 records code-mode `exec` output as Responses content items.
+        (
+            [
+                {"type": "input_text", "text": "Script completed\nOutput:\n"},
+                {"type": "input_text", "text": "OK\n"},
+            ],
+            "Script completed\nOutput:\nOK\n",
+        ),
+        ('{"output": "plain", "metadata": {"exit_code": 0}}', "plain"),
+        ("not json", "not json"),
+    ],
+)
+def test_tool_output_blob_text(raw, expected) -> None:
+    assert Codex._parse_output_blob(raw)[0] == expected

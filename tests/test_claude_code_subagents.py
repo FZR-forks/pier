@@ -615,6 +615,21 @@ async def test_all_claude_model_channels_are_pinned(
         "ANTHROPIC_SMALL_FAST_MODEL",
     ):
         assert env[key] == env["ANTHROPIC_MODEL"]
+    # A flagged request must not be retried on a different model.
+    assert env["CLAUDE_CODE_DISABLE_REFUSAL_FALLBACK"] == "1"
+
+
+@pytest.mark.asyncio
+async def test_refusal_fallback_can_be_reenabled_from_agent_env(tmp_path: Path):
+    agent = ClaudeCode(
+        logs_dir=tmp_path,
+        model_name="anthropic/claude-opus-4-6",
+        extra_env={"CLAUDE_CODE_DISABLE_REFUSAL_FALLBACK": "0"},
+    )
+    environment = FakeEnvironment()
+    await agent.run("Fix the bug", cast(BaseEnvironment, environment), AgentContext())
+
+    assert environment.envs[-1]["CLAUDE_CODE_DISABLE_REFUSAL_FALLBACK"] == "0"
 
 
 @pytest.mark.asyncio

@@ -51,6 +51,9 @@ Pi aggregates a cost only when every recorded usage contribution includes its
 cost. Missing costs remain unknown instead of being summed as free usage.
 Explicitly configured all-zero model rates are preserved; Pi's default zeros
 for an unpriced model continue to use the standard pricing fallback.
+Claude Code's reported cost is likewise unknown when any model in its
+`modelUsage` has `costBasis: "unknown"`: Claude Code had no price for that
+model ID and priced it at the default model's rate.
 
 These are inference observations, not gateway invoices. Standard provider
 prices and upstream LLM caching are in scope; gateway billing, gateway response

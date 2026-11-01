@@ -110,6 +110,8 @@ class Pi(BaseInstalledAgent):
             "ANTHROPIC_OAUTH_TOKEN",
             "ANTHROPIC_BASE_URL",
         ),
+        # Pi 1.0.3 renamed `azure-openai-responses` to `azure`.
+        "azure": ("AZURE_OPENAI_API_KEY",),
         "azure-openai-responses": ("AZURE_OPENAI_API_KEY",),
         "cerebras": ("CEREBRAS_API_KEY",),
         "deepseek": ("DEEPSEEK_API_KEY",),
@@ -133,6 +135,7 @@ class Pi(BaseInstalledAgent):
     # name (``$VAR``) so the secret itself is never written to disk.
     _PROVIDER_API_KEY_ENVS: dict[str, str] = {
         "anthropic": "ANTHROPIC_API_KEY",
+        "azure": "AZURE_OPENAI_API_KEY",
         "azure-openai-responses": "AZURE_OPENAI_API_KEY",
         "cerebras": "CEREBRAS_API_KEY",
         "deepseek": "DEEPSEEK_API_KEY",

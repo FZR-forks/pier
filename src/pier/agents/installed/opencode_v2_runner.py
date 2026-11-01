@@ -21,7 +21,9 @@ import argparse
 import base64
 import hashlib
 import json
+import math
 import os
+import re
 import secrets
 import select
 import shutil
@@ -1437,35 +1439,107 @@ def _model_selection(value: str, *, label: str) -> tuple[str, str, str]:
 # OpenCode 2.0.8 session/compaction.ts: DEFAULT_BUFFER and OUTPUT_TOKEN_MAX.
 _COMPACTION_DEFAULT_BUFFER = 20_000
 _COMPACTION_OUTPUT_TOKEN_MAX = 32_000
+# OpenCode 2.2.5 session/compaction.ts: RESERVE_MIN and RESERVE_SHARE.
+_COMPACTION_RESERVE_MIN = 16_000
+_COMPACTION_RESERVE_SHARE = 0.15
+# Releases whose rule is mirrored below. 2.0.19 through 2.2.4 used
+# intermediate rules that are not reproduced, so their ceiling is unknown.
+_COMPACTION_LEGACY_BEFORE = (2, 0, 19)
+_COMPACTION_CURRENT_FROM = (2, 2, 5)
 
 
-def _compaction_prompt_ceiling(limit: dict[str, Any], compaction: Any) -> int | None:
-    """Prompt size at which OpenCode 2.0.8 auto-compacts, or None if it never does.
+def probe_binary_version(binary: str) -> str:
+    """``opencode --version`` output, or why it is unavailable."""
+    try:
+        result = subprocess.run(
+            [binary, "--version"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+        return (result.stdout or result.stderr).strip()
+    except (OSError, subprocess.SubprocessError) as error:
+        return f"unavailable: {type(error).__name__}: {error}"
 
-    Mirrors ``SessionCompaction.required``: the input limit and the context
-    window minus reserved output are independent caps and the lower one wins,
-    so an inherited input limit above a reduced context is not contradictory.
+
+def _parse_version(text: str) -> tuple[int, int, int] | None:
+    """``(major, minor, patch)`` from ``opencode --version`` output."""
+    match = re.search(r"(\d+)\.(\d+)\.(\d+)", text or "")
+    return (int(match[1]), int(match[2]), int(match[3])) if match else None
+
+
+def _compaction_buffer(settings: dict[str, Any], *, allow_percent: bool) -> Any:
+    """The configured buffer as OpenCode decodes it, or None when unset.
+
+    ConfigNormalize maps the legacy ``reserved`` key onto ``buffer`` (native
+    wins) and skips values that are not valid buffers.
     """
-    settings = compaction if isinstance(compaction, dict) else {}
-    if settings.get("auto") is False:
-        return None
-    context = limit.get("context")
-    output = limit.get("output")
-    if not isinstance(context, int) or context <= 0 or not isinstance(output, int):
-        return None
-    # ConfigNormalize maps the legacy ``reserved`` key onto ``buffer`` (native
-    # wins) and skips values that are not non-negative integers.
-    buffer = _COMPACTION_DEFAULT_BUFFER
+    buffer = None
     for key in ("reserved", "buffer"):
         value = settings.get(key)
         if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
             buffer = value
-    reserved = max(min(output, _COMPACTION_OUTPUT_TOKEN_MAX), buffer)
-    ceiling = context - reserved
+        elif (
+            allow_percent
+            and isinstance(value, str)
+            and re.fullmatch(r"[1-9]\d?(\.\d+)?%", value)
+        ):
+            buffer = value
+    return buffer
+
+
+def _compaction_prompt_ceiling(
+    limit: dict[str, Any],
+    compaction: Any,
+    version: tuple[int, int, int] | None,
+) -> int | None:
+    """Prompt size at which OpenCode auto-compacts.
+
+    None when it never does, or when the binary's rule is not mirrored here.
+    """
+    settings = compaction if isinstance(compaction, dict) else {}
+    if settings.get("auto") is False or version is None:
+        return None
+    context = limit.get("context")
     input_limit = limit.get("input")
-    if isinstance(input_limit, int):
-        ceiling = min(ceiling, input_limit - buffer)
-    return ceiling
+    if version < _COMPACTION_LEGACY_BEFORE:
+        # Mirrors 2.0.8 ``SessionCompaction.required``: the input limit and the
+        # context window minus reserved output are independent caps and the
+        # lower one wins, so an inherited input limit above a reduced context
+        # is not contradictory.
+        output = limit.get("output")
+        if not isinstance(context, int) or context <= 0 or not isinstance(output, int):
+            return None
+        buffer = _compaction_buffer(settings, allow_percent=False)
+        if buffer is None:
+            buffer = _COMPACTION_DEFAULT_BUFFER
+        reserved = max(min(output, _COMPACTION_OUTPUT_TOKEN_MAX), buffer)
+        ceiling = context - reserved
+        if isinstance(input_limit, int):
+            ceiling = min(ceiling, input_limit - buffer)
+        return ceiling
+    if version < _COMPACTION_CURRENT_FROM:
+        return None
+    # Mirrors 2.2.5 ``calculateCeiling``: the window is the lower of the known
+    # input and context limits; a buffer that leaves no room is ignored.
+    known = [
+        value
+        for value in (input_limit, context)
+        if isinstance(value, int) and not isinstance(value, bool) and value > 0
+    ]
+    if not known:
+        return None
+    window = min(known)
+    buffer = _compaction_buffer(settings, allow_percent=True)
+    if isinstance(buffer, str):
+        buffer = math.floor(window * float(buffer[:-1]) / 100 + 0.5)
+    if buffer is not None and buffer < window:
+        return window - buffer
+    reserve_min = (
+        _COMPACTION_RESERVE_MIN if window >= 2 * _COMPACTION_RESERVE_MIN else 0
+    )
+    return window - max(math.floor(window * _COMPACTION_RESERVE_SHARE), reserve_min)
 
 
 def preflight_runtime(
@@ -1474,6 +1548,7 @@ def preflight_runtime(
     model_spec: str | None,
     config_file: str | None,
     restrict_model: bool,
+    opencode_version: tuple[int, int, int] | None = None,
     timeout: float = 15.0,
 ) -> dict[str, Any]:
     """Resolve and verify the selected model and all configured active agents."""
@@ -1553,7 +1628,7 @@ def preflight_runtime(
                         f"{resolved_limit.get(key)!r}, expected {value!r}"
                     )
             compaction_ceiling = _compaction_prompt_ceiling(
-                resolved_limit, config.get("compaction")
+                resolved_limit, config.get("compaction"), opencode_version
             )
             if compaction_ceiling is not None and compaction_ceiling <= 0:
                 raise RuntimeError(
@@ -2192,6 +2267,9 @@ def main() -> None:
     work_dir = Path(args.work_dir).resolve()
     instruction = Path(args.instruction_file).read_text()
     binary = resolve_binary(args.binary)
+    # Probed once the termination handler is installed, so a stop request
+    # during the probe still finalizes; finalization probes if it never ran.
+    binary_version: str | None = None
 
     home = os.environ.get("HOME") or str(Path.home())
     # Generate the authentication secret inside the trial runner. It is shared
@@ -2271,6 +2349,7 @@ def main() -> None:
     signal.signal(signal.SIGTERM, handle_termination)
 
     try:
+        binary_version = probe_binary_version(binary)
         recorder.stage("server-starting")
         # Durable before readiness: a runner that dies mid-startup must still
         # leave the server killable from outside.
@@ -2294,6 +2373,7 @@ def main() -> None:
             model_spec=model_spec,
             config_file=args.config_file,
             restrict_model=args.restrict_model,
+            opencode_version=_parse_version(binary_version),
         )
         (logs_dir / "opencode-v2-preflight.json").write_text(
             json.dumps(preflight, indent=2) + "\n"
@@ -2583,18 +2663,8 @@ def main() -> None:
     os.replace(sessions_temporary, sessions_dump)
     dump_jsonl(logs_dir / "opencode-v2-raw-pages.jsonl", server.raw_pages)
 
-    try:
-        version_result = subprocess.run(
-            [binary, "--version"],
-            capture_output=True,
-            text=True,
-            timeout=10,
-            check=False,
-        )
-        binary_version = (version_result.stdout or version_result.stderr).strip()
-    except (OSError, subprocess.SubprocessError) as error:
-        binary_version = f"unavailable: {type(error).__name__}: {error}"
-
+    if binary_version is None:
+        binary_version = probe_binary_version(binary)
     collection_complete = _collection_complete(
         settled=settled,
         errors=collection_errors,
