@@ -246,6 +246,18 @@ class TestRunCommand:
         assert env["ANTHROPIC_OAUTH_TOKEN"] == "oauth"
 
     @pytest.mark.asyncio
+    async def test_azure_endpoint_env_is_forwarded(
+        self, tmp_path: Path, fake_environment, monkeypatch: pytest.MonkeyPatch
+    ):
+        monkeypatch.setenv("AZURE_OPENAI_API_KEY", "az-key")
+        monkeypatch.setenv("AZURE_OPENAI_RESOURCE_NAME", "my-resource")
+        agent = Pi(logs_dir=tmp_path, model_name="azure/gpt-5.6-luna")
+        await self._run(agent, fake_environment)
+        env = fake_environment.envs[-1]
+        assert env["AZURE_OPENAI_API_KEY"] == "az-key"
+        assert env["AZURE_OPENAI_RESOURCE_NAME"] == "my-resource"
+
+    @pytest.mark.asyncio
     async def test_ambient_keys_are_scoped_to_the_provider(
         self, tmp_path: Path, fake_environment, monkeypatch: pytest.MonkeyPatch
     ):
@@ -397,6 +409,15 @@ class TestNetworkAllowlist:
             },
         )
         assert "gateway.example.com" in self._domains(agent)
+
+    @pytest.mark.parametrize("provider", ["azure", "azure-openai-responses"])
+    def test_azure_endpoint_is_allowlisted(self, tmp_path: Path, provider: str):
+        agent = Pi(
+            logs_dir=tmp_path,
+            model_name=f"{provider}/gpt-5.6-luna",
+            extra_env={"AZURE_OPENAI_BASE_URL": "https://gw.example.com/openai/v1"},
+        )
+        assert {".openai.azure.com", "gw.example.com"} <= self._domains(agent)
 
     def test_no_allowlist_without_provider_prefix(self, tmp_path: Path):
         agent = Pi(logs_dir=tmp_path, model_name="gpt-5.6-luna")

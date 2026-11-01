@@ -37,3 +37,23 @@ def test_total_cost_respects_cost_basis(tmp_path: Path, model_usage, expected):
     _write_result(tmp_path, model_usage)
     agent = ClaudeCode(logs_dir=tmp_path, model_name="deepseek-v4p1-flash[1m]")
     assert agent._parse_total_cost_from_stream_json() == expected
+
+
+def test_unknown_basis_in_any_result_taints_the_total(tmp_path: Path):
+    lines = [
+        {
+            "type": "result",
+            "total_cost_usd": 0.05,
+            "modelUsage": {"m": {"costUSD": 0.05, "costBasis": "unknown"}},
+        },
+        {
+            "type": "result",
+            "total_cost_usd": 0.07,
+            "modelUsage": {"m": {"costUSD": 0.07, "costBasis": "managed"}},
+        },
+    ]
+    (tmp_path / "claude-code.txt").write_text(
+        "".join(json.dumps(line) + "\n" for line in lines)
+    )
+    agent = ClaudeCode(logs_dir=tmp_path, model_name="m")
+    assert agent._parse_total_cost_from_stream_json() is None

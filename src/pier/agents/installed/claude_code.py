@@ -667,6 +667,7 @@ class ClaudeCode(BaseInstalledAgent):
             content = stream_path.read_text(encoding="utf-8")
         except OSError:
             return None
+        results: list[dict[str, Any]] = []
         for line in content.split("\n"):
             line = line.strip()
             if not line or not line.startswith("{"):
@@ -675,24 +676,28 @@ class ClaudeCode(BaseInstalledAgent):
                 event = json.loads(line)
             except json.JSONDecodeError:
                 continue
-            if event.get("type") == "result":
-                cost = event.get("total_cost_usd")
-                if cost is None:
-                    return None
-                # `costBasis: "unknown"` (newer Claude Code) means no price
-                # matched the model ID and the cost is a guess at the default
-                # model's rate, so it is not a measurement.
-                model_usage = event.get("modelUsage")
-                if isinstance(model_usage, dict) and any(
-                    isinstance(usage, dict) and usage.get("costBasis") == "unknown"
-                    for usage in model_usage.values()
-                ):
-                    return None
-                try:
-                    return float(cost)
-                except (TypeError, ValueError):
-                    return None
-        return None
+            if isinstance(event, dict) and event.get("type") == "result":
+                results.append(event)
+        if not results:
+            return None
+        # `costBasis: "unknown"` (newer Claude Code) means no price matched the
+        # model ID and the cost is a guess at the default model's rate, so it
+        # is not a measurement. The basis is the latest request's, so any
+        # result reporting it taints the cumulative total.
+        for event in results:
+            model_usage = event.get("modelUsage")
+            if isinstance(model_usage, dict) and any(
+                isinstance(usage, dict) and usage.get("costBasis") == "unknown"
+                for usage in model_usage.values()
+            ):
+                return None
+        cost = results[0].get("total_cost_usd")
+        if cost is None:
+            return None
+        try:
+            return float(cost)
+        except (TypeError, ValueError):
+            return None
 
     @staticmethod
     def _first_event_model(
@@ -1292,8 +1297,8 @@ class ClaudeCode(BaseInstalledAgent):
             "ENABLE_BACKGROUND_TASKS": "1",
             # Newer Claude Code retries a flagged request on another model, also
             # for gateway model names it does not recognize. That would move a
-            # benchmark run off its model (see the pinning below); agent.env can
-            # still re-enable it.
+            # benchmark run off its model (see the pinning below). Setting it to
+            # "" in agent.env re-enables it; any non-empty value disables it.
             "CLAUDE_CODE_DISABLE_REFUSAL_FALLBACK": "1",
         }
 

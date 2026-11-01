@@ -110,9 +110,18 @@ class Pi(BaseInstalledAgent):
             "ANTHROPIC_OAUTH_TOKEN",
             "ANTHROPIC_BASE_URL",
         ),
-        # Pi 1.0.3 renamed `azure-openai-responses` to `azure`.
-        "azure": ("AZURE_OPENAI_API_KEY",),
-        "azure-openai-responses": ("AZURE_OPENAI_API_KEY",),
+        # Pi 1.0.3 renamed `azure-openai-responses` to `azure`. The endpoint
+        # comes from the base URL or the resource name.
+        "azure": (
+            "AZURE_OPENAI_API_KEY",
+            "AZURE_OPENAI_BASE_URL",
+            "AZURE_OPENAI_RESOURCE_NAME",
+        ),
+        "azure-openai-responses": (
+            "AZURE_OPENAI_API_KEY",
+            "AZURE_OPENAI_BASE_URL",
+            "AZURE_OPENAI_RESOURCE_NAME",
+        ),
         "cerebras": ("CEREBRAS_API_KEY",),
         "deepseek": ("DEEPSEEK_API_KEY",),
         "github-copilot": ("GITHUB_TOKEN",),
@@ -149,6 +158,9 @@ class Pi(BaseInstalledAgent):
 
     _DEFAULT_PROVIDER_DOMAINS: dict[str, list[str]] = {
         "anthropic": ["api.anthropic.com"],
+        # AZURE_OPENAI_RESOURCE_NAME resolves to <name>.openai.azure.com.
+        "azure": [".openai.azure.com"],
+        "azure-openai-responses": [".openai.azure.com"],
         "deepseek": ["api.deepseek.com"],
         "google": [".googleapis.com"],
         "groq": ["api.groq.com"],
@@ -323,6 +335,11 @@ class Pi(BaseInstalledAgent):
         # pi spells the key `baseUrl`, which is not one of collect_url_values'
         # defaults, so it has to be requested explicitly.
         urls = list(self._base_url_values())
+        urls.extend(
+            value
+            for key in self._PROVIDER_ENVS.get(provider, ())
+            if key.endswith("_BASE_URL") and (value := self._get_env(key))
+        )
         urls.extend(
             collect_url_values(
                 self._build_models_config(),

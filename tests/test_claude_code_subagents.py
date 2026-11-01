@@ -624,12 +624,13 @@ async def test_refusal_fallback_can_be_reenabled_from_agent_env(tmp_path: Path):
     agent = ClaudeCode(
         logs_dir=tmp_path,
         model_name="anthropic/claude-opus-4-6",
-        extra_env={"CLAUDE_CODE_DISABLE_REFUSAL_FALLBACK": "0"},
+        extra_env={"CLAUDE_CODE_DISABLE_REFUSAL_FALLBACK": ""},
     )
     environment = FakeEnvironment()
     await agent.run("Fix the bug", cast(BaseEnvironment, environment), AgentContext())
 
-    assert environment.envs[-1]["CLAUDE_CODE_DISABLE_REFUSAL_FALLBACK"] == "0"
+    # Claude Code disables the fallback for any non-empty value.
+    assert environment.envs[-1].get("CLAUDE_CODE_DISABLE_REFUSAL_FALLBACK", "") == ""
 
 
 @pytest.mark.asyncio
