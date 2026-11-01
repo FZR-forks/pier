@@ -366,10 +366,12 @@ class Codex(BaseInstalledAgent):
         # Codex >= 0.16x also writes a `token_usage_record` per completed
         # response with an ID. Some billed responses never reach the
         # cumulative `token_count`: remote compactions, and responses whose
-        # tools were still running at a timeout. A record is covered when it
-        # fits in the growth of the cumulative total since the previous
-        # snapshot (`last_token_usage` is not reliable: Codex keeps it unchanged
-        # for spending-only updates); uncovered records are added on top.
+        # tools were still running at a timeout. A thread's responses are
+        # sequential and each one's `token_count` precedes the next record, so
+        # a record can only be covered by the first snapshot after it, when it
+        # fits in that snapshot's growth. (`last_token_usage` is not reliable:
+        # Codex keeps it unchanged for spending-only updates.) Uncovered
+        # records are added on top.
         thread_id, _, _ = Codex._rollout_thread_ids(raw_events)
         counted = ("input_tokens", "cached_input_tokens", "output_tokens")
 
@@ -379,6 +381,7 @@ class Codex(BaseInstalledAgent):
                 for key in counted
             ]
 
+        fresh: list[dict[str, Any]] = []
         unmatched: list[dict[str, Any]] = []
         previous = amounts(initial_total_usage or {})
         for event in raw_events:
@@ -389,7 +392,7 @@ class Codex(BaseInstalledAgent):
                 if isinstance(payload.get("usage"), dict) and (
                     thread_id is None or payload.get("thread_id") in (None, thread_id)
                 ):
-                    unmatched.append(payload["usage"])
+                    fresh.append(payload["usage"])
                 continue
             info = payload.get("info") if payload.get("type") == "token_count" else None
             total = info.get("total_token_usage") if isinstance(info, dict) else None
@@ -399,15 +402,15 @@ class Codex(BaseInstalledAgent):
             if not any(current):
                 continue  # a context-overflow marker, not a usage report
             room = [now - before for now, before in zip(current, previous)]
-            remaining: list[dict[str, Any]] = []
-            for record in unmatched:
+            for record in reversed(fresh):
                 usage = amounts(record)
                 if all(used <= free for used, free in zip(usage, room)):
                     room = [free - used for used, free in zip(usage, room)]
                 else:
-                    remaining.append(record)
-            unmatched = remaining
+                    unmatched.append(record)
+            fresh = []
             previous = current
+        unmatched.extend(fresh)
 
         final_total_usage: dict[str, Any] | None = None
         saw_context_full_snapshot = False

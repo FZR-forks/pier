@@ -737,3 +737,32 @@ def test_remote_compaction_response_is_billed(tmp_path: Path):
     final = _convert(tmp_path).final_metrics
 
     assert (final.total_prompt_tokens, final.total_completion_tokens) == (51_500, 460)
+
+
+def test_older_compaction_record_does_not_take_a_later_responses_growth(
+    tmp_path: Path,
+):
+    """A later, larger response must not be mistaken for an earlier remote
+    compaction whose usage the snapshots never included."""
+
+    def token_count(total: tuple[int, int], last: tuple[int, int]) -> dict:
+        event = _token_count(*total)
+        event["payload"]["info"]["last_token_usage"] = _usage_record(*last)["payload"][
+            "usage"
+        ]
+        return event
+
+    events = _thread_events(ROOT, None, model=ROOT_MODEL)
+    events += [
+        _usage_record(30_000, 100),
+        token_count((30_000, 100), (30_000, 100)),
+        _usage_record(20_000, 300),  # remote compaction
+        token_count((30_000, 100), (0, 0)),
+        _usage_record(30_000, 500),
+        token_count((60_000, 600), (30_000, 500)),
+    ]
+    _write_rollout(tmp_path, f"rollout-{ROOT}.jsonl", events)
+
+    final = _convert(tmp_path).final_metrics
+
+    assert (final.total_prompt_tokens, final.total_completion_tokens) == (80_000, 900)
