@@ -1458,17 +1458,21 @@ def probe_binary_version(binary: str) -> str:
             timeout=10,
             check=False,
         )
-        return (result.stdout or result.stderr).strip()
+        output = (result.stdout or result.stderr).strip()
+        if result.returncode != 0:
+            return f"unavailable: exit {result.returncode}: {output}"
+        return output
     except (OSError, subprocess.SubprocessError) as error:
         return f"unavailable: {type(error).__name__}: {error}"
 
 
 def _parse_version(text: str) -> tuple[int, int, int] | None:
-    """``(major, minor, patch)`` from ``opencode --version`` output."""
-    if not text or text.startswith("unavailable:"):
-        # A failed probe's error text may name a versioned path.
-        return None
-    match = re.search(r"(\d+)\.(\d+)\.(\d+)", text)
+    """``(major, minor, patch)`` from ``opencode --version`` output.
+
+    Only a plain release version counts: failed probes and prerelease or
+    development builds are unknown, so no release's rule is assumed.
+    """
+    match = re.fullmatch(r"(?:opencode\s+)?v?(\d+)\.(\d+)\.(\d+)", (text or "").strip())
     return (int(match[1]), int(match[2]), int(match[3])) if match else None
 
 
@@ -1499,6 +1503,7 @@ def _compaction_prompt_ceiling(
     limit: dict[str, Any],
     compaction: Any,
     version: tuple[int, int, int] | None,
+    model_compaction: Any = None,
 ) -> int | None:
     """Prompt size at which OpenCode auto-compacts.
 
@@ -1524,19 +1529,33 @@ def _compaction_prompt_ceiling(
         ceiling = context - reserved
         if isinstance(input_limit, int):
             ceiling = min(ceiling, input_limit - buffer)
+        # A model's provider-mode compaction policy can set a lower threshold.
+        policy = model_compaction if isinstance(model_compaction, dict) else {}
+        threshold = policy.get("threshold")
+        if (
+            policy.get("mode") == "provider"
+            and isinstance(threshold, (int, float))
+            and not isinstance(threshold, bool)
+        ):
+            ceiling = min(ceiling, int(threshold))
         return ceiling
     if version < _COMPACTION_CURRENT_FROM:
         return None
-    # Mirrors 2.2.5 ``calculateCeiling``: the window is the lower of the known
-    # input and context limits; a buffer that leaves no room is ignored.
-    known = [
-        value
-        for value in (input_limit, context)
-        if isinstance(value, int) and not isinstance(value, bool) and value > 0
-    ]
-    if not known:
+
+    # Mirrors 2.2.5 ``calculateCeiling``: the window is the lower of the input
+    # and context limits when both are set (JavaScript truthiness: any nonzero
+    # number), else whichever is set; a buffer that leaves no room is ignored.
+    def is_set(value: Any) -> bool:
+        return isinstance(value, int) and not isinstance(value, bool) and value != 0
+
+    if is_set(input_limit) and is_set(context):
+        window = min(input_limit, context)
+    else:
+        window = (
+            input_limit if is_set(input_limit) else context if is_set(context) else 0
+        )
+    if window <= 0:
         return None
-    window = min(known)
     buffer = _compaction_buffer(settings, allow_percent=True)
     if isinstance(buffer, str):
         buffer = math.floor(window * float(buffer[:-1]) / 100 + 0.5)
@@ -1634,7 +1653,10 @@ def preflight_runtime(
                         f"{resolved_limit.get(key)!r}, expected {value!r}"
                     )
             compaction_ceiling = _compaction_prompt_ceiling(
-                resolved_limit, config.get("compaction"), opencode_version
+                resolved_limit,
+                config.get("compaction"),
+                opencode_version,
+                selected.get("compaction"),
             )
             if compaction_ceiling is not None and compaction_ceiling <= 0:
                 raise RuntimeError(

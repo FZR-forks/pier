@@ -652,6 +652,9 @@ def test_unreported_cache_writes_stay_absent_from_metrics(tmp_path: Path) -> Non
             "Script completed\nOutput:\nOK\n",
         ),
         ('{"output": "plain", "metadata": {"exit_code": 0}}', "plain"),
+        # A tool that printed a JSON array keeps its output.
+        ('["a", "b"]', '["a", "b"]'),
+        ("[]", "[]"),
         ("not json", "not json"),
     ],
 )
@@ -766,3 +769,99 @@ def test_older_compaction_record_does_not_take_a_later_responses_growth(
     final = _convert(tmp_path).final_metrics
 
     assert (final.total_prompt_tokens, final.total_completion_tokens) == (80_000, 900)
+
+
+def _snapshot(
+    total: tuple[int, int], last: tuple[int, int], window: int | None = None
+) -> dict:
+    event = _token_count(*total)
+    event["payload"]["info"]["last_token_usage"] = _usage_record(*last)["payload"][
+        "usage"
+    ]
+    if window is not None:
+        event["payload"]["info"]["model_context_window"] = window
+    return event
+
+
+def test_usage_before_an_overflow_reset_is_kept(tmp_path: Path):
+    """After a context overflow Codex zeroes its counter and accumulates anew."""
+    overflow = _token_count(0, 0)
+    overflow["payload"]["info"]["total_token_usage"]["total_tokens"] = 95_000
+    overflow["payload"]["info"]["model_context_window"] = 95_000
+    events = _thread_events(ROOT, None, model=ROOT_MODEL)
+    events += [
+        _usage_record(30_000, 100),
+        _snapshot((30_000, 100), (30_000, 100)),
+        overflow,
+        {
+            "type": "response_item",
+            "payload": {
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "again"}],
+            },
+        },
+        _usage_record(1_000, 10),
+        _snapshot((1_000, 10), (1_000, 10)),
+    ]
+    _write_rollout(tmp_path, f"rollout-{ROOT}.jsonl", events)
+
+    final = _convert(tmp_path).final_metrics
+
+    assert (final.total_prompt_tokens, final.total_completion_tokens) == (31_000, 110)
+
+
+def test_incomplete_response_step_gets_its_own_usage(tmp_path: Path):
+    """A spending-only update keeps the previous `last_token_usage`."""
+    message = {
+        "type": "response_item",
+        "payload": {
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": "x"}],
+        },
+    }
+    events = _thread_events(ROOT, None, model=ROOT_MODEL)
+    events += [
+        _usage_record(10_000, 100),
+        _snapshot((10_000, 100), (10_000, 100)),
+        dict(message),
+        _snapshot((40_000, 600), (10_000, 100)),  # incomplete, no record
+    ]
+    _write_rollout(tmp_path, f"rollout-{ROOT}.jsonl", events)
+
+    trajectory = _convert(tmp_path)
+
+    prompts = [s.metrics.prompt_tokens for s in trajectory.steps if s.metrics]
+    assert prompts == [10_000, 30_000]
+    assert trajectory.final_metrics.total_prompt_tokens == 40_000
+
+
+def test_async_compaction_is_rejected(tmp_path: Path):
+    with pytest.raises(ValueError, match="async_compaction"):
+        Codex(
+            logs_dir=tmp_path,
+            model_name=ROOT_MODEL,
+            config_toml="[features]\nasync_compaction = true\n",
+        )
+
+
+def test_rewritten_fork_checkpoint_still_matches_its_parent():
+    """A fork clears checkpoint metadata on the copied `compacted` item."""
+    parent = {
+        "type": "compacted",
+        "payload": {
+            "message": "summary",
+            "compaction_response_id": "resp_2",
+            "window_id": "w1",
+            "latest_token_usage_record": {"usage": {"input_tokens": 1}},
+            "resume_metadata": {"turn_attribution": {"turn_id": "t"}},
+        },
+    }
+    child = json.loads(json.dumps(parent))
+    child["payload"]["latest_token_usage_record"] = None
+    child["payload"]["resume_metadata"]["turn_attribution"] = None
+    assert Codex._same_rollout_event(child, parent)
+    other = json.loads(json.dumps(child))
+    other["payload"]["compaction_response_id"] = "resp_9"
+    assert not Codex._same_rollout_event(other, parent)

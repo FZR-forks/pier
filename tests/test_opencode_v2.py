@@ -3460,6 +3460,7 @@ def _preflight_with_limits(
     resolved_limit: dict,
     compaction: dict | None = None,
     version: tuple[int, int, int] | None = (2, 0, 8),
+    model_compaction: dict | None = None,
 ) -> dict:
     config: dict = {
         "providers": {
@@ -3490,6 +3491,7 @@ def _preflight_with_limits(
                     "id": "gpt-5.6-luna",
                     "variants": [{"id": "low"}],
                     "limit": resolved_limit,
+                    **({"compaction": model_compaction} if model_compaction else {}),
                 }
             ]
         return []
@@ -3595,10 +3597,51 @@ def test_preflight_does_not_guess_unmirrored_compaction_ceiling(
     assert result["compaction_prompt_ceiling"] is None
 
 
+def test_legacy_provider_compaction_threshold_lowers_ceiling(
+    tmp_path: Path, monkeypatch
+):
+    # OpenCode 2.0.8 takes min(policy.threshold, prompt ceiling) in provider mode.
+    result = _preflight_with_limits(
+        tmp_path,
+        monkeypatch,
+        {"context": 400000, "input": 272000, "output": 128000},
+        model_compaction={"mode": "provider", "threshold": 100000},
+    )
+    assert result["compaction_prompt_ceiling"] == 100000
+
+
+def test_current_rule_follows_javascript_truthiness_for_signed_limits(
+    tmp_path: Path, monkeypatch
+):
+    # 2.2.5: a negative input limit is "set", so the window is negative and
+    # automatic compaction never triggers.
+    result = _preflight_with_limits(
+        tmp_path,
+        monkeypatch,
+        {"context": 100000, "input": -1, "output": 8192},
+        version=(2, 2, 5),
+    )
+    assert result["compaction_prompt_ceiling"] is None
+
+
+def test_failed_version_probe_is_unavailable(tmp_path: Path):
+    binary = tmp_path / "opencode"
+    binary.write_text(
+        "#!/bin/sh\necho 'fatal: cannot initialize /opt/opencode-2.2.5/opencode'\n"
+        "exit 1\n"
+    )
+    binary.chmod(0o755)
+    probed = runner_module.probe_binary_version(str(binary))
+    assert probed.startswith("unavailable: exit 1:")
+    assert runner_module._parse_version(probed) is None
+
+
 def test_parse_opencode_version():
     assert runner_module._parse_version("opencode v2.2.5") == (2, 2, 5)
     assert runner_module._parse_version("2.0.8\n") == (2, 0, 8)
     assert runner_module._parse_version("unavailable: OSError") is None
+    assert runner_module._parse_version("0.0.0-dev-408") is None
+    assert runner_module._parse_version("opencode v2.2.6-beta.1") is None
     assert (
         runner_module._parse_version(
             "unavailable: TimeoutExpired: /opt/opencode-2.2.5/opencode timed out"
