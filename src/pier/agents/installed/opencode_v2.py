@@ -40,6 +40,7 @@ from pier.agents.installed.opencode import OpenCode
 from pier.agents.network import allowlist_from_urls, collect_url_values
 from pier.environments.base import BaseEnvironment
 from pier.models.agent.context import AgentContext
+from pier.models.agent.session_usage import SessionUsage
 from pier.models.agent.install import AgentInstallSpec, InstallStep
 from pier.models.agent.name import AgentName
 from pier.models.agent.network import NetworkAllowlist
@@ -1537,7 +1538,9 @@ class OpenCodeV2(BaseInstalledAgent):
         if not path.exists():
             return []
         records: list[dict[str, Any]] = []
-        for line in path.read_text().splitlines():
+        # NEL and Unicode line/paragraph separators are valid inside JSON
+        # strings, not JSONL delimiters.
+        for line in path.read_text(encoding="utf-8").split("\n"):
             line = line.strip()
             if not line:
                 continue
@@ -1653,7 +1656,7 @@ class OpenCodeV2(BaseInstalledAgent):
             "cost": 0.0,
         }
         summarization_count = 0
-        incomplete = malformed_messages
+        incomplete = malformed_messages or bool(inspection.get("active"))
         usage_seen = False
         cost_complete = True
         failed_attempts = 0
@@ -1709,7 +1712,8 @@ class OpenCodeV2(BaseInstalledAgent):
                             f"{message.get('id', 'unknown')}:{actual_model}"
                         )
                 step, contribution, message_incomplete = self._compaction_step(message)
-                summarization_count += 1
+                if str(message.get("status") or "completed") == "completed":
+                    summarization_count += 1
                 incomplete = incomplete or message_incomplete
             elif message_type == "idle":
                 if message.get("outcome"):
@@ -1764,6 +1768,9 @@ class OpenCodeV2(BaseInstalledAgent):
                 )
 
         final_extra: dict[str, Any] = {}
+        reported = self._session_reported_usage(session, complete=not incomplete)
+        if reported is not None:
+            final_extra["session_reported_usage"] = reported.model_dump()
         if usage_seen:
             final_extra["total_cache_write_input_tokens"] = totals["cache_write"]
             final_extra["total_reasoning_tokens"] = totals["reasoning"]
@@ -1791,9 +1798,7 @@ class OpenCodeV2(BaseInstalledAgent):
             extra=extra_with_context_metrics(
                 final_extra or None,
                 peak_context_tokens=peak_context_tokens_from_steps(steps),
-                summarization_count=summarization_count
-                if summarization_count
-                else None,
+                summarization_count=summarization_count,
             ),
         )
         if incomplete:
@@ -2324,6 +2329,36 @@ class OpenCodeV2(BaseInstalledAgent):
             len(trajectories) - 1 if subagent_count is None else subagent_count,
         )
 
+    @classmethod
+    def _session_reported_usage(
+        cls, session: dict[str, Any], *, complete: bool
+    ) -> SessionUsage | None:
+        tokens = cls._partial_usage_fields(session.get("tokens"))
+        cost = session.get("cost")
+        cost = (
+            float(cost)
+            if isinstance(cost, (int, float))
+            and not isinstance(cost, bool)
+            and cost >= 0
+            else None
+        )
+        if cost is None and all(value is None for value in tokens.values()):
+            return None
+
+        def total(*keys):
+            values = [tokens[key] for key in keys]
+            return sum(values) if all(value is not None for value in values) else None
+
+        return SessionUsage(
+            complete=complete
+            and cls._usage_record_complete(session.get("tokens"))
+            and cost is not None,
+            n_input_tokens=total("input", "cache_read", "cache_write"),
+            n_output_tokens=total("output", "reasoning"),
+            n_cache_tokens=tokens["cache_read"],
+            cost_usd=cost,
+        )
+
     def _with_tree_metrics(self, root: Trajectory, subagent_count: int) -> Trajectory:
         """Whole-tree totals on the root, with root-only figures in extra.
 
@@ -2437,6 +2472,11 @@ class OpenCodeV2(BaseInstalledAgent):
         tree_extra["tree_metrics_complete"] = complete
         tree_extra["tree_cost_complete"] = cost_complete
         tree_extra["tree_model_provenance_complete"] = model_provenance_complete
+        reported = self._collected_session_usage(
+            nodes, complete=complete and len(nodes) == subagent_count + 1
+        )
+        if reported:
+            tree_extra["session_reported_usage"] = reported.model_dump()
         if peak_context is not None:
             tree_extra["peak_context_tokens"] = peak_context
         if summarizations is not None:
@@ -2483,11 +2523,52 @@ class OpenCodeV2(BaseInstalledAgent):
         return Trajectory.model_validate(data)
 
     @staticmethod
+    def _collected_session_usage(
+        trajectories: list[Trajectory], *, complete: bool
+    ) -> SessionUsage | None:
+        # Collection can contain a valid descendant whose intermediate parent
+        # is missing. Its native session usage still belongs to the observation,
+        # independently of whether its trajectory can be attached to the root.
+        reported = [
+            SessionUsage.model_validate(
+                node.final_metrics.extra["session_reported_usage"]
+            )
+            for node in trajectories
+            if node.final_metrics
+            and node.final_metrics.extra
+            and node.final_metrics.extra.get("session_reported_usage")
+        ]
+        if not reported:
+            return None
+        totals = {}
+        for field in (
+            "n_input_tokens",
+            "n_cache_tokens",
+            "n_output_tokens",
+            "cost_usd",
+        ):
+            values = [getattr(item, field) for item in reported]
+            totals[field] = (
+                sum(values) if all(value is not None for value in values) else None
+            )
+        return SessionUsage(
+            complete=complete
+            and len(reported) == len(trajectories)
+            and all(item.complete for item in reported),
+            **totals,
+        )
+
+    @staticmethod
     def _mark_collection_incomplete(root: Trajectory) -> Trajectory:
         """Withhold aggregates when the runner could not prove full collection."""
         data = root.to_json_dict()
         metrics = data.get("final_metrics") or {}
         extra = dict(metrics.get("extra") or {})
+        if extra.get("session_reported_usage"):
+            extra["session_reported_usage"] = {
+                **extra["session_reported_usage"],
+                "complete": False,
+            }
         extra.update(
             {
                 "metrics_complete": False,
@@ -2513,6 +2594,10 @@ class OpenCodeV2(BaseInstalledAgent):
         context: AgentContext, metrics: FinalMetrics | None
     ) -> None:
         """Keep withheld token totals unknown instead of coercing them to zero."""
+        if metrics is not None and (metrics.extra or {}).get("session_reported_usage"):
+            context.session_reported_usage = SessionUsage.model_validate(
+                metrics.extra["session_reported_usage"]
+            )
         if metrics is None or any(
             value is None
             for value in (
@@ -2646,7 +2731,9 @@ class OpenCodeV2(BaseInstalledAgent):
         stream = base / "opencode-v2-cli-stream.jsonl"
         if stream.exists():
             try:
-                lines = stream.read_text(errors="replace").splitlines()
+                lines = stream.read_text(errors="replace").split("\n")
+                if lines and not lines[-1]:
+                    lines.pop()
             except OSError:
                 lines = []
             if lines:
@@ -2803,7 +2890,9 @@ class OpenCodeV2(BaseInstalledAgent):
                 "Ignoring %d malformed OpenCode V2 session inspection record(s)",
                 len(inspections) - len(valid_inspections),
             )
-        inspections = valid_inspections
+        inspections = list(
+            {record["session"]["id"]: record for record in valid_inspections}.values()
+        )
         if not inspections:
             # Only read now: the CLI stream can be large and a successful
             # collection never looks at it.
@@ -2949,6 +3038,22 @@ class OpenCodeV2(BaseInstalledAgent):
             or not attachment_complete
         ):
             embedded = self._mark_collection_incomplete(embedded)
+
+        # Use every validated, deduplicated collected session, not just the
+        # connected portion of the reconstructed trajectory tree.
+        reported = self._collected_session_usage(
+            trajectories,
+            complete=not (
+                (embedded.final_metrics.extra or {}).get("collection_incomplete")
+                or (embedded.final_metrics.extra or {}).get("tree_metrics_complete")
+                is False
+            ),
+        )
+        if reported:
+            embedded.final_metrics.extra = {
+                **(embedded.final_metrics.extra or {}),
+                "session_reported_usage": reported.model_dump(),
+            }
 
         trajectory_path = self.logs_dir / "trajectory.json"
         try:

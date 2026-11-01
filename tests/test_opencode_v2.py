@@ -147,6 +147,110 @@ def write_inspections(
     )
 
 
+def test_jsonl_unicode_separators_and_crlf_preserve_usage(tmp_path):
+    records = OpenCodeV2._read_jsonl(FIXTURES / "unicode_separators.jsonl")
+    assert len(records) == 1
+    dump = tmp_path / "unicode.jsonl"
+    dump.write_bytes((json.dumps(records[0], ensure_ascii=False) + "\r\n").encode())
+    assert OpenCodeV2._read_jsonl(dump) == records
+    write_inspections(tmp_path, records)
+    context = AgentContext()
+    make_agent(tmp_path).populate_context_post_run(context)
+    assert context.n_input_tokens == 19
+    assert context.n_output_tokens == 5
+    trajectory = json.loads((tmp_path / "trajectory.json").read_text())
+    assert trajectory["steps"][0]["message"] == "NEL: \u0085; LS: \u2028; PS: \u2029"
+
+
+@pytest.mark.parametrize("incomplete", [False, True])
+def test_session_running_totals_survive_incomplete_tree_collection(
+    tmp_path, incomplete
+):
+    inspections = load_fixture()
+    if incomplete:
+        inspections[1]["messages"][1].pop("tokens")
+    write_inspections(tmp_path, inspections)
+    if incomplete:
+        (tmp_path / "opencode-v2" / "runner-result.json").unlink()
+    context = AgentContext()
+    make_agent(tmp_path).populate_context_post_run(context)
+    reported = context.session_reported_usage
+    assert reported.complete is not incomplete
+    assert (
+        reported.n_input_tokens,
+        reported.n_cache_tokens,
+        reported.n_output_tokens,
+        reported.cost_usd,
+    ) == (223, 30, 120, 4.5)
+    assert context.n_input_tokens == (None if incomplete else 223)
+    assert context.cost_usd == (None if incomplete else 4.5)
+    saved = AgentContext.model_validate_json(context.model_dump_json())
+    assert saved.session_reported_usage == reported
+
+
+def test_partial_session_categories_are_unknown_not_zero(tmp_path):
+    agent = make_agent(tmp_path)
+    reported = agent._session_reported_usage(
+        {"id": "partial", "tokens": {"input": 10, "cache": {"read": 0}}, "cost": 0},
+        complete=False,
+    )
+    assert reported.n_input_tokens is reported.n_output_tokens is None
+    assert reported.n_cache_tokens == reported.cost_usd == 0
+    assert reported.complete is False
+
+
+def test_active_session_and_duplicate_snapshots_cannot_report_complete_usage(tmp_path):
+    inspections = load_fixture()
+    inspections[0]["active"] = {"running": True}
+    write_inspections(tmp_path, inspections + [inspections[0]])
+    context = AgentContext()
+    make_agent(tmp_path).populate_context_post_run(context)
+    assert context.n_input_tokens is None
+    assert context.session_reported_usage.complete is False
+    assert context.session_reported_usage.n_input_tokens == 223
+
+
+@pytest.mark.parametrize("missing_parent", [False, True])
+def test_all_collected_session_usage_survives_missing_intermediate_parent(
+    tmp_path, missing_parent
+):
+    inspections = load_fixture()
+    if missing_parent:
+        inspections[1]["session"]["parentID"] = "missing-intermediate"
+    write_inspections(tmp_path, inspections + [copy.deepcopy(inspections[1])])
+    manifest = tmp_path / "opencode-v2" / "runner-result.json"
+    manifest.write_text(
+        json.dumps(
+            {
+                "root_id": inspections[0]["session"]["id"],
+                "collection_complete": not missing_parent,
+                "discovered_session_ids": [
+                    item["session"]["id"] for item in inspections
+                ]
+                + (["missing-intermediate"] if missing_parent else []),
+            }
+        )
+    )
+    context = AgentContext()
+    make_agent(tmp_path).populate_context_post_run(context)
+    usage = context.session_reported_usage
+    assert (
+        usage.n_input_tokens,
+        usage.n_cache_tokens,
+        usage.n_output_tokens,
+        usage.cost_usd,
+    ) == (223, 30, 120, 4.5)
+    assert usage.complete is not missing_parent
+    trajectory = json.loads((tmp_path / "trajectory.json").read_text())
+    assert (
+        trajectory["final_metrics"]["extra"]["session_reported_usage"]
+        == usage.model_dump()
+    )
+    if missing_parent:
+        assert context.n_input_tokens is context.cost_usd is None
+        assert not trajectory.get("subagent_trajectories")
+
+
 # ---------------------------------------------------------------------------
 # Registration and naming
 # ---------------------------------------------------------------------------
@@ -716,9 +820,7 @@ def test_provider_urls_are_not_restricted_by_adapter(tmp_path: Path):
         agent = make_agent(
             tmp_path,
             opencode_v2_config={
-                "providers": {
-                    "litellm": {"settings": {"baseURL": base_url}}
-                }
+                "providers": {"litellm": {"settings": {"baseURL": base_url}}}
             },
         )
         assert expected_host in agent.network_allowlist().domains
@@ -2182,7 +2284,8 @@ def test_failed_compaction_marks_incomplete(tmp_path: Path):
     assert final["total_prompt_tokens"] == 5
     assert final["total_completion_tokens"] == 0
     assert final["extra"]["failed_attempts"] == 1
-    assert final["extra"]["compacted"] is True
+    assert final["extra"]["summarization_count"] == 0
+    assert not final["extra"].get("compacted", False)
 
 
 # ---------------------------------------------------------------------------

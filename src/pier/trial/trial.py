@@ -950,11 +950,12 @@ class Trial:
         )
         return artifacts_dir
 
-    async def run(self) -> TrialResult:
+    async def run(self, *, attempt: int = 1) -> TrialResult:
         self._trial_paths.trial_dir.mkdir(parents=True, exist_ok=True)
         self._trial_paths.config_path.write_text(self.config.model_dump_json(indent=4))
 
         self._result = TrialResult(
+            attempt=attempt,
             trial_name=self.config.trial_name,
             task_name=self._task.name,
             task_id=self.config.task.get_task_id(),
@@ -966,7 +967,17 @@ class Trial:
             source=self.config.task.source,
         )
 
-        await self._invoke_hooks(TrialEvent.START)
+        try:
+            await self._invoke_hooks(TrialEvent.START)
+        except asyncio.CancelledError as exc:
+            # A replacement may be cancelled in its first hook, before the
+            # normal try/finally. Persist that attempt before notifying the job.
+            self.result.exception_info = ExceptionInfo.from_exception(exc)
+            try:
+                await self._cleanup_and_finalize()
+            finally:
+                self._close_logger_handler()
+            raise
 
         try:
             await self._setup_environment()

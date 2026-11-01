@@ -288,8 +288,8 @@ def start(
         list[str] | None,
         Option(
             "--retry-include",
-            help="Exception types to retry on. If not specified, all exceptions except "
-            "those in --retry-exclude are retried (can be used multiple times)",
+            help="Exception types to retry. Defaults to infrastructure failures only; "
+            "explicit includes override eligibility, exclusions take precedence (repeatable)",
             rich_help_panel="Job Settings",
             show_default=False,
         ),

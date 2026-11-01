@@ -41,10 +41,11 @@ def populate_context_from_final_metrics(
 ) -> None:
     """Copy trajectory final metrics into the run-level agent context."""
     context.cost_usd = metrics.total_cost_usd
-    context.n_input_tokens = metrics.total_prompt_tokens or 0
-    context.n_cache_tokens = metrics.total_cached_tokens or 0
-    context.n_output_tokens = metrics.total_completion_tokens or 0
+    context.n_input_tokens = metrics.total_prompt_tokens
+    context.n_cache_tokens = metrics.total_cached_tokens
+    context.n_output_tokens = metrics.total_completion_tokens
     extra = metrics.extra or {}
+    context.rejected_request_tokens = extra.get("rejected_request_tokens")
     peak_context_tokens = extra.get("peak_context_tokens")
     summarization_count = extra.get("summarization_count")
     context.peak_context_tokens = (

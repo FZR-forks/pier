@@ -27,7 +27,7 @@ from pier.models.job.config import (
     JobConfig,
 )
 from pier.models.job.lock import LOCK_FILENAME, JobLock, build_job_lock
-from pier.models.job.result import EvalsRewardsMap, JobResult, JobStats
+from pier.models.job.result import EvalsRewardsMap, JobResult, JobStats, RetryOverhead
 from pier.models.trial.config import TaskConfig, TrialConfig
 from pier.models.trial.paths import TrialPaths
 from pier.models.trial.result import TrialResult
@@ -438,6 +438,8 @@ class Job:
         self._refresh_metrics_for_eval(evals_key, dataset_name)
 
     def _write_job_result(self, *, exclude_trial_results: bool = False) -> None:
+        self._job_result.stats.update_usage(list(self._previous_trial_results.values()))
+        self._job_result.stats.retry_overhead = self._retry_overhead()
         if exclude_trial_results:
             result_json = self._job_result.model_dump_json(
                 indent=4,
@@ -446,6 +448,39 @@ class Job:
         else:
             result_json = self._job_result.model_dump_json(indent=4)
         self._job_result_path.write_text(result_json)
+
+    def _retry_overhead(self) -> RetryOverhead | None:
+        attempts = []
+        kept_ids = {result.id for result in self._previous_trial_results.values()}
+        for path in sorted((self.job_dir / ".retry-attempts").glob("*/*/result.json")):
+            try:
+                result = TrialResult.model_validate_json(path.read_text())
+                # During backoff the existing hooks still count this result
+                # as current. It becomes overhead when a replacement starts.
+                if result.id in kept_ids:
+                    continue
+                has_context = result.agent_result is not None or any(
+                    step.agent_result is not None for step in result.step_results or []
+                )
+                attempts.append(
+                    result.compute_token_cost_totals()
+                    if has_context
+                    else (0, 0, 0, 0.0)
+                )
+            except (ValueError, OSError):
+                # Count unreadable attempts without inventing zero spend.
+                attempts.append((None, None, None, None))
+        if not attempts:
+            return None
+        totals = {}
+        for index, field in enumerate(
+            ("n_input_tokens", "n_cache_tokens", "n_output_tokens", "cost_usd")
+        ):
+            values = [usage[index] for usage in attempts]
+            totals[field] = (
+                sum(values) if all(value is not None for value in values) else None
+            )
+        return RetryOverhead(n_attempts=len(attempts), **totals)
 
     async def _write_job_result_async(
         self, *, exclude_trial_results: bool = False
@@ -685,7 +720,9 @@ class Job:
                 )
 
                 if trial_result.verifier_result is not None:
-                    final_rewards[evals_key].append(trial_result.verifier_result.rewards)
+                    final_rewards[evals_key].append(
+                        trial_result.verifier_result.rewards
+                    )
                 else:
                     final_rewards[evals_key].append(None)
 

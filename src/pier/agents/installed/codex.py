@@ -30,11 +30,10 @@ from pier.models.trial.paths import EnvironmentPaths
 from pier.utils.env import parse_bool_env_value
 from pier.utils.trajectory_metrics import (
     extra_with_context_metrics,
+    peak_context_tokens_from_steps,
     populate_context_from_final_metrics,
 )
 from pier.utils.trajectory_utils import format_trajectory_json
-
-_COMPACTION_DROP_TOKEN_THRESHOLD = 10_000
 
 
 class Codex(BaseInstalledAgent):
@@ -310,9 +309,9 @@ class Codex(BaseInstalledAgent):
             extra["cache_write_input_tokens"] = cache_write_tokens
 
         return {
-            "prompt_tokens": prompt_tokens if prompt_tokens else None,
-            "completion_tokens": completion_tokens or None,
-            "cached_tokens": cached_tokens or None,
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "cached_tokens": cached_tokens,
             "extra": extra,
         }
 
@@ -442,22 +441,13 @@ class Codex(BaseInstalledAgent):
     def _extract_context_metrics(
         raw_events: list[dict[str, Any]],
     ) -> tuple[int | None, int | None]:
-        """Return best-effort (peak_context_tokens, summarization_count)."""
+        """Peak input only; output/reasoning changes are not compactions."""
         peak_context_tokens: int | None = None
-        window_peak: int | None = None
-        token_drop_summarization_count = 0
-        compacted_item_count = sum(
-            1 for event in raw_events if event.get("type") == "compacted"
-        )
-        context_compacted_event_count = 0
-        saw_usage = False
 
         for event in raw_events:
             if event.get("type") != "event_msg":
                 continue
             payload = event.get("payload", {})
-            if isinstance(payload, dict) and payload.get("type") == "context_compacted":
-                context_compacted_event_count += 1
             if not isinstance(payload, dict) or payload.get("type") != "token_count":
                 continue
             info = payload.get("info")
@@ -467,41 +457,28 @@ class Codex(BaseInstalledAgent):
             if not isinstance(last_usage, dict):
                 continue
 
-            context_tokens = last_usage.get("total_tokens")
-            if not isinstance(context_tokens, int):
-                context_tokens = last_usage.get("input_tokens")
-            if not isinstance(context_tokens, int):
+            context_tokens = last_usage.get("input_tokens")
+            if not isinstance(context_tokens, int) or isinstance(context_tokens, bool):
                 continue
 
-            saw_usage = True
             peak_context_tokens = (
                 context_tokens
                 if peak_context_tokens is None
                 else max(peak_context_tokens, context_tokens)
             )
-            if (
-                window_peak is not None
-                and context_tokens < window_peak - _COMPACTION_DROP_TOKEN_THRESHOLD
-            ):
-                token_drop_summarization_count += 1
-                window_peak = context_tokens
-            else:
-                window_peak = (
-                    context_tokens
-                    if window_peak is None
-                    else max(window_peak, context_tokens)
-                )
+        return peak_context_tokens, len(Codex._compaction_events(raw_events))
 
-        if not saw_usage:
-            summarization_count = compacted_item_count or context_compacted_event_count
-            return None, summarization_count if summarization_count else None
-
-        summarization_count = (
-            compacted_item_count
-            or context_compacted_event_count
-            or token_drop_summarization_count
-        )
-        return peak_context_tokens, summarization_count
+    @staticmethod
+    def _compaction_events(raw_events: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        # Codex can emit both forms for the same compaction. Prefer durable
+        # rollout items, using event messages only when those are absent.
+        return [event for event in raw_events if event.get("type") == "compacted"] or [
+            event
+            for event in raw_events
+            if event.get("type") == "event_msg"
+            and isinstance(event.get("payload"), dict)
+            and event["payload"].get("type") == "context_compacted"
+        ]
 
     def _convert_event_to_step(self, event: dict[str, Any], step_id: int) -> Step:
         """Convert a normalized Codex event dictionary into an ATIF step."""
@@ -1227,6 +1204,7 @@ class Codex(BaseInstalledAgent):
         api_call_metrics: dict[str, dict[str, Any]] = {}
         saw_model_output_in_api_call = False
         tool_order_counter = 0
+        compactions = {id(event) for event in self._compaction_events(raw_events)}
 
         def record_model_output() -> None:
             nonlocal saw_model_output_in_api_call
@@ -1252,6 +1230,21 @@ class Codex(BaseInstalledAgent):
             etype = event.get("type")
             payload = event.get("payload", {})
             timestamp = event.get("timestamp")
+
+            if id(event) in compactions:
+                normalized_events.append(
+                    {
+                        "kind": "message",
+                        "role": "system",
+                        "timestamp": timestamp,
+                        "text": str(payload.get("message") or "")
+                        if isinstance(payload, dict)
+                        else "",
+                        "extra": {"compaction": {"source": etype}},
+                    }
+                )
+                pending_reasoning = None
+                continue
 
             if etype == "event_msg" and isinstance(payload, dict):
                 event_type = payload.get("type")
@@ -1442,9 +1435,8 @@ class Codex(BaseInstalledAgent):
             self.logger.debug("No valid steps produced from Codex session")
             return None
 
-        peak_context_tokens, summarization_count = self._extract_context_metrics(
-            raw_events
-        )
+        _, summarization_count = self._extract_context_metrics(raw_events)
+        peak_context_tokens = peak_context_tokens_from_steps(steps)
 
         spawned = self._collect_spawned_threads(raw_events)
         if spawned:
@@ -1468,6 +1460,11 @@ class Codex(BaseInstalledAgent):
                 )
 
         final_extra: dict[str, Any] = {}
+        from pier.utils.rejected_request import rejected_requests_from_errors
+
+        rejected = rejected_requests_from_errors(raw_events, source="codex.rollout")
+        if rejected:
+            final_extra["rejected_request_tokens"] = rejected
         if summarization_count:
             final_extra["compacted"] = True
         final_extra = dict(
@@ -1506,13 +1503,16 @@ class Codex(BaseInstalledAgent):
             final_extra["total_tokens"] = usage["total_tokens"] or None
 
             total_metrics = FinalMetrics(
-                total_prompt_tokens=usage["prompt_tokens"] or None,
-                total_completion_tokens=usage["completion_tokens"] or None,
-                total_cached_tokens=usage["cached_tokens"] or None,
+                total_prompt_tokens=usage["prompt_tokens"],
+                total_completion_tokens=usage["completion_tokens"],
+                total_cached_tokens=usage["cached_tokens"],
                 total_cost_usd=total_cost_usd,
                 total_steps=len(steps),
                 extra=final_extra,
             )
+        elif rejected or summarization_count:
+            final_extra["metrics_complete"] = False
+            total_metrics = FinalMetrics(total_steps=len(steps), extra=final_extra)
 
         trajectory = Trajectory(
             schema_version="ATIF-v1.7",
@@ -1769,6 +1769,16 @@ class Codex(BaseInstalledAgent):
         tree_extra["subagent_count"] = len(nodes) - 1
         tree_extra["tree_metrics_complete"] = complete
         tree_extra["tree_cost_complete"] = cost_complete
+        rejected = [
+            item
+            for node in nodes
+            if node.final_metrics
+            for item in (node.final_metrics.extra or {}).get(
+                "rejected_request_tokens", []
+            )
+        ]
+        if rejected:
+            tree_extra["rejected_request_tokens"] = rejected
         if peak_context is not None:
             tree_extra["peak_context_tokens"] = peak_context
         if summarizations is not None:
@@ -1788,9 +1798,9 @@ class Codex(BaseInstalledAgent):
         aggregate_steps = sum(len(node.steps) for node in nodes) or None
         aggregate = (
             {
-                "total_prompt_tokens": totals["total_prompt_tokens"] or None,
-                "total_completion_tokens": totals["total_completion_tokens"] or None,
-                "total_cached_tokens": totals["total_cached_tokens"] or None,
+                "total_prompt_tokens": totals["total_prompt_tokens"],
+                "total_completion_tokens": totals["total_completion_tokens"],
+                "total_cached_tokens": totals["total_cached_tokens"],
                 "total_cost_usd": total_cost if cost_complete else None,
                 "total_steps": aggregate_steps,
             }

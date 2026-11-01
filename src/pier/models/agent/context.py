@@ -3,9 +3,18 @@ from typing import Any
 from pydantic import BaseModel, Field
 
 from pier.models.agent.rollout_detail import RolloutDetail
+from pier.models.agent.session_usage import SessionUsage
 
 
 class AgentContext(BaseModel):
+    session_reported_usage: SessionUsage | None = Field(
+        default=None,
+        description="Saved harness running totals. Incomplete observations are not exact run totals.",
+    )
+    rejected_request_tokens: list[dict[str, Any]] | None = Field(
+        default=None,
+        description="Provider-reported rejected input sizes, separate from successful usage.",
+    )
     n_input_tokens: int | None = Field(
         default=None, description="The number of input tokens used including cache."
     )

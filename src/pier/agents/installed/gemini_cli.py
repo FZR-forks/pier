@@ -493,7 +493,7 @@ class GeminiCli(BaseInstalledAgent):
         message_ids: list[str] = []
         messages_by_id: dict[str, dict[str, Any]] = {}
 
-        for line in text.splitlines():
+        for line in text.split("\n"):
             stripped = line.strip()
             if not stripped:
                 continue

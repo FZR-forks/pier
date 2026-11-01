@@ -152,7 +152,7 @@ def _build_step_metrics(
     return Metrics(
         prompt_tokens=prompt_tokens,
         completion_tokens=completion_tokens,
-        cached_tokens=cached_tokens if cached_tokens > 0 else None,
+        cached_tokens=cached_tokens,
         cost_usd=step_cost if step_cost and step_cost > 0 else None,
         extra=extra_metrics if extra_metrics else None,
     )
@@ -478,10 +478,11 @@ def convert_mini_swe_agent_to_atif(
         summarization_count=None,
     )
 
+    usage_seen = any(_usage_from_message(message) for message in messages)
     final_metrics = FinalMetrics(
-        total_prompt_tokens=total_prompt_tokens,
-        total_completion_tokens=total_completion_tokens,
-        total_cached_tokens=total_cached_tokens if total_cached_tokens > 0 else None,
+        total_prompt_tokens=total_prompt_tokens if usage_seen else None,
+        total_completion_tokens=total_completion_tokens if usage_seen else None,
+        total_cached_tokens=total_cached_tokens if usage_seen else None,
         total_cost_usd=total_cost_usd if total_cost_usd > 0 else None,
         total_steps=len(steps),
         extra=final_extra,

@@ -757,7 +757,7 @@ class CritiqueTrial:
 
     def _redact_instruction_from_jsonl(self, path: Path, instruction: str) -> None:
         try:
-            lines = path.read_text(encoding="utf-8").splitlines()
+            lines = path.read_text(encoding="utf-8").split("\n")
         except (OSError, UnicodeDecodeError):
             return
 

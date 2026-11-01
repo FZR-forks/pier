@@ -12,6 +12,16 @@ TrialRewardsMap = dict[str, Rewards | None]
 EvalsRewardsMap = dict[str, TrialRewardsMap]
 
 
+class RetryOverhead(BaseModel):
+    """Discarded attempts, excluded from canonical rewards and usage totals."""
+
+    n_attempts: int = 0
+    n_input_tokens: int | None = None
+    n_cache_tokens: int | None = None
+    n_output_tokens: int | None = None
+    cost_usd: float | None = None
+
+
 class AgentDatasetStats(BaseModel):
     n_trials: int = 0
     n_errors: int = 0
@@ -26,6 +36,7 @@ class AgentDatasetStats(BaseModel):
 
 
 class JobStats(BaseModel):
+    retry_overhead: RetryOverhead | None = None
     n_completed_trials: int = 0
     n_errored_trials: int = 0
     n_running_trials: int = 0
@@ -78,6 +89,7 @@ class JobStats(BaseModel):
 
         for trial_result in trial_results:
             result.increment(trial_result)
+        result.update_usage(trial_results)
 
         if n_total_trials is not None:
             result.update_progress_counts(
@@ -87,6 +99,30 @@ class JobStats(BaseModel):
             )
 
         return result
+
+    def update_usage(self, trial_results: list[TrialResult]) -> None:
+        """Recompute exact totals from the same observations used for rewards.
+
+        A trial with no agent context never entered inference and contributes
+        nothing. A context with a missing category makes that total unknown.
+        """
+        usage = [
+            trial.compute_token_cost_totals()
+            for trial in trial_results
+            if trial.agent_result is not None
+            or any(step.agent_result is not None for step in trial.step_results or [])
+        ]
+        for index, field in enumerate(
+            ("n_input_tokens", "n_cache_tokens", "n_output_tokens", "cost_usd")
+        ):
+            values = [item[index] for item in usage]
+            setattr(
+                self,
+                field,
+                sum(values)
+                if values and all(value is not None for value in values)
+                else None,
+            )
 
     @classmethod
     def from_counts(

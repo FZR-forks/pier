@@ -143,7 +143,7 @@ class OpenCode(BaseInstalledAgent):
             return []
 
         events: list[dict[str, Any]] = []
-        for line in output_path.read_text().splitlines():
+        for line in output_path.read_text(encoding="utf-8").split("\n"):
             line = line.strip()
             if not line:
                 continue
@@ -220,6 +220,7 @@ class OpenCode(BaseInstalledAgent):
         total_input_tokens = 0
         total_output_tokens = 0
         total_cache_read = 0
+        usage_seen = False
 
         for turn in turns:
             text_parts: list[str] = []
@@ -270,6 +271,7 @@ class OpenCode(BaseInstalledAgent):
             # Extract metrics from step_finish
             finish = turn.get("finish", {})
             tokens = finish.get("tokens", {})
+            usage_seen = usage_seen or isinstance(finish.get("tokens"), dict)
             cost = finish.get("cost", 0) or 0
             input_tok = tokens.get("input", 0) or 0
             output_tok = tokens.get("output", 0) or 0
@@ -288,7 +290,7 @@ class OpenCode(BaseInstalledAgent):
                 metrics = Metrics(
                     prompt_tokens=input_tok + cache_read,
                     completion_tokens=output_tok,
-                    cached_tokens=cache_read if cache_read else None,
+                    cached_tokens=cache_read,
                     cost_usd=cost if cost else None,
                     extra={
                         k: v
@@ -332,9 +334,9 @@ class OpenCode(BaseInstalledAgent):
             return None
 
         final_metrics = FinalMetrics(
-            total_prompt_tokens=total_input_tokens or None,
-            total_completion_tokens=total_output_tokens or None,
-            total_cached_tokens=total_cache_read or None,
+            total_prompt_tokens=total_input_tokens if usage_seen else None,
+            total_completion_tokens=total_output_tokens if usage_seen else None,
+            total_cached_tokens=total_cache_read if usage_seen else None,
             total_cost_usd=total_cost if total_cost else None,
             total_steps=len(steps),
             extra=extra_with_context_metrics(

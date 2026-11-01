@@ -667,7 +667,7 @@ class ClaudeCode(BaseInstalledAgent):
             content = stream_path.read_text(encoding="utf-8")
         except OSError:
             return None
-        for line in content.splitlines():
+        for line in content.split("\n"):
             line = line.strip()
             if not line or not line.startswith("{"):
                 continue

@@ -87,6 +87,7 @@ class TrialResult(BaseModel):
     verifier: TimingInfo | None = None
     n_agent_steps: int | None = None
     step_results: list[StepResult] | None = None
+    attempt: int = Field(default=1, ge=1)
 
     def agent_step_count(self) -> int | None:
         if self.n_agent_steps is not None:
@@ -127,18 +128,16 @@ class TrialResult(BaseModel):
         if not contexts:
             return None, None, None, None
 
-        n_input: int | None = None
-        n_cache: int | None = None
-        n_output: int | None = None
-        cost: float | None = None
-        for ctx in contexts:
-            if ctx.n_input_tokens is not None:
-                n_input = (n_input or 0) + ctx.n_input_tokens
-            if ctx.n_cache_tokens is not None:
-                n_cache = (n_cache or 0) + ctx.n_cache_tokens
-            if ctx.n_output_tokens is not None:
-                n_output = (n_output or 0) + ctx.n_output_tokens
-            if ctx.cost_usd is not None:
-                cost = (cost or 0.0) + ctx.cost_usd
-
-        return n_input, n_cache, n_output, cost
+        # Do not present a partial multi-step sum as the complete trial total.
+        totals = []
+        for field in (
+            "n_input_tokens",
+            "n_cache_tokens",
+            "n_output_tokens",
+            "cost_usd",
+        ):
+            values = [getattr(context, field) for context in contexts]
+            totals.append(
+                sum(values) if all(value is not None for value in values) else None
+            )
+        return tuple(totals)
