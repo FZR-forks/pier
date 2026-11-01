@@ -363,37 +363,35 @@ class Codex(BaseInstalledAgent):
         # than being flattened to 0 like the always-present counters.
         optional = {"cache_write_tokens"}
 
-        # Codex >= 0.16x writes one `token_usage_record` per completed response,
-        # including remote compactions that `token_count` leaves out, and before
-        # a response's tools run (a timeout there loses its `token_count`). The
-        # thread's own records are therefore the complete per-response usage.
+        # Codex >= 0.16x also writes a `token_usage_record` per completed
+        # response with an ID. Each `token_count` accounts for one response
+        # (`last_token_usage`), but some billed responses never get one: remote
+        # compactions, and responses whose tools were still running at a
+        # timeout. Records no `token_count` matched are added to the snapshot.
+        # (A response without an ID has no record but is in the snapshot.)
         thread_id, _, _ = Codex._rollout_thread_ids(raw_events)
-        records = [
-            event["payload"]["usage"]
-            for event in raw_events
-            if event.get("type") == "token_usage_record"
-            and isinstance(event.get("payload"), dict)
-            and isinstance(event["payload"].get("usage"), dict)
-            and (
-                thread_id is None
-                or event["payload"].get("thread_id") in (None, thread_id)
-            )
-        ]
-        if records:
-            summed: dict[str, int | None] = {}
-            for target, source in field_map.items():
-                values = [record.get(source) for record in records]
-                if target in optional and all(value is None for value in values):
-                    summed[target] = None
-                    continue
-                if not all(
-                    value is None
-                    or (isinstance(value, int) and not isinstance(value, bool))
-                    for value in values
+        counted = ("input_tokens", "cached_input_tokens", "output_tokens")
+        unmatched: list[dict[str, Any]] = []
+        for event in raw_events:
+            payload = event.get("payload")
+            if not isinstance(payload, dict):
+                continue
+            if event.get("type") == "token_usage_record":
+                if isinstance(payload.get("usage"), dict) and (
+                    thread_id is None or payload.get("thread_id") in (None, thread_id)
                 ):
-                    return None, False
-                summed[target] = sum(value or 0 for value in values)
-            return summed, True
+                    unmatched.append(payload["usage"])
+            elif (
+                event.get("type") == "event_msg"
+                and payload.get("type") == "token_count"
+            ):
+                info = payload.get("info")
+                last = info.get("last_token_usage") if isinstance(info, dict) else None
+                if isinstance(last, dict):
+                    for index, record in enumerate(unmatched):
+                        if all(record.get(key) == last.get(key) for key in counted):
+                            del unmatched[index]
+                            break
 
         final_total_usage: dict[str, Any] | None = None
         saw_context_full_snapshot = False
@@ -443,6 +441,8 @@ class Codex(BaseInstalledAgent):
             # cumulative usage, which means zero child-local usage.
             if saw_context_full_snapshot and initial_total_usage is not None:
                 final_total_usage = initial_total_usage
+            elif unmatched:
+                final_total_usage = initial_total_usage or {}
             else:
                 return None, True
 
@@ -473,6 +473,11 @@ class Codex(BaseInstalledAgent):
                 return None, False
             usage[target] = delta
 
+        for record in unmatched:
+            for target, source in field_map.items():
+                value = record.get(source)
+                if isinstance(value, int) and not isinstance(value, bool):
+                    usage[target] = (usage.get(target) or 0) + value
         return usage, True
 
     @staticmethod

@@ -1465,7 +1465,10 @@ def probe_binary_version(binary: str) -> str:
 
 def _parse_version(text: str) -> tuple[int, int, int] | None:
     """``(major, minor, patch)`` from ``opencode --version`` output."""
-    match = re.search(r"(\d+)\.(\d+)\.(\d+)", text or "")
+    if not text or text.startswith("unavailable:"):
+        # A failed probe's error text may name a versioned path.
+        return None
+    match = re.search(r"(\d+)\.(\d+)\.(\d+)", text)
     return (int(match[1]), int(match[2]), int(match[3])) if match else None
 
 

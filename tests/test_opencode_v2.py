@@ -3599,6 +3599,12 @@ def test_parse_opencode_version():
     assert runner_module._parse_version("opencode v2.2.5") == (2, 2, 5)
     assert runner_module._parse_version("2.0.8\n") == (2, 0, 8)
     assert runner_module._parse_version("unavailable: OSError") is None
+    assert (
+        runner_module._parse_version(
+            "unavailable: TimeoutExpired: /opt/opencode-2.2.5/opencode timed out"
+        )
+        is None
+    )
 
 
 def test_preflight_rejects_limits_without_prompt_budget(tmp_path: Path, monkeypatch):
