@@ -727,9 +727,13 @@ def test_remote_compaction_response_is_billed(tmp_path: Path):
         token_count((31_000, 110), (1_000, 10)),
         # An incomplete response without an ID: in the snapshot, no record.
         token_count((31_200, 130), (200, 20)),
+        # An incomplete response with an ID: Codex records it and grows the
+        # total, but keeps the previous `last_token_usage` (spending only).
+        _usage_record(300, 30),
+        token_count((31_500, 160), (200, 20)),
     ]
     _write_rollout(tmp_path, f"rollout-{ROOT}.jsonl", events)
 
     final = _convert(tmp_path).final_metrics
 
-    assert (final.total_prompt_tokens, final.total_completion_tokens) == (51_200, 430)
+    assert (final.total_prompt_tokens, final.total_completion_tokens) == (51_500, 460)

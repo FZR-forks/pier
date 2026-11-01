@@ -364,14 +364,23 @@ class Codex(BaseInstalledAgent):
         optional = {"cache_write_tokens"}
 
         # Codex >= 0.16x also writes a `token_usage_record` per completed
-        # response with an ID. Each `token_count` accounts for one response
-        # (`last_token_usage`), but some billed responses never get one: remote
-        # compactions, and responses whose tools were still running at a
-        # timeout. Records no `token_count` matched are added to the snapshot.
-        # (A response without an ID has no record but is in the snapshot.)
+        # response with an ID. Some billed responses never reach the
+        # cumulative `token_count`: remote compactions, and responses whose
+        # tools were still running at a timeout. A record is covered when it
+        # fits in the growth of the cumulative total since the previous
+        # snapshot (`last_token_usage` is not reliable: Codex keeps it unchanged
+        # for spending-only updates); uncovered records are added on top.
         thread_id, _, _ = Codex._rollout_thread_ids(raw_events)
         counted = ("input_tokens", "cached_input_tokens", "output_tokens")
+
+        def amounts(usage: dict[str, Any]) -> list[int]:
+            return [
+                value if isinstance(value := usage.get(key), int) else 0
+                for key in counted
+            ]
+
         unmatched: list[dict[str, Any]] = []
+        previous = amounts(initial_total_usage or {})
         for event in raw_events:
             payload = event.get("payload")
             if not isinstance(payload, dict):
@@ -381,17 +390,24 @@ class Codex(BaseInstalledAgent):
                     thread_id is None or payload.get("thread_id") in (None, thread_id)
                 ):
                     unmatched.append(payload["usage"])
-            elif (
-                event.get("type") == "event_msg"
-                and payload.get("type") == "token_count"
-            ):
-                info = payload.get("info")
-                last = info.get("last_token_usage") if isinstance(info, dict) else None
-                if isinstance(last, dict):
-                    for index, record in enumerate(unmatched):
-                        if all(record.get(key) == last.get(key) for key in counted):
-                            del unmatched[index]
-                            break
+                continue
+            info = payload.get("info") if payload.get("type") == "token_count" else None
+            total = info.get("total_token_usage") if isinstance(info, dict) else None
+            if event.get("type") != "event_msg" or not isinstance(total, dict):
+                continue
+            current = amounts(total)
+            if not any(current):
+                continue  # a context-overflow marker, not a usage report
+            room = [now - before for now, before in zip(current, previous)]
+            remaining: list[dict[str, Any]] = []
+            for record in unmatched:
+                usage = amounts(record)
+                if all(used <= free for used, free in zip(usage, room)):
+                    room = [free - used for used, free in zip(usage, room)]
+                else:
+                    remaining.append(record)
+            unmatched = remaining
+            previous = current
 
         final_total_usage: dict[str, Any] | None = None
         saw_context_full_snapshot = False
