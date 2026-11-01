@@ -703,3 +703,22 @@ def test_completed_response_usage_survives_timeout_inside_tool(tmp_path: Path):
     # The tool never returned, so its result has no content.
     results = agent_steps[-1].observation.results if agent_steps[-1].observation else []
     assert all(result.content is None for result in results)
+
+
+def test_remote_compaction_response_is_billed(tmp_path: Path):
+    """Shape of a real 0.166 rollout: every response has a usage record, but the
+    `token_count` after a remote compaction leaves the compaction response out."""
+    events = _thread_events(ROOT, None, model=ROOT_MODEL)
+    events += [
+        _usage_record(30_000, 100),
+        _token_count(30_000, 100),
+        _usage_record(20_000, 300),  # the remote compaction response
+        {"type": "compacted", "payload": {"message": ""}},
+        _usage_record(1_000, 10),
+        _token_count(31_000, 110),
+    ]
+    _write_rollout(tmp_path, f"rollout-{ROOT}.jsonl", events)
+
+    final = _convert(tmp_path).final_metrics
+
+    assert (final.total_prompt_tokens, final.total_completion_tokens) == (51_000, 410)

@@ -2251,6 +2251,50 @@ def test_session_usage_without_a_message_is_added(tmp_path: Path):
     assert unattributed["cost_usd"] == pytest.approx(0.2)
 
 
+def test_session_usage_breakdown_follows_adopted_totals(tmp_path: Path):
+    inspection = {
+        "session": {
+            "id": "ses_bg000000000000000000000002",
+            "cost": 0.2,
+            "tokens": {
+                "input": 100,
+                "output": 15,
+                "reasoning": 10,
+                "cache": {"read": 0, "write": 50},
+            },
+        },
+        "messages": [
+            {"type": "user", "id": "msg_u1", "text": "go", "time": {"created": 1}},
+            {
+                "type": "assistant",
+                "id": "msg_a1",
+                "agent": "build",
+                "model": {"id": "m", "providerID": "p"},
+                "time": {"created": 2, "completed": 3},
+                "finish": "stop",
+                "cost": 0.1,
+                "tokens": {
+                    "input": 100,
+                    "output": 5,
+                    "reasoning": 0,
+                    "cache": {"read": 0, "write": 0},
+                },
+                "content": [{"type": "text", "text": "ok"}],
+            },
+        ],
+        "active": None,
+        "terminal": None,
+    }
+    agent = make_agent(tmp_path)
+    write_inspections(tmp_path, [inspection])
+    agent.populate_context_post_run(AgentContext())
+
+    final = json.loads((tmp_path / "trajectory.json").read_text())["final_metrics"]
+    assert (final["total_prompt_tokens"], final["total_completion_tokens"]) == (150, 25)
+    assert final["extra"]["total_cache_write_input_tokens"] == 50
+    assert final["extra"]["total_reasoning_tokens"] == 10
+
+
 def test_compaction_wrapper_reference_is_not_counted_again(tmp_path: Path):
     """A linked wrapper is deduped by record ID, never by equal token totals."""
     inspection = {

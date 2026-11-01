@@ -128,7 +128,11 @@ def test_session_totals_add_compaction_summary_calls(tmp_path: Path):
         "prompt_tokens": 50,
         "completion_tokens": 15,
         "cached_tokens": 20,
+        "cache_write_tokens": 0,
     }
+    # The cache breakdown follows the adopted totals.
+    assert final.extra["total_cache_read_input_tokens"] == 70
+    assert final.extra["total_cache_creation_input_tokens"] == 0
 
 
 def test_inconsistent_session_totals_are_exposed_not_adopted(tmp_path: Path):
@@ -152,3 +156,23 @@ def test_compaction_without_session_totals_is_flagged(tmp_path: Path):
 
     assert final.total_prompt_tokens == 150
     assert final.extra["compaction_usage_missing"] is True
+
+
+def test_latest_cumulative_cost_is_used(tmp_path: Path):
+    lines = [
+        {
+            "type": "result",
+            "total_cost_usd": 0.05,
+            "modelUsage": {"m": {"costUSD": 0.05, "costBasis": "list"}},
+        },
+        {
+            "type": "result",
+            "total_cost_usd": 0.07,
+            "modelUsage": {"m": {"costUSD": 0.07, "costBasis": "list"}},
+        },
+    ]
+    (tmp_path / "claude-code.txt").write_text(
+        "".join(json.dumps(line) + "\n" for line in lines)
+    )
+    agent = ClaudeCode(logs_dir=tmp_path, model_name="m")
+    assert agent._parse_total_cost_from_stream_json() == 0.07

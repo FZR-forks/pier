@@ -407,9 +407,12 @@ class Pi(BaseInstalledAgent):
                 f"--provider {shlex.quote(provider)} --model {shlex.quote(model_id)} "
                 f"{cli_flags_arg}"
                 "2>&1 "
-                '| grep -Ev \'"type":"(message_update|agent_end)"\' '
+                # Line-buffered throughout, so a completed event reaches the log
+                # even if the run is stopped while a tool is still running.
+                '| stdbuf -oL grep -Ev \'"type":"(message_update|agent_end)"\' '
                 # Keep only `usage` entries: no other entry type starts with "u".
-                '| grep -Ev \'^\\{"type":"entry_appended","entry":\\{"type":"[^u]\' '
+                "| stdbuf -oL grep -Ev "
+                '\'^\\{"type":"entry_appended","entry":\\{"type":"[^u]\' '
                 f"| stdbuf -oL tee /logs/agent/{self._OUTPUT_FILENAME}"
             ),
             env=env,

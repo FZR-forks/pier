@@ -1,3 +1,6 @@
+import time
+import signal
+import os
 import subprocess
 import json
 import re
@@ -210,7 +213,7 @@ class TestRunCommand:
         await self._run(agent, fake_environment)
         command = fake_environment.commands[-1]
         start = command.index("2>&1 ") + len("2>&1 ")
-        pipeline = command[start : command.index("| stdbuf")]
+        pipeline = command[start : command.index("| stdbuf -oL tee")]
         lines = [
             '{"type":"message_update","usage":{}}',
             '{"type":"agent_end","messages":[]}',
@@ -227,6 +230,33 @@ class TestRunCommand:
         ).stdout.splitlines()
         # Pi 1.x cache-warming usage arrives only as a `usage` entry.
         assert kept == [lines[3], lines[4]]
+
+    @pytest.mark.asyncio
+    async def test_capture_is_durable_while_pi_is_still_running(
+        self, agent: Pi, fake_environment, tmp_path: Path
+    ):
+        """A timeout inside a tool kills the pipeline before pi exits; the
+        completed turn must already be in the log by then."""
+        await self._run(agent, fake_environment)
+        command = fake_environment.commands[-1]
+        start = command.index("2>&1 ") + len("2>&1 ")
+        pipeline = command[start : command.index("| stdbuf -oL tee")]
+        captured = tmp_path / "captured.txt"
+        line = '{"type":"turn_end","message":{}}'
+        producer = subprocess.Popen(
+            ["bash", "-c", f"{{ echo '{line}'; sleep 30; }} {pipeline} > {captured}"],
+            start_new_session=True,
+        )
+        try:
+            deadline = time.monotonic() + 10
+            while time.monotonic() < deadline and not (
+                captured.exists() and captured.read_text()
+            ):
+                time.sleep(0.05)
+            assert captured.read_text().splitlines() == [line]
+        finally:
+            os.killpg(producer.pid, signal.SIGKILL)
+            producer.wait()
 
     @pytest.mark.asyncio
     async def test_offline_env_is_set_and_overridable(

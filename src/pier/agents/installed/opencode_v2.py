@@ -1775,23 +1775,29 @@ class OpenCodeV2(BaseInstalledAgent):
             # background compaction summary that was never applied. Its own
             # session counters include them, so the difference is added.
             if reported.complete and usage_seen:
+                # A complete record has every category (`_usage_record_complete`).
+                native = self._partial_usage_fields(session.get("tokens"))
                 unattributed = {
                     "prompt": (reported.n_input_tokens or 0) - totals["prompt"],
                     "completion": (reported.n_output_tokens or 0)
                     - totals["completion"],
-                    "cached": (reported.n_cache_tokens or 0) - totals["cached"],
+                    "cached": (native["cache_read"] or 0) - totals["cached"],
+                    "cache_write": (native["cache_write"] or 0) - totals["cache_write"],
+                    "reasoning": (native["reasoning"] or 0) - totals["reasoning"],
                 }
+                # Only missing requests are added: every component, uncached
+                # input and visible output included, must not shrink.
                 if (
                     min(unattributed.values()) >= 0
-                    and unattributed["prompt"] >= unattributed["cached"]
+                    and unattributed["prompt"]
+                    >= unattributed["cached"] + unattributed["cache_write"]
+                    and unattributed["completion"] >= unattributed["reasoning"]
                     and any(unattributed.values())
                 ):
                     for key, value in unattributed.items():
                         totals[key] += value
                     extra_usage = {
-                        "prompt_tokens": unattributed["prompt"],
-                        "completion_tokens": unattributed["completion"],
-                        "cached_tokens": unattributed["cached"],
+                        f"{key}_tokens": value for key, value in unattributed.items()
                     }
                     if cost_complete and reported.cost_usd is not None:
                         extra_usage["cost_usd"] = max(

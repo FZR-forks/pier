@@ -700,7 +700,8 @@ class ClaudeCode(BaseInstalledAgent):
                 for usage in model_usage.values()
             ):
                 return None
-        cost = results[0].get("total_cost_usd")
+        # Every result carries the session's cumulative cost; read the latest.
+        cost = results[-1].get("total_cost_usd")
         if cost is None:
             return None
         try:
@@ -718,7 +719,7 @@ class ClaudeCode(BaseInstalledAgent):
         model_usage = results[-1].get("modelUsage") if results else None
         if not isinstance(model_usage, dict) or not model_usage:
             return None
-        totals = {"prompt": 0, "completion": 0, "cached": 0}
+        totals = {"prompt": 0, "completion": 0, "cached": 0, "cache_write": 0}
         for usage in model_usage.values():
             if not isinstance(usage, dict):
                 return None
@@ -743,6 +744,7 @@ class ClaudeCode(BaseInstalledAgent):
             )
             totals["completion"] += fields["outputTokens"]
             totals["cached"] += fields["cacheReadInputTokens"]
+            totals["cache_write"] += fields["cacheCreationInputTokens"]
         return totals
 
     @staticmethod
@@ -1201,6 +1203,7 @@ class ClaudeCode(BaseInstalledAgent):
             "prompt": total_prompt_tokens or 0,
             "completion": total_completion_tokens or 0,
             "cached": total_cached_tokens or 0,
+            "cache_write": cache_creation_total,
         }
         unattributed = (
             {key: native[key] - step_totals[key] for key in native}
@@ -1212,16 +1215,20 @@ class ClaudeCode(BaseInstalledAgent):
         consistent = bool(
             unattributed
             and min(unattributed.values()) >= 0
-            and unattributed["prompt"] >= unattributed["cached"]
+            and unattributed["prompt"]
+            >= unattributed["cached"] + unattributed["cache_write"]
         )
         if unattributed and consistent and any(unattributed.values()):
             total_prompt_tokens = native["prompt"]
             total_completion_tokens = native["completion"]
             total_cached_tokens = native["cached"]
+            final_extra["total_cache_read_input_tokens"] = native["cached"]
+            final_extra["total_cache_creation_input_tokens"] = native["cache_write"]
             final_extra["unattributed_usage"] = {
                 "prompt_tokens": unattributed["prompt"],
                 "completion_tokens": unattributed["completion"],
                 "cached_tokens": unattributed["cached"],
+                "cache_write_tokens": unattributed["cache_write"],
             }
         elif unattributed and not consistent:
             # The transcript disagrees with the session totals beyond missing
@@ -1230,6 +1237,7 @@ class ClaudeCode(BaseInstalledAgent):
                 "prompt_tokens": native["prompt"],
                 "completion_tokens": native["completion"],
                 "cached_tokens": native["cached"],
+                "cache_write_tokens": native["cache_write"],
             }
         elif native is None and summarization_count:
             # No session totals (e.g. a timeout): the summary calls are missing.

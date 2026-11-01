@@ -349,22 +349,55 @@ class Codex(BaseInstalledAgent):
         counter was reset or the inherited baseline is otherwise incompatible;
         in that case the caller must withhold token totals instead of guessing.
         """
+        field_map = {
+            "prompt_tokens": "input_tokens",
+            "completion_tokens": "output_tokens",
+            "cached_tokens": "cached_input_tokens",
+            "cache_write_tokens": "cache_write_input_tokens",
+            "reasoning_tokens": "reasoning_output_tokens",
+            "total_tokens": "total_tokens",
+        }
+        # Cache writes are the one optional field here: older Codex builds omit
+        # them entirely. Absence therefore means "unknown", which has to stay
+        # distinguishable from a reported zero, so it is carried as None rather
+        # than being flattened to 0 like the always-present counters.
+        optional = {"cache_write_tokens"}
+
+        # Codex >= 0.16x writes one `token_usage_record` per completed response,
+        # including remote compactions that `token_count` leaves out, and before
+        # a response's tools run (a timeout there loses its `token_count`). The
+        # thread's own records are therefore the complete per-response usage.
+        thread_id, _, _ = Codex._rollout_thread_ids(raw_events)
+        records = [
+            event["payload"]["usage"]
+            for event in raw_events
+            if event.get("type") == "token_usage_record"
+            and isinstance(event.get("payload"), dict)
+            and isinstance(event["payload"].get("usage"), dict)
+            and (
+                thread_id is None
+                or event["payload"].get("thread_id") in (None, thread_id)
+            )
+        ]
+        if records:
+            summed: dict[str, int | None] = {}
+            for target, source in field_map.items():
+                values = [record.get(source) for record in records]
+                if target in optional and all(value is None for value in values):
+                    summed[target] = None
+                    continue
+                if not all(
+                    value is None
+                    or (isinstance(value, int) and not isinstance(value, bool))
+                    for value in values
+                ):
+                    return None, False
+                summed[target] = sum(value or 0 for value in values)
+            return summed, True
+
         final_total_usage: dict[str, Any] | None = None
         saw_context_full_snapshot = False
-        # Codex >= 0.16x writes a `token_usage_record` as soon as a response
-        # completes but defers its `token_count` until pending tools resolve.
-        # Responses after the last snapshot (e.g. a timeout inside a tool) are
-        # billed but only present as records, so their usage is added on top.
-        unreported: dict[str, int] = {}
         for event in reversed(raw_events):
-            if event.get("type") == "token_usage_record":
-                record = event.get("payload")
-                record_usage = record.get("usage") if isinstance(record, dict) else None
-                if isinstance(record_usage, dict):
-                    for key, value in record_usage.items():
-                        if isinstance(value, int) and not isinstance(value, bool):
-                            unreported[key] = unreported.get(key, 0) + value
-                continue
             if event.get("type") != "event_msg":
                 continue
             payload = event.get("payload")
@@ -408,35 +441,11 @@ class Codex(BaseInstalledAgent):
             # A full-history child may overflow before making its first successful
             # request. Its seeded parent baseline is then still the final known
             # cumulative usage, which means zero child-local usage.
-            if (saw_context_full_snapshot or unreported) and (
-                initial_total_usage is not None
-            ):
+            if saw_context_full_snapshot and initial_total_usage is not None:
                 final_total_usage = initial_total_usage
-            elif unreported:
-                final_total_usage = {}
             else:
                 return None, True
-        if unreported:
-            final_total_usage = {
-                key: (final_total_usage.get(key) or 0) + unreported.get(key, 0)
-                if key in unreported or key in final_total_usage
-                else None
-                for key in {*final_total_usage, *unreported}
-            }
 
-        field_map = {
-            "prompt_tokens": "input_tokens",
-            "completion_tokens": "output_tokens",
-            "cached_tokens": "cached_input_tokens",
-            "cache_write_tokens": "cache_write_input_tokens",
-            "reasoning_tokens": "reasoning_output_tokens",
-            "total_tokens": "total_tokens",
-        }
-        # Cache writes are the one optional field here: older Codex builds omit
-        # them entirely. Absence therefore means "unknown", which has to stay
-        # distinguishable from a reported zero, so it is carried as None rather
-        # than being flattened to 0 like the always-present counters.
-        optional = {"cache_write_tokens"}
         usage: dict[str, int | None] = {}
         for target, source in field_map.items():
             value = final_total_usage.get(source)
@@ -1488,8 +1497,9 @@ class Codex(BaseInstalledAgent):
         if spawned:
             trajectory_extra["spawned_threads"] = spawned
 
-        # Match Harbor's authoritative final-metrics source: the latest
-        # cumulative total_token_usage snapshot. Full-history children subtract
+        # The thread's per-response usage records where Codex writes them;
+        # otherwise Harbor's source, the latest cumulative total_token_usage
+        # snapshot. Full-history children subtract
         # the cumulative baseline copied from their parent so tree totals remain
         # child-local instead of counting inherited history again.
         usage, usage_complete = self._final_cumulative_usage(
