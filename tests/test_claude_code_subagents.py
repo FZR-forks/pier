@@ -198,6 +198,81 @@ class TestSubagentTranscripts:
         assert messages.index("Fix the bug.") < messages.index("Repo explored.")
         assert messages.index("Repo explored.") < messages.index("All done.")
 
+    def test_spawning_call_stays_one_step_around_subagent_events(self, tmp_path: Path):
+        # Claude Code writes each content block of one API response as its own
+        # JSONL entry. The `Agent` tool call is only emitted once its result
+        # arrives, after the sidechain, so its fragments are not adjacent.
+        agent = ClaudeCode(logs_dir=tmp_path, model_name="claude-opus-4-6")
+        main_events = [
+            _make_user_event("Delegate it.", timestamp="2026-01-01T00:00:00Z"),
+            _make_assistant_event(
+                [{"type": "text", "text": "Delegating."}],
+                timestamp="2026-01-01T00:00:01.000Z",
+                input_tokens=100,
+                output_tokens=10,
+                msg_id="msg_main_1",
+            ),
+            _make_assistant_event(
+                [
+                    {
+                        "type": "tool_use",
+                        "id": "toolu_agent",
+                        "name": "Agent",
+                        "input": {"prompt": "read the file"},
+                    }
+                ],
+                timestamp="2026-01-01T00:00:01.500Z",
+                input_tokens=100,
+                output_tokens=10,
+                msg_id="msg_main_1",
+            ),
+            _make_tool_result_event(
+                tool_id="toolu_agent",
+                content="file contents",
+                timestamp="2026-01-01T00:00:04Z",
+            ),
+            _make_assistant_event(
+                [{"type": "text", "text": "Done."}],
+                timestamp="2026-01-01T00:00:05Z",
+                input_tokens=200,
+                output_tokens=20,
+                msg_id="msg_main_2",
+            ),
+        ]
+        subagent_events = [
+            _sidechain(
+                _make_user_event("read the file", timestamp="2026-01-01T00:00:02Z")
+            ),
+            _sidechain(
+                _make_assistant_event(
+                    [{"type": "text", "text": "file contents"}],
+                    timestamp="2026-01-01T00:00:03Z",
+                    input_tokens=50,
+                    output_tokens=5,
+                    msg_id="msg_sub_1",
+                )
+            ),
+        ]
+        session_dir = _write_session(tmp_path, main_events)
+        _write_subagent_file(session_dir, subagent_events)
+
+        trajectory = agent._convert_events_to_trajectory(session_dir)
+
+        assert trajectory is not None
+        agent_steps = [step for step in trajectory.steps if step.source == "agent"]
+        assert len(agent_steps) == 3
+        spawning = agent_steps[0]
+        assert spawning.message == "Delegating."
+        assert [tc.function_name for tc in spawning.tool_calls or []] == ["Agent"]
+        assert spawning.metrics is not None
+        assert spawning.metrics.prompt_tokens == 100
+        assert (spawning.extra or {}).get("is_sidechain") is False
+        timestamps = [step.timestamp for step in trajectory.steps]
+        assert timestamps == sorted(timestamps)
+        assert trajectory.final_metrics is not None
+        assert trajectory.final_metrics.total_prompt_tokens == 350
+        assert trajectory.final_metrics.total_completion_tokens == 35
+
     def test_subagent_uuid_is_deduplicated_across_files(self, tmp_path: Path):
         agent = ClaudeCode(logs_dir=tmp_path, model_name="claude-opus-4-6")
         duplicated = _sidechain(

@@ -563,44 +563,43 @@ class ClaudeCode(BaseInstalledAgent):
     def _group_events_by_msg_id(
         normalized_events: list[dict[str, Any]],
     ) -> list[dict[str, Any]]:
-        """Merge assistant message fragments sharing a Claude message id."""
+        """Merge assistant message fragments sharing a Claude message id.
+
+        A message id identifies one API response, so all of its fragments form
+        one step, placed where its first fragment occurs. The fragments are not
+        always adjacent: a tool call is only emitted once its result arrives, and
+        a subagent's sidechain events arrive before the result of the `Agent`
+        call that started it.
+        """
         result: list[dict[str, Any]] = []
         groups: dict[str, dict[str, Any]] = {}
-        group_order: list[str] = []
 
-        def flush() -> None:
-            for group_id in group_order:
-                group = groups.pop(group_id, None)
-                if group is None:
-                    continue
-                group["tool_calls"].sort(key=lambda tc: tc.get("tool_order", 0))
-                message_parts = [
-                    part.strip()
-                    for part in group.pop("message_parts")
-                    if isinstance(part, str) and part.strip()
+        def finalize(group: dict[str, Any]) -> None:
+            group["tool_calls"].sort(key=lambda tc: tc.get("tool_order", 0))
+            message_parts = [
+                part.strip()
+                for part in group.pop("message_parts")
+                if isinstance(part, str) and part.strip()
+            ]
+            reasoning_parts = [
+                part.strip()
+                for part in group.pop("reasoning_parts")
+                if isinstance(part, str) and part.strip()
+            ]
+            if len(message_parts) == 0:
+                group["message"] = ""
+            elif len(message_parts) == 1:
+                group["message"] = message_parts[0]
+            else:
+                group["message"] = [
+                    ContentPart(type="text", text=part) for part in message_parts
                 ]
-                reasoning_parts = [
-                    part.strip()
-                    for part in group.pop("reasoning_parts")
-                    if isinstance(part, str) and part.strip()
-                ]
-                if len(message_parts) == 0:
-                    group["message"] = ""
-                elif len(message_parts) == 1:
-                    group["message"] = message_parts[0]
-                else:
-                    group["message"] = [
-                        ContentPart(type="text", text=part) for part in message_parts
-                    ]
-                if reasoning_parts:
-                    group["reasoning"] = "\n\n".join(reasoning_parts)
-                result.append(group)
-            group_order.clear()
+            if reasoning_parts:
+                group["reasoning"] = "\n\n".join(reasoning_parts)
 
         for event in normalized_events:
             msg_id = event.get("msg_id")
             if not msg_id:
-                flush()
                 result.append(event)
                 continue
 
@@ -617,7 +616,7 @@ class ClaudeCode(BaseInstalledAgent):
                     "reasoning_parts": [],
                     "tool_calls": [],
                 }
-                group_order.append(msg_id)
+                result.append(groups[msg_id])
 
             group = groups[msg_id]
             if event.get("kind") == "message":
@@ -651,7 +650,8 @@ class ClaudeCode(BaseInstalledAgent):
                 if not group.get("model_name") and event.get("model_name"):
                     group["model_name"] = event["model_name"]
 
-        flush()
+        for group in groups.values():
+            finalize(group)
         return result
 
     def _parse_total_cost_from_stream_json(self) -> float | None:
