@@ -451,6 +451,8 @@ class Codex(BaseInstalledAgent):
                 continue
             assert isinstance(info, dict)
             if is_context_full(info, total):
+                unmatched.extend(fresh)
+                fresh = []
                 for source in field_map.values():
                     value = (last_real or {}).get(source)
                     if isinstance(value, int) and not isinstance(value, bool):
