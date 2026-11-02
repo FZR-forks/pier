@@ -1,3 +1,7 @@
+import time
+import signal
+import os
+import subprocess
 import json
 import re
 from pathlib import Path
@@ -208,10 +212,51 @@ class TestRunCommand:
     ):
         await self._run(agent, fake_environment)
         command = fake_environment.commands[-1]
-        assert (
-            '| grep -Ev \'"type":"(message_update|entry_appended|agent_end)"\' '
-            in command
+        start = command.index("2>&1 ") + len("2>&1 ")
+        pipeline = command[start : command.index("| stdbuf -oL tee")]
+        lines = [
+            '{"type":"message_update","usage":{}}',
+            '{"type":"agent_end","messages":[]}',
+            '{"type":"entry_appended","entry":{"type":"message","id":"a"}}',
+            '{"type":"entry_appended","entry":{"type":"usage","id":"b"}}',
+            '{"type":"turn_end","message":{}}',
+        ]
+        kept = subprocess.run(
+            ["bash", "-c", f"cat {pipeline}"],
+            input="\n".join(lines) + "\n",
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.splitlines()
+        # Pi 1.x cache-warming usage arrives only as a `usage` entry.
+        assert kept == [lines[3], lines[4]]
+
+    @pytest.mark.asyncio
+    async def test_capture_is_durable_while_pi_is_still_running(
+        self, agent: Pi, fake_environment, tmp_path: Path
+    ):
+        """A timeout inside a tool kills the pipeline before pi exits; the
+        completed turn must already be in the log by then."""
+        await self._run(agent, fake_environment)
+        command = fake_environment.commands[-1]
+        start = command.index("2>&1 ") + len("2>&1 ")
+        pipeline = command[start : command.index("| stdbuf -oL tee")]
+        captured = tmp_path / "captured.txt"
+        line = '{"type":"turn_end","message":{}}'
+        producer = subprocess.Popen(
+            ["bash", "-c", f"{{ echo '{line}'; sleep 30; }} {pipeline} > {captured}"],
+            start_new_session=True,
         )
+        try:
+            deadline = time.monotonic() + 10
+            while time.monotonic() < deadline and not (
+                captured.exists() and captured.read_text()
+            ):
+                time.sleep(0.05)
+            assert captured.read_text().splitlines() == [line]
+        finally:
+            os.killpg(producer.pid, signal.SIGKILL)
+            producer.wait()
 
     @pytest.mark.asyncio
     async def test_offline_env_is_set_and_overridable(
@@ -244,6 +289,18 @@ class TestRunCommand:
         env = fake_environment.envs[-1]
         assert env["ANTHROPIC_API_KEY"] == "sk-ant"
         assert env["ANTHROPIC_OAUTH_TOKEN"] == "oauth"
+
+    @pytest.mark.asyncio
+    async def test_azure_endpoint_env_is_forwarded(
+        self, tmp_path: Path, fake_environment, monkeypatch: pytest.MonkeyPatch
+    ):
+        monkeypatch.setenv("AZURE_OPENAI_API_KEY", "az-key")
+        monkeypatch.setenv("AZURE_OPENAI_RESOURCE_NAME", "my-resource")
+        agent = Pi(logs_dir=tmp_path, model_name="azure/gpt-5.6-luna")
+        await self._run(agent, fake_environment)
+        env = fake_environment.envs[-1]
+        assert env["AZURE_OPENAI_API_KEY"] == "az-key"
+        assert env["AZURE_OPENAI_RESOURCE_NAME"] == "my-resource"
 
     @pytest.mark.asyncio
     async def test_ambient_keys_are_scoped_to_the_provider(
@@ -397,6 +454,15 @@ class TestNetworkAllowlist:
             },
         )
         assert "gateway.example.com" in self._domains(agent)
+
+    @pytest.mark.parametrize("provider", ["azure", "azure-openai-responses"])
+    def test_azure_endpoint_is_allowlisted(self, tmp_path: Path, provider: str):
+        agent = Pi(
+            logs_dir=tmp_path,
+            model_name=f"{provider}/gpt-5.6-luna",
+            extra_env={"AZURE_OPENAI_BASE_URL": "https://gw.example.com/openai/v1"},
+        )
+        assert {".openai.azure.com", "gw.example.com"} <= self._domains(agent)
 
     def test_no_allowlist_without_provider_prefix(self, tmp_path: Path):
         agent = Pi(logs_dir=tmp_path, model_name="gpt-5.6-luna")
@@ -647,6 +713,34 @@ class TestCompaction:
         assert final["total_cost_usd"] == pytest.approx(0.006)
         assert final["extra"]["total_cache_write_tokens"] == 30
         assert final["extra"]["total_cache_write_1h_tokens"] == 12
+
+    def test_cache_warming_usage_is_billed_into_totals(self, agent: Pi):
+        """Pi 1.x cache warming bills requests recorded only as usage entries."""
+        message = assistant_message(response_id="r1", input=100, output=10, cost=0.001)
+        warm = {
+            "type": "usage",
+            "id": "w1",
+            "kind": "cache_warm",
+            "usage": usage(input=50, output=1, cost=0.0005),
+        }
+        events = [
+            {"type": "session", "id": "s1"},
+            {"type": "message_end", "message": message},
+            # Warming runs while tools execute, between message_end and turn_end;
+            # a repeated entry is counted once.
+            {"type": "entry_appended", "entry": warm},
+            {"type": "entry_appended", "entry": warm},
+            {"type": "turn_end", "message": message, "toolResults": []},
+        ]
+        trajectory = self._convert(agent, events)["trajectory"]
+        final = trajectory["final_metrics"]
+        assert final["total_prompt_tokens"] == 150
+        assert final["total_completion_tokens"] == 11
+        assert final["total_cost_usd"] == pytest.approx(0.0015)
+        assert final["extra"]["usage_entries"] == {
+            "cache_warm": {"count": 1, "prompt_tokens": 50, "completion_tokens": 1}
+        }
+        assert [s["source"] for s in trajectory["steps"]] == ["user", "agent"]
 
     def test_aborted_compaction_is_not_counted(self, agent: Pi):
         trajectory = self._convert(agent, self._events_with_compaction(aborted=True))[

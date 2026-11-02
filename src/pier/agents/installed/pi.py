@@ -75,9 +75,12 @@ class Pi(BaseInstalledAgent):
         compaction_end        - context compaction, including the summary's own usage
         auto_retry_start      - provider error that pi retried internally
 
-    ``message_update`` (delta-only), ``entry_appended`` and ``agent_end`` are
-    filtered out of the captured stream: each re-serialises message content that
-    is already covered by ``turn_end`` / ``message_end``.
+        entry_appended (usage) - billed requests outside the turn loop, such as
+                                 Pi 1.x cache warming during long tool runs
+
+    ``message_update`` (delta-only), other ``entry_appended`` events and
+    ``agent_end`` are filtered out of the captured stream: each re-serialises
+    message content that is already covered by ``turn_end`` / ``message_end``.
     """
 
     SUPPORTS_ATIF: bool = True
@@ -110,7 +113,18 @@ class Pi(BaseInstalledAgent):
             "ANTHROPIC_OAUTH_TOKEN",
             "ANTHROPIC_BASE_URL",
         ),
-        "azure-openai-responses": ("AZURE_OPENAI_API_KEY",),
+        # Pi 1.0.3 renamed `azure-openai-responses` to `azure`. The endpoint
+        # comes from the base URL or the resource name.
+        "azure": (
+            "AZURE_OPENAI_API_KEY",
+            "AZURE_OPENAI_BASE_URL",
+            "AZURE_OPENAI_RESOURCE_NAME",
+        ),
+        "azure-openai-responses": (
+            "AZURE_OPENAI_API_KEY",
+            "AZURE_OPENAI_BASE_URL",
+            "AZURE_OPENAI_RESOURCE_NAME",
+        ),
         "cerebras": ("CEREBRAS_API_KEY",),
         "deepseek": ("DEEPSEEK_API_KEY",),
         "github-copilot": ("GITHUB_TOKEN",),
@@ -133,6 +147,7 @@ class Pi(BaseInstalledAgent):
     # name (``$VAR``) so the secret itself is never written to disk.
     _PROVIDER_API_KEY_ENVS: dict[str, str] = {
         "anthropic": "ANTHROPIC_API_KEY",
+        "azure": "AZURE_OPENAI_API_KEY",
         "azure-openai-responses": "AZURE_OPENAI_API_KEY",
         "cerebras": "CEREBRAS_API_KEY",
         "deepseek": "DEEPSEEK_API_KEY",
@@ -146,6 +161,9 @@ class Pi(BaseInstalledAgent):
 
     _DEFAULT_PROVIDER_DOMAINS: dict[str, list[str]] = {
         "anthropic": ["api.anthropic.com"],
+        # AZURE_OPENAI_RESOURCE_NAME resolves to <name>.openai.azure.com.
+        "azure": [".openai.azure.com"],
+        "azure-openai-responses": [".openai.azure.com"],
         "deepseek": ["api.deepseek.com"],
         "google": [".googleapis.com"],
         "groq": ["api.groq.com"],
@@ -321,6 +339,11 @@ class Pi(BaseInstalledAgent):
         # defaults, so it has to be requested explicitly.
         urls = list(self._base_url_values())
         urls.extend(
+            value
+            for key in self._PROVIDER_ENVS.get(provider, ())
+            if key.endswith("_BASE_URL") and (value := self._get_env(key))
+        )
+        urls.extend(
             collect_url_values(
                 self._build_models_config(),
                 keys={"baseUrl", "base_url", "baseurl", "baseURL", "url"},
@@ -384,7 +407,12 @@ class Pi(BaseInstalledAgent):
                 f"--provider {shlex.quote(provider)} --model {shlex.quote(model_id)} "
                 f"{cli_flags_arg}"
                 "2>&1 "
-                '| grep -Ev \'"type":"(message_update|entry_appended|agent_end)"\' '
+                # Line-buffered throughout, so a completed event reaches the log
+                # even if the run is stopped while a tool is still running.
+                '| stdbuf -oL grep -Ev \'"type":"(message_update|agent_end)"\' '
+                # Keep only `usage` entries: no other entry type starts with "u".
+                "| stdbuf -oL grep -Ev "
+                '\'^\\{"type":"entry_appended","entry":\\{"type":"[^u]\' '
                 f"| stdbuf -oL tee /logs/agent/{self._OUTPUT_FILENAME}"
             ),
             env=env,
@@ -827,7 +855,46 @@ class Pi(BaseInstalledAgent):
         if not any(step.source != "user" for step in steps):
             return None
 
+        # Billed requests recorded only as session `usage` entries (Pi 1.x
+        # cache warming). They are not turns, so they add to the totals only.
+        usage_entries: dict[str, dict[str, Any]] = {}
+        for event in events:
+            entry = (
+                event.get("entry") if event.get("type") == "entry_appended" else None
+            )
+            if (
+                isinstance(entry, dict)
+                and entry.get("type") == "usage"
+                and isinstance(entry.get("usage"), dict)
+            ):
+                usage_entries[str(entry.get("id") or len(usage_entries))] = entry
+        usage_by_kind: dict[str, dict[str, Any]] = {}
+        for entry in usage_entries.values():
+            usage = entry["usage"]
+            contribution = {
+                "prompt": int(usage.get("input") or 0)
+                + int(usage.get("cacheRead") or 0)
+                + int(usage.get("cacheWrite") or 0),
+                "completion": int(usage.get("output") or 0),
+                "cached": int(usage.get("cacheRead") or 0),
+                "cache_write": int(usage.get("cacheWrite") or 0),
+                "cache_write_1h": int(usage.get("cacheWrite1h") or 0),
+                "reasoning": int(usage.get("reasoning") or 0),
+                "cost": self._reported_cost(usage) or 0.0,
+            }
+            for key, value in contribution.items():
+                totals[key] += value
+            summary = usage_by_kind.setdefault(
+                str(entry.get("kind") or "unknown"),
+                {"count": 0, "prompt_tokens": 0, "completion_tokens": 0},
+            )
+            summary["count"] += 1
+            summary["prompt_tokens"] += contribution["prompt"]
+            summary["completion_tokens"] += contribution["completion"]
+
         final_extra: dict[str, Any] = {}
+        if usage_by_kind:
+            final_extra["usage_entries"] = usage_by_kind
         from pier.utils.rejected_request import rejected_requests_from_errors
 
         rejected = rejected_requests_from_errors(events, source="pi.errorMessage")
@@ -859,6 +926,7 @@ class Pi(BaseInstalledAgent):
                 )
             else:
                 usages.append(record["result"].get("usage"))
+        usages.extend(entry["usage"] for entry in usage_entries.values())
         usage_known = all(
             isinstance(item, dict)
             and all(

@@ -78,6 +78,25 @@ class Codex(BaseInstalledAgent):
         self._config_toml = config_toml
         if config_toml_file:
             self._config_toml = Path(config_toml_file).read_text()
+        if self._config_toml:
+            try:
+                features = toml.loads(self._config_toml).get("features") or {}
+            except toml.TomlDecodeError:
+                features = {}
+            setting = (
+                features.get("async_compaction") if isinstance(features, dict) else None
+            )
+            if setting is True or (
+                # Table form: `[features.async_compaction]` with `enabled`.
+                isinstance(setting, dict) and setting.get("enabled", True) is not False
+            ):
+                # Background compactions are billed but leave neither a
+                # `token_count` nor a `token_usage_record` (Codex 0.166
+                # `compact_remote_v2.rs`), so the run's usage cannot be counted.
+                raise ValueError(
+                    "features.async_compaction is not supported: Codex does not "
+                    "record the usage of background compactions"
+                )
 
         # Benchmark isolation is opt-in: by default Codex keeps its stock model
         # catalog and its delegation behaviour is left completely untouched.
@@ -205,6 +224,14 @@ class Codex(BaseInstalledAgent):
                 output = json.dumps(parsed, ensure_ascii=False)
             metadata = parsed.get("metadata")
             return output, metadata if isinstance(metadata, dict) else None
+
+        if isinstance(raw, list):
+            # Newer Codex records tool output as Responses content items, e.g.
+            # code-mode `exec` results as a list of `input_text` blocks. A string
+            # is the tool's own text, even when it parses as a JSON array.
+            return Codex._extract_message_text(raw), None
+        if isinstance(parsed, list) and isinstance(raw, str):
+            return raw, None
 
         return str(parsed), None
 
@@ -336,65 +363,14 @@ class Codex(BaseInstalledAgent):
         cumulative accounting composable across a trajectory tree.
 
         Codex also emits a special context-window-full snapshot whose cumulative
-        billable fields are zeroed. That snapshot is skipped in favor of the last
-        real cumulative provider-usage snapshot so a failed overflow attempt does
+        billable fields are zeroed, and later usage accumulates from there. The
+        usage before each such reset is kept, so a failed overflow attempt does
         not erase usage already incurred by the thread.
 
         Returns ``(usage, complete)``. A negative child delta means the cumulative
         counter was reset or the inherited baseline is otherwise incompatible;
         in that case the caller must withhold token totals instead of guessing.
         """
-        final_total_usage: dict[str, Any] | None = None
-        saw_context_full_snapshot = False
-        for event in reversed(raw_events):
-            if event.get("type") != "event_msg":
-                continue
-            payload = event.get("payload")
-            if not isinstance(payload, dict) or payload.get("type") != "token_count":
-                continue
-            info = payload.get("info")
-            if not isinstance(info, dict):
-                continue
-            cumulative = info.get("total_token_usage")
-            if not isinstance(cumulative, dict):
-                continue
-
-            # Codex 0.151.0's `set_total_tokens_full()` is a context-overflow
-            # marker, not a provider usage report. `fill_to_context_window()`
-            # replaces the cumulative billable fields with zeros and sets only
-            # total_tokens=model_context_window. If it is the final snapshot,
-            # treating it as cumulative billing would erase all known usage.
-            # Walk back to the last real cumulative snapshot instead.
-            model_context_window = info.get("model_context_window")
-            detailed_fields = (
-                "input_tokens",
-                "cached_input_tokens",
-                "cache_write_input_tokens",
-                "output_tokens",
-                "reasoning_output_tokens",
-            )
-            is_context_full_snapshot = (
-                isinstance(model_context_window, int)
-                and model_context_window > 0
-                and cumulative.get("total_tokens") == model_context_window
-                and all((cumulative.get(field) or 0) == 0 for field in detailed_fields)
-            )
-            if is_context_full_snapshot:
-                saw_context_full_snapshot = True
-                continue
-
-            final_total_usage = cumulative
-            break
-
-        if final_total_usage is None:
-            # A full-history child may overflow before making its first successful
-            # request. Its seeded parent baseline is then still the final known
-            # cumulative usage, which means zero child-local usage.
-            if saw_context_full_snapshot and initial_total_usage is not None:
-                final_total_usage = initial_total_usage
-            else:
-                return None, True
-
         field_map = {
             "prompt_tokens": "input_tokens",
             "completion_tokens": "output_tokens",
@@ -408,6 +384,112 @@ class Codex(BaseInstalledAgent):
         # distinguishable from a reported zero, so it is carried as None rather
         # than being flattened to 0 like the always-present counters.
         optional = {"cache_write_tokens"}
+
+        # Codex >= 0.16x also writes a `token_usage_record` per completed
+        # response with an ID. Some billed responses never reach the
+        # cumulative `token_count`: remote compactions, and responses whose
+        # tools were still running at a timeout. A thread's responses are
+        # sequential and each one's `token_count` precedes the next record, so
+        # a record can only be covered by the first snapshot after it, when it
+        # fits in that snapshot's growth. (`last_token_usage` is not reliable:
+        # Codex keeps it unchanged for spending-only updates.) Uncovered
+        # records are added on top.
+        thread_id, _, _ = Codex._rollout_thread_ids(raw_events)
+        counted = ("input_tokens", "cached_input_tokens", "output_tokens")
+
+        def amounts(usage: dict[str, Any]) -> list[int]:
+            return [
+                value if isinstance(value := usage.get(key), int) else 0
+                for key in counted
+            ]
+
+        detailed_fields = (
+            "input_tokens",
+            "cached_input_tokens",
+            "cache_write_input_tokens",
+            "output_tokens",
+            "reasoning_output_tokens",
+        )
+
+        def is_context_full(info: dict[str, Any], cumulative: dict[str, Any]) -> bool:
+            # `set_total_tokens_full()` / `fill_to_context_window()` is a
+            # context-overflow marker, not a provider usage report: it replaces
+            # the cumulative billable fields with zeros and sets only
+            # total_tokens=model_context_window. Later usage accumulates on top
+            # of those zeros, so the counter restarts there.
+            window = info.get("model_context_window")
+            return (
+                isinstance(window, int)
+                and window > 0
+                and cumulative.get("total_tokens") == window
+                and all((cumulative.get(field) or 0) == 0 for field in detailed_fields)
+            )
+
+        # Usage of counter periods closed by an overflow reset, plus the last
+        # real snapshot of the current period. A full-history child's period
+        # starts from the parent baseline its counter was seeded with.
+        closed: dict[str, int] = {}
+        period_start: dict[str, Any] | None = None
+        last_real: dict[str, Any] | None = initial_total_usage
+        saw_snapshot = False
+        fresh: list[dict[str, Any]] = []
+        unmatched: list[dict[str, Any]] = []
+        previous = amounts(initial_total_usage or {})
+        for event in raw_events:
+            payload = event.get("payload")
+            if not isinstance(payload, dict):
+                continue
+            if event.get("type") == "token_usage_record":
+                if isinstance(payload.get("usage"), dict) and (
+                    thread_id is None or payload.get("thread_id") in (None, thread_id)
+                ):
+                    fresh.append(payload["usage"])
+                continue
+            info = payload.get("info") if payload.get("type") == "token_count" else None
+            total = info.get("total_token_usage") if isinstance(info, dict) else None
+            if event.get("type") != "event_msg" or not isinstance(total, dict):
+                continue
+            assert isinstance(info, dict)
+            if is_context_full(info, total):
+                for source in field_map.values():
+                    value = (last_real or {}).get(source)
+                    if isinstance(value, int) and not isinstance(value, bool):
+                        base = (period_start or {}).get(source)
+                        value -= base if isinstance(base, int) else 0
+                        closed[source] = closed.get(source, 0) + value
+                # The new period counts from the marker, whose total_tokens is
+                # the synthetic context window, not usage.
+                period_start = total
+                last_real = None
+                previous = [0] * len(counted)
+                continue
+            current = amounts(total)
+            room = [now - before for now, before in zip(current, previous)]
+            for record in reversed(fresh):
+                usage = amounts(record)
+                if all(used <= free for used, free in zip(usage, room)):
+                    room = [free - used for used, free in zip(usage, room)]
+                else:
+                    unmatched.append(record)
+            fresh = []
+            previous = current
+            last_real = total
+            saw_snapshot = True
+        unmatched.extend(fresh)
+
+        if not saw_snapshot and not closed and not unmatched:
+            return None, True
+        final_total_usage: dict[str, Any] = dict(last_real or {})
+        for source, base in (period_start or {}).items():
+            value = final_total_usage.get(source)
+            if isinstance(value, int) and isinstance(base, int) and last_real:
+                final_total_usage[source] = value - base
+        for source, value in closed.items():
+            current_value = final_total_usage.get(source)
+            final_total_usage[source] = (
+                current_value if isinstance(current_value, int) else 0
+            ) + value
+
         usage: dict[str, int | None] = {}
         for target, source in field_map.items():
             value = final_total_usage.get(source)
@@ -435,6 +517,11 @@ class Codex(BaseInstalledAgent):
                 return None, False
             usage[target] = delta
 
+        for record in unmatched:
+            for target, source in field_map.items():
+                value = record.get(source)
+                if isinstance(value, int) and not isinstance(value, bool):
+                    usage[target] = (usage.get(target) or 0) + value
         return usage, True
 
     @staticmethod
@@ -854,9 +941,28 @@ class Codex(BaseInstalledAgent):
 
     @staticmethod
     def _same_rollout_event(left: dict[str, Any], right: dict[str, Any]) -> bool:
-        return left.get("type") == right.get("type") and left.get(
-            "payload"
-        ) == right.get("payload")
+        if left.get("type") != right.get("type"):
+            return False
+        left_payload, right_payload = left.get("payload"), right.get("payload")
+        if not isinstance(left_payload, dict) or not isinstance(right_payload, dict):
+            return left_payload == right_payload
+        # A fork rewrites copied items for the child (Codex `agent/history.rs`):
+        # checkpoint metadata of `compacted` items and response-item metadata.
+        # Compare what identifies the copied item instead.
+        if left.get("type") == "compacted":
+            keys = (
+                "message",
+                "compaction_response_id",
+                "window_id",
+                "first_window_id",
+                "previous_window_id",
+            )
+            return all(left_payload.get(key) == right_payload.get(key) for key in keys)
+        if left.get("type") == "response_item":
+            return {k: v for k, v in left_payload.items() if k != "metadata"} == {
+                k: v for k, v in right_payload.items() if k != "metadata"
+            }
+        return left_payload == right_payload
 
     def _local_rollout_events(
         self,
@@ -1202,6 +1308,7 @@ class Codex(BaseInstalledAgent):
         api_call_index = 1
         current_api_call_id = f"api_call_{api_call_index}"
         api_call_metrics: dict[str, dict[str, Any]] = {}
+        pending_usage_record: dict[str, Any] | None = None
         saw_model_output_in_api_call = False
         tool_order_counter = 0
         compactions = {id(event) for event in self._compaction_events(raw_events)}
@@ -1210,14 +1317,60 @@ class Codex(BaseInstalledAgent):
             nonlocal saw_model_output_in_api_call
             saw_model_output_in_api_call = True
 
+        # The cumulative total before the current response, for its growth.
+        usage_fields = (
+            "input_tokens",
+            "cached_input_tokens",
+            "cache_write_input_tokens",
+            "output_tokens",
+            "reasoning_output_tokens",
+            "total_tokens",
+        )
+        previous_total: dict[str, Any] = dict(initial_total_usage or {})
+
         def finish_api_call(token_count_payload: dict[str, Any]) -> None:
             nonlocal api_call_index, current_api_call_id, saw_model_output_in_api_call
-            nonlocal tool_order_counter
+            nonlocal tool_order_counter, pending_usage_record, previous_total
+
+            record = pending_usage_record
+            pending_usage_record = None
+            info = token_count_payload.get("info")
+            total = info.get("total_token_usage") if isinstance(info, dict) else None
+            growth: dict[str, Any] | None = None
+            if isinstance(total, dict):
+                window = info.get("model_context_window")
+                if (
+                    isinstance(window, int)
+                    and total.get("total_tokens") == window
+                    and not any(total.get(key) for key in usage_fields[:-1])
+                ):
+                    # An overflow marker restarts the counter from its own values.
+                    previous_total = dict(total)
+                    total = None
+                else:
+                    growth = {
+                        key: total[key] - (previous_total.get(key) or 0)
+                        for key in usage_fields
+                        if isinstance(total.get(key), int)
+                    }
+                    previous_total = dict(total)
 
             if not saw_model_output_in_api_call:
                 return
 
-            metrics = self._metrics_from_token_count_payload(token_count_payload)
+            # The response's own record, else the growth of the cumulative
+            # total: Codex keeps `last_token_usage` unchanged for spending-only
+            # updates such as an incomplete response.
+            if record is not None:
+                metrics = self._metrics_from_token_count_payload(
+                    {"info": {"last_token_usage": record}}
+                )
+            elif growth and any(growth.values()) and min(growth.values()) >= 0:
+                metrics = self._metrics_from_token_count_payload(
+                    {"info": {"last_token_usage": growth}}
+                )
+            else:
+                metrics = self._metrics_from_token_count_payload(token_count_payload)
             if metrics:
                 api_call_metrics[current_api_call_id] = metrics
 
@@ -1255,6 +1408,11 @@ class Codex(BaseInstalledAgent):
                     codex_turn_id = None
                 elif event_type == "token_count":
                     finish_api_call(payload)
+                continue
+
+            if etype == "token_usage_record" and isinstance(payload, dict):
+                if isinstance(payload.get("usage"), dict):
+                    pending_usage_record = payload["usage"]
                 continue
 
             if etype == "turn_context":
@@ -1410,6 +1568,16 @@ class Codex(BaseInstalledAgent):
                 pending_reasoning = None
                 continue
 
+        # A run that stopped inside a tool: the call never got its output and
+        # the response its `token_count`, but both happened and were billed.
+        normalized_events.extend(pending_calls.values())
+        if saw_model_output_in_api_call and pending_usage_record is not None:
+            metrics = self._metrics_from_token_count_payload(
+                {"info": {"last_token_usage": pending_usage_record}}
+            )
+            if metrics:
+                api_call_metrics[current_api_call_id] = metrics
+
         for event in normalized_events:
             api_call_id = event.get("api_call_id")
             if isinstance(api_call_id, str) and api_call_id in api_call_metrics:
@@ -1442,8 +1610,9 @@ class Codex(BaseInstalledAgent):
         if spawned:
             trajectory_extra["spawned_threads"] = spawned
 
-        # Match Harbor's authoritative final-metrics source: the latest
-        # cumulative total_token_usage snapshot. Full-history children subtract
+        # The thread's per-response usage records where Codex writes them;
+        # otherwise Harbor's source, the latest cumulative total_token_usage
+        # snapshot. Full-history children subtract
         # the cumulative baseline copied from their parent so tree totals remain
         # child-local instead of counting inherited history again.
         usage, usage_complete = self._final_cumulative_usage(
