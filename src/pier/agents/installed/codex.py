@@ -83,7 +83,13 @@ class Codex(BaseInstalledAgent):
                 features = toml.loads(self._config_toml).get("features") or {}
             except toml.TomlDecodeError:
                 features = {}
-            if isinstance(features, dict) and features.get("async_compaction") is True:
+            setting = (
+                features.get("async_compaction") if isinstance(features, dict) else None
+            )
+            if setting is True or (
+                # Table form: `[features.async_compaction]` with `enabled`.
+                isinstance(setting, dict) and setting.get("enabled", True) is not False
+            ):
                 # Background compactions are billed but leave neither a
                 # `token_count` nor a `token_usage_record` (Codex 0.166
                 # `compact_remote_v2.rs`), so the run's usage cannot be counted.
@@ -219,15 +225,13 @@ class Codex(BaseInstalledAgent):
             metadata = parsed.get("metadata")
             return output, metadata if isinstance(metadata, dict) else None
 
-        if isinstance(parsed, list) and any(
-            isinstance(item, dict) and isinstance(item.get("text"), str)
-            for item in parsed
-        ):
+        if isinstance(raw, list):
             # Newer Codex records tool output as Responses content items, e.g.
-            # code-mode `exec` results as a list of `input_text` blocks.
-            return Codex._extract_message_text(parsed), None
+            # code-mode `exec` results as a list of `input_text` blocks. A string
+            # is the tool's own text, even when it parses as a JSON array.
+            return Codex._extract_message_text(raw), None
         if isinstance(parsed, list) and isinstance(raw, str):
-            return raw, None  # e.g. a tool that printed a JSON array
+            return raw, None
 
         return str(parsed), None
 
@@ -425,6 +429,7 @@ class Codex(BaseInstalledAgent):
         # real snapshot of the current period. A full-history child's period
         # starts from the parent baseline its counter was seeded with.
         closed: dict[str, int] = {}
+        period_start: dict[str, Any] | None = None
         last_real: dict[str, Any] | None = initial_total_usage
         saw_snapshot = False
         fresh: list[dict[str, Any]] = []
@@ -449,7 +454,12 @@ class Codex(BaseInstalledAgent):
                 for source in field_map.values():
                     value = (last_real or {}).get(source)
                     if isinstance(value, int) and not isinstance(value, bool):
+                        base = (period_start or {}).get(source)
+                        value -= base if isinstance(base, int) else 0
                         closed[source] = closed.get(source, 0) + value
+                # The new period counts from the marker, whose total_tokens is
+                # the synthetic context window, not usage.
+                period_start = total
                 last_real = None
                 previous = [0] * len(counted)
                 continue
@@ -470,6 +480,10 @@ class Codex(BaseInstalledAgent):
         if not saw_snapshot and not closed and not unmatched:
             return None, True
         final_total_usage: dict[str, Any] = dict(last_real or {})
+        for source, base in (period_start or {}).items():
+            value = final_total_usage.get(source)
+            if isinstance(value, int) and isinstance(base, int) and last_real:
+                final_total_usage[source] = value - base
         for source, value in closed.items():
             current_value = final_total_usage.get(source)
             final_total_usage[source] = (
@@ -1330,7 +1344,8 @@ class Codex(BaseInstalledAgent):
                     and total.get("total_tokens") == window
                     and not any(total.get(key) for key in usage_fields[:-1])
                 ):
-                    previous_total = {}  # an overflow marker restarts the counter
+                    # An overflow marker restarts the counter from its own values.
+                    previous_total = dict(total)
                     total = None
                 else:
                     growth = {

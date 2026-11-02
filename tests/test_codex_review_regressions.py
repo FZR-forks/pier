@@ -643,6 +643,11 @@ def test_unreported_cache_writes_stay_absent_from_metrics(tmp_path: Path) -> Non
 @pytest.mark.parametrize(
     ("raw", "expected"),
     [
+        # A tool's own JSON-array text is kept even when items have `text`.
+        (
+            '[{"text": "alpha", "row": 1}]',
+            '[{"text": "alpha", "row": 1}]',
+        ),
         # Codex 0.166 records code-mode `exec` output as Responses content items.
         (
             [
@@ -804,8 +809,14 @@ def test_usage_before_an_overflow_reset_is_kept(tmp_path: Path):
         _usage_record(1_000, 10),
         _snapshot((1_000, 10), (1_000, 10)),
     ]
+    # Real snapshots carry total_tokens; after the reset Codex accumulates on
+    # top of the marker's synthetic total_tokens.
+    events[-5]["payload"]["info"]["total_token_usage"]["total_tokens"] = 30_100
+    events[-1]["payload"]["info"]["total_token_usage"]["total_tokens"] = 95_000 + 1_010
     _write_rollout(tmp_path, f"rollout-{ROOT}.jsonl", events)
 
+    usage, complete = Codex._final_cumulative_usage(events)
+    assert complete and usage["total_tokens"] == 31_110
     final = _convert(tmp_path).final_metrics
 
     assert (final.total_prompt_tokens, final.total_completion_tokens) == (31_000, 110)
@@ -837,13 +848,17 @@ def test_incomplete_response_step_gets_its_own_usage(tmp_path: Path):
     assert trajectory.final_metrics.total_prompt_tokens == 40_000
 
 
-def test_async_compaction_is_rejected(tmp_path: Path):
+@pytest.mark.parametrize(
+    "config",
+    [
+        "[features]\nasync_compaction = true\n",
+        "[features.async_compaction]\nenabled = true\n",
+        "[features]\nasync_compaction = { enabled = true }\n",
+    ],
+)
+def test_async_compaction_is_rejected(tmp_path: Path, config: str):
     with pytest.raises(ValueError, match="async_compaction"):
-        Codex(
-            logs_dir=tmp_path,
-            model_name=ROOT_MODEL,
-            config_toml="[features]\nasync_compaction = true\n",
-        )
+        Codex(logs_dir=tmp_path, model_name=ROOT_MODEL, config_toml=config)
 
 
 def test_rewritten_fork_checkpoint_still_matches_its_parent():
