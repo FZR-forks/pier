@@ -2199,6 +2199,102 @@ def test_compaction_counted_once(tmp_path: Path):
     }
 
 
+def test_session_usage_without_a_message_is_added(tmp_path: Path):
+    """A discarded background compaction summary is billed to the session only."""
+    assistant = {
+        "type": "assistant",
+        "id": "msg_a1",
+        "agent": "build",
+        "model": {"id": "m", "providerID": "p"},
+        "time": {"created": 2, "completed": 3},
+        "finish": "stop",
+        "cost": 0.1,
+        "tokens": {
+            "input": 10,
+            "output": 5,
+            "reasoning": 0,
+            "cache": {"read": 20, "write": 0},
+        },
+        "content": [{"type": "text", "text": "ok"}],
+    }
+    inspection = {
+        "session": {
+            "id": "ses_bg000000000000000000000001",
+            "cost": 0.3,
+            "tokens": {
+                "input": 60,
+                "output": 25,
+                "reasoning": 0,
+                "cache": {"read": 30, "write": 0},
+            },
+        },
+        "messages": [
+            {"type": "user", "id": "msg_u1", "text": "go", "time": {"created": 1}},
+            assistant,
+        ],
+        "active": None,
+        "terminal": None,
+    }
+    agent = make_agent(tmp_path)
+    write_inspections(tmp_path, [inspection])
+    agent.populate_context_post_run(AgentContext())
+
+    final = json.loads((tmp_path / "trajectory.json").read_text())["final_metrics"]
+    assert final["total_prompt_tokens"] == 90
+    assert final["total_completion_tokens"] == 25
+    assert final["total_cached_tokens"] == 30
+    assert final["total_cost_usd"] == pytest.approx(0.3)
+    unattributed = final["extra"]["unattributed_usage"]
+    assert unattributed["prompt_tokens"] == 60
+    assert unattributed["completion_tokens"] == 20
+    assert unattributed["cached_tokens"] == 10
+    assert unattributed["cost_usd"] == pytest.approx(0.2)
+
+
+def test_session_usage_breakdown_follows_adopted_totals(tmp_path: Path):
+    inspection = {
+        "session": {
+            "id": "ses_bg000000000000000000000002",
+            "cost": 0.2,
+            "tokens": {
+                "input": 100,
+                "output": 15,
+                "reasoning": 10,
+                "cache": {"read": 0, "write": 50},
+            },
+        },
+        "messages": [
+            {"type": "user", "id": "msg_u1", "text": "go", "time": {"created": 1}},
+            {
+                "type": "assistant",
+                "id": "msg_a1",
+                "agent": "build",
+                "model": {"id": "m", "providerID": "p"},
+                "time": {"created": 2, "completed": 3},
+                "finish": "stop",
+                "cost": 0.1,
+                "tokens": {
+                    "input": 100,
+                    "output": 5,
+                    "reasoning": 0,
+                    "cache": {"read": 0, "write": 0},
+                },
+                "content": [{"type": "text", "text": "ok"}],
+            },
+        ],
+        "active": None,
+        "terminal": None,
+    }
+    agent = make_agent(tmp_path)
+    write_inspections(tmp_path, [inspection])
+    agent.populate_context_post_run(AgentContext())
+
+    final = json.loads((tmp_path / "trajectory.json").read_text())["final_metrics"]
+    assert (final["total_prompt_tokens"], final["total_completion_tokens"]) == (150, 25)
+    assert final["extra"]["total_cache_write_input_tokens"] == 50
+    assert final["extra"]["total_reasoning_tokens"] == 10
+
+
 def test_compaction_wrapper_reference_is_not_counted_again(tmp_path: Path):
     """A linked wrapper is deduped by record ID, never by equal token totals."""
     inspection = {
@@ -3359,7 +3455,12 @@ def test_preflight_rejects_subagent_model_when_restricted(tmp_path: Path, monkey
 
 
 def _preflight_with_limits(
-    tmp_path: Path, monkeypatch, resolved_limit: dict, compaction: dict | None = None
+    tmp_path: Path,
+    monkeypatch,
+    resolved_limit: dict,
+    compaction: dict | None = None,
+    version: tuple[int, int, int] | None = (2, 0, 8),
+    model_compaction: dict | None = None,
 ) -> dict:
     config: dict = {
         "providers": {
@@ -3390,6 +3491,7 @@ def _preflight_with_limits(
                     "id": "gpt-5.6-luna",
                     "variants": [{"id": "low"}],
                     "limit": resolved_limit,
+                    **({"compaction": model_compaction} if model_compaction else {}),
                 }
             ]
         return []
@@ -3400,6 +3502,7 @@ def _preflight_with_limits(
         model_spec="litellm/gpt-5.6-luna#low",
         config_file=str(config_path),
         restrict_model=True,
+        opencode_version=version,
         timeout=0.01,
     )
 
@@ -3440,6 +3543,111 @@ def test_preflight_reports_opencode_compaction_ceiling(
 ):
     result = _preflight_with_limits(tmp_path, monkeypatch, resolved_limit, compaction)
     assert result["compaction_prompt_ceiling"] == expected
+
+
+@pytest.mark.parametrize(
+    ("resolved_limit", "compaction", "expected"),
+    [
+        # OpenCode 2.2.5 keeps 15%, and at least 16k, of the window free.
+        ({"context": 1000000, "output": 384000}, None, 850000),
+        ({"context": 272000, "input": 144000, "output": 128000}, None, 122400),
+        ({"context": 40000, "output": 8192}, None, 24000),
+        ({"context": 30000, "output": 8192}, None, 25500),
+        ({"context": 272000, "output": 128000}, {"buffer": "20%"}, 217600),
+        ({"context": 272000, "output": 128000}, {"buffer": 0}, 272000),
+        # Native `buffer` wins over legacy `reserved`; invalid values are skipped.
+        ({"context": 272000, "output": 128000}, {"reserved": 40000}, 232000),
+        (
+            {"context": 272000, "output": 128000},
+            {"reserved": 40000, "buffer": "10%"},
+            244800,
+        ),
+        ({"context": 272000, "output": 128000}, {"buffer": "100%"}, 231200),
+        # JSON's integral floats are integers; only ASCII digits form a percent.
+        (
+            {"context": 100000, "input": 90000, "output": 8192},
+            {"reserved": 4000, "buffer": 1000.0},
+            89000,
+        ),
+        ({"context": 100000, "output": 8192}, {"buffer": "1\u0662%"}, 84000),
+        # A buffer that leaves no room is ignored.
+        ({"context": 272000, "output": 128000}, {"buffer": 300000}, 231200),
+        ({"context": 272000, "output": 128000}, {"auto": False}, None),
+    ],
+)
+def test_preflight_reports_current_opencode_compaction_ceiling(
+    tmp_path: Path, monkeypatch, resolved_limit, compaction, expected
+):
+    result = _preflight_with_limits(
+        tmp_path, monkeypatch, resolved_limit, compaction, version=(2, 2, 5)
+    )
+    assert result["compaction_prompt_ceiling"] == expected
+
+
+@pytest.mark.parametrize("version", [None, (2, 0, 19), (2, 2, 4)])
+def test_preflight_does_not_guess_unmirrored_compaction_ceiling(
+    tmp_path: Path, monkeypatch, version
+):
+    result = _preflight_with_limits(
+        tmp_path,
+        monkeypatch,
+        {"context": 272000, "output": 128000},
+        version=version,
+    )
+    assert result["compaction_prompt_ceiling"] is None
+
+
+def test_legacy_provider_compaction_threshold_lowers_ceiling(
+    tmp_path: Path, monkeypatch
+):
+    # OpenCode 2.0.8 takes min(policy.threshold, prompt ceiling) in provider mode.
+    result = _preflight_with_limits(
+        tmp_path,
+        monkeypatch,
+        {"context": 400000, "input": 272000, "output": 128000},
+        model_compaction={"mode": "provider", "threshold": 100000},
+    )
+    assert result["compaction_prompt_ceiling"] == 100000
+
+
+def test_current_rule_follows_javascript_truthiness_for_signed_limits(
+    tmp_path: Path, monkeypatch
+):
+    # 2.2.5: a negative input limit is "set", so the window is negative and
+    # automatic compaction never triggers.
+    result = _preflight_with_limits(
+        tmp_path,
+        monkeypatch,
+        {"context": 100000, "input": -1, "output": 8192},
+        version=(2, 2, 5),
+    )
+    assert result["compaction_prompt_ceiling"] is None
+
+
+def test_failed_version_probe_is_unavailable(tmp_path: Path):
+    binary = tmp_path / "opencode"
+    binary.write_text(
+        "#!/bin/sh\necho 'fatal: cannot initialize /opt/opencode-2.2.5/opencode'\n"
+        "exit 1\n"
+    )
+    binary.chmod(0o755)
+    probed = runner_module.probe_binary_version(str(binary))
+    assert probed.startswith("unavailable: exit 1:")
+    assert runner_module._parse_version(probed) is None
+
+
+def test_parse_opencode_version():
+    assert runner_module._parse_version("opencode v2.2.5") == (2, 2, 5)
+    assert runner_module._parse_version("2.0.8\n") == (2, 0, 8)
+    assert runner_module._parse_version("unavailable: OSError") is None
+    assert runner_module._parse_version("0.0.0-dev-408") is None
+    assert runner_module._parse_version("opencode v2.2.6-beta.1") is None
+    assert (
+        runner_module._parse_version(
+            "unavailable: TimeoutExpired: /opt/opencode-2.2.5/opencode timed out"
+        )
+        is None
+    )
 
 
 def test_preflight_rejects_limits_without_prompt_budget(tmp_path: Path, monkeypatch):

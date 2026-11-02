@@ -638,3 +638,245 @@ def test_unreported_cache_writes_stay_absent_from_metrics(tmp_path: Path) -> Non
     for step in trajectory.steps:
         if step.metrics:
             assert "cache_write_input_tokens" not in (step.metrics.extra or {})
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        # A tool's own JSON-array text is kept even when items have `text`.
+        (
+            '[{"text": "alpha", "row": 1}]',
+            '[{"text": "alpha", "row": 1}]',
+        ),
+        # Codex 0.166 records code-mode `exec` output as Responses content items.
+        (
+            [
+                {"type": "input_text", "text": "Script completed\nOutput:\n"},
+                {"type": "input_text", "text": "OK\n"},
+            ],
+            "Script completed\nOutput:\nOK\n",
+        ),
+        ('{"output": "plain", "metadata": {"exit_code": 0}}', "plain"),
+        # A tool that printed a JSON array keeps its output.
+        ('["a", "b"]', '["a", "b"]'),
+        ("[]", "[]"),
+        ("not json", "not json"),
+    ],
+)
+def test_tool_output_blob_text(raw, expected) -> None:
+    assert Codex._parse_output_blob(raw)[0] == expected
+
+
+def _usage_record(input_tokens: int, output_tokens: int) -> dict[str, object]:
+    usage = {
+        "input_tokens": input_tokens,
+        "cached_input_tokens": 0,
+        "cache_write_input_tokens": 0,
+        "output_tokens": output_tokens,
+        "reasoning_output_tokens": 0,
+        "total_tokens": input_tokens + output_tokens,
+    }
+    return {
+        "type": "token_usage_record",
+        "payload": {"usage": usage, "thread_token_usage": usage},
+    }
+
+
+def test_completed_response_usage_survives_timeout_inside_tool(tmp_path: Path):
+    """Codex records a response's usage before its tool runs, and its
+    `token_count` only after; a timeout in between must not lose either."""
+    events = _thread_events(ROOT, (100, 10), model=ROOT_MODEL)
+    events[-1:-1] = [_usage_record(100, 10)]
+    events += [
+        _usage_record(150, 20),
+        {
+            "type": "response_item",
+            "payload": {
+                "type": "custom_tool_call",
+                "call_id": "call-1",
+                "name": "exec",
+                "input": "await tools.exec_command({cmd: 'sleep 60'})",
+            },
+        },
+    ]
+    _write_rollout(tmp_path, f"rollout-{ROOT}.jsonl", events)
+
+    trajectory = _convert(tmp_path)
+
+    final = trajectory.final_metrics
+    assert (final.total_prompt_tokens, final.total_completion_tokens) == (250, 30)
+    agent_steps = [step for step in trajectory.steps if step.source == "agent"]
+    assert [step.metrics.prompt_tokens for step in agent_steps] == [100, 150]
+    assert agent_steps[-1].tool_calls[0].function_name == "exec"
+    # The tool never returned, so its result has no content.
+    results = agent_steps[-1].observation.results if agent_steps[-1].observation else []
+    assert all(result.content is None for result in results)
+
+
+def test_remote_compaction_response_is_billed(tmp_path: Path):
+    """Shape of a real 0.166 rollout: every response has a usage record, but the
+    `token_count` after a remote compaction leaves the compaction response out."""
+
+    def token_count(total: tuple[int, int], last: tuple[int, int]) -> dict:
+        event = _token_count(*total)
+        event["payload"]["info"]["last_token_usage"] = _usage_record(*last)["payload"][
+            "usage"
+        ]
+        return event
+
+    events = _thread_events(ROOT, None, model=ROOT_MODEL)
+    events += [
+        _usage_record(30_000, 100),
+        token_count((30_000, 100), (30_000, 100)),
+        _usage_record(20_000, 300),  # the remote compaction response
+        {"type": "compacted", "payload": {"message": ""}},
+        token_count((30_000, 100), (0, 0)),
+        _usage_record(1_000, 10),
+        token_count((31_000, 110), (1_000, 10)),
+        # An incomplete response without an ID: in the snapshot, no record.
+        token_count((31_200, 130), (200, 20)),
+        # An incomplete response with an ID: Codex records it and grows the
+        # total, but keeps the previous `last_token_usage` (spending only).
+        _usage_record(300, 30),
+        token_count((31_500, 160), (200, 20)),
+    ]
+    _write_rollout(tmp_path, f"rollout-{ROOT}.jsonl", events)
+
+    final = _convert(tmp_path).final_metrics
+
+    assert (final.total_prompt_tokens, final.total_completion_tokens) == (51_500, 460)
+
+
+def test_older_compaction_record_does_not_take_a_later_responses_growth(
+    tmp_path: Path,
+):
+    """A later, larger response must not be mistaken for an earlier remote
+    compaction whose usage the snapshots never included."""
+
+    def token_count(total: tuple[int, int], last: tuple[int, int]) -> dict:
+        event = _token_count(*total)
+        event["payload"]["info"]["last_token_usage"] = _usage_record(*last)["payload"][
+            "usage"
+        ]
+        return event
+
+    events = _thread_events(ROOT, None, model=ROOT_MODEL)
+    events += [
+        _usage_record(30_000, 100),
+        token_count((30_000, 100), (30_000, 100)),
+        _usage_record(20_000, 300),  # remote compaction
+        token_count((30_000, 100), (0, 0)),
+        _usage_record(30_000, 500),
+        token_count((60_000, 600), (30_000, 500)),
+    ]
+    _write_rollout(tmp_path, f"rollout-{ROOT}.jsonl", events)
+
+    final = _convert(tmp_path).final_metrics
+
+    assert (final.total_prompt_tokens, final.total_completion_tokens) == (80_000, 900)
+
+
+def _snapshot(
+    total: tuple[int, int], last: tuple[int, int], window: int | None = None
+) -> dict:
+    event = _token_count(*total)
+    event["payload"]["info"]["last_token_usage"] = _usage_record(*last)["payload"][
+        "usage"
+    ]
+    if window is not None:
+        event["payload"]["info"]["model_context_window"] = window
+    return event
+
+
+def test_usage_before_an_overflow_reset_is_kept(tmp_path: Path):
+    """After a context overflow Codex zeroes its counter and accumulates anew."""
+    overflow = _token_count(0, 0)
+    overflow["payload"]["info"]["total_token_usage"]["total_tokens"] = 95_000
+    overflow["payload"]["info"]["model_context_window"] = 95_000
+    events = _thread_events(ROOT, None, model=ROOT_MODEL)
+    events += [
+        _usage_record(30_000, 100),
+        _snapshot((30_000, 100), (30_000, 100)),
+        overflow,
+        {
+            "type": "response_item",
+            "payload": {
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "again"}],
+            },
+        },
+        _usage_record(1_000, 10),
+        _snapshot((1_000, 10), (1_000, 10)),
+    ]
+    # Real snapshots carry total_tokens; after the reset Codex accumulates on
+    # top of the marker's synthetic total_tokens.
+    events[-5]["payload"]["info"]["total_token_usage"]["total_tokens"] = 30_100
+    events[-1]["payload"]["info"]["total_token_usage"]["total_tokens"] = 95_000 + 1_010
+    _write_rollout(tmp_path, f"rollout-{ROOT}.jsonl", events)
+
+    usage, complete = Codex._final_cumulative_usage(events)
+    assert complete and usage["total_tokens"] == 31_110
+    final = _convert(tmp_path).final_metrics
+
+    assert (final.total_prompt_tokens, final.total_completion_tokens) == (31_000, 110)
+
+
+def test_incomplete_response_step_gets_its_own_usage(tmp_path: Path):
+    """A spending-only update keeps the previous `last_token_usage`."""
+    message = {
+        "type": "response_item",
+        "payload": {
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": "x"}],
+        },
+    }
+    events = _thread_events(ROOT, None, model=ROOT_MODEL)
+    events += [
+        _usage_record(10_000, 100),
+        _snapshot((10_000, 100), (10_000, 100)),
+        dict(message),
+        _snapshot((40_000, 600), (10_000, 100)),  # incomplete, no record
+    ]
+    _write_rollout(tmp_path, f"rollout-{ROOT}.jsonl", events)
+
+    trajectory = _convert(tmp_path)
+
+    prompts = [s.metrics.prompt_tokens for s in trajectory.steps if s.metrics]
+    assert prompts == [10_000, 30_000]
+    assert trajectory.final_metrics.total_prompt_tokens == 40_000
+
+
+@pytest.mark.parametrize(
+    "config",
+    [
+        "[features]\nasync_compaction = true\n",
+        "[features.async_compaction]\nenabled = true\n",
+        "[features]\nasync_compaction = { enabled = true }\n",
+    ],
+)
+def test_async_compaction_is_rejected(tmp_path: Path, config: str):
+    with pytest.raises(ValueError, match="async_compaction"):
+        Codex(logs_dir=tmp_path, model_name=ROOT_MODEL, config_toml=config)
+
+
+def test_rewritten_fork_checkpoint_still_matches_its_parent():
+    """A fork clears checkpoint metadata on the copied `compacted` item."""
+    parent = {
+        "type": "compacted",
+        "payload": {
+            "message": "summary",
+            "compaction_response_id": "resp_2",
+            "window_id": "w1",
+            "latest_token_usage_record": {"usage": {"input_tokens": 1}},
+            "resume_metadata": {"turn_attribution": {"turn_id": "t"}},
+        },
+    }
+    child = json.loads(json.dumps(parent))
+    child["payload"]["latest_token_usage_record"] = None
+    child["payload"]["resume_metadata"]["turn_attribution"] = None
+    assert Codex._same_rollout_event(child, parent)
+    other = json.loads(json.dumps(child))
+    other["payload"]["compaction_response_id"] = "resp_9"
+    assert not Codex._same_rollout_event(other, parent)

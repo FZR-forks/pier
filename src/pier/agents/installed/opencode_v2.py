@@ -1771,6 +1771,40 @@ class OpenCodeV2(BaseInstalledAgent):
         reported = self._session_reported_usage(session, complete=not incomplete)
         if reported is not None:
             final_extra["session_reported_usage"] = reported.model_dump()
+            # OpenCode also bills requests that leave no message, such as a
+            # background compaction summary that was never applied. Its own
+            # session counters include them, so the difference is added.
+            if reported.complete and usage_seen:
+                # A complete record has every category (`_usage_record_complete`).
+                native = self._partial_usage_fields(session.get("tokens"))
+                unattributed = {
+                    "prompt": (reported.n_input_tokens or 0) - totals["prompt"],
+                    "completion": (reported.n_output_tokens or 0)
+                    - totals["completion"],
+                    "cached": (native["cache_read"] or 0) - totals["cached"],
+                    "cache_write": (native["cache_write"] or 0) - totals["cache_write"],
+                    "reasoning": (native["reasoning"] or 0) - totals["reasoning"],
+                }
+                # Only missing requests are added: every component, uncached
+                # input and visible output included, must not shrink.
+                if (
+                    min(unattributed.values()) >= 0
+                    and unattributed["prompt"]
+                    >= unattributed["cached"] + unattributed["cache_write"]
+                    and unattributed["completion"] >= unattributed["reasoning"]
+                    and any(unattributed.values())
+                ):
+                    for key, value in unattributed.items():
+                        totals[key] += value
+                    extra_usage = {
+                        f"{key}_tokens": value for key, value in unattributed.items()
+                    }
+                    if cost_complete and reported.cost_usd is not None:
+                        extra_usage["cost_usd"] = max(
+                            0.0, reported.cost_usd - totals["cost"]
+                        )
+                        totals["cost"] = max(totals["cost"], reported.cost_usd)
+                    final_extra["unattributed_usage"] = extra_usage
         if usage_seen:
             final_extra["total_cache_write_input_tokens"] = totals["cache_write"]
             final_extra["total_reasoning_tokens"] = totals["reasoning"]
