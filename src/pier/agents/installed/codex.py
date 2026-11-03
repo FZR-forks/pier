@@ -2391,6 +2391,7 @@ class Codex(BaseInstalledAgent):
                 env=env,
             )
         finally:
+            self.finish_execution()
             try:
                 await self.exec_as_agent(
                     environment,

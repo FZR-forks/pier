@@ -5384,6 +5384,25 @@ def _pidfile_agent(tmp_path: Path, pidfile: Path):
     return agent
 
 
+def test_shutdown_ignores_pidfile_reused_by_untagged_service(tmp_path):
+    from pier.trial.processes import AgentProcesses
+
+    service = subprocess.Popen(["sleep", "300"])
+    try:
+        pidfile = tmp_path / "runner.pid"
+        pidfile.write_text(f"runner={service.pid}\nserver=none\ncli=none\n")
+        agent = _pidfile_agent(tmp_path, pidfile)
+        environment = _LocalShellEnvironment()
+        agent._run_processes = AgentProcesses(environment, "different-run")
+        states = asyncio.run(agent._owned_states(environment))
+        assert states == {key: "GONE" for key in agent._OWNED_PROCESSES}
+        asyncio.run(agent._force_stop(environment, None))
+        assert service.poll() is None
+    finally:
+        service.terminate()
+        service.wait()
+
+
 def test_shutdown_targets_the_runner_entry_of_a_multi_entry_pidfile(tmp_path: Path):
     """The graceful SIGTERM must reach the runner, not the whole pidfile.
 

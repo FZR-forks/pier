@@ -76,10 +76,14 @@ Claude Code's reported cost is likewise unknown when any model in its
 model ID and priced it at the default model's rate.
 
 Installed agents are stopped before logs, artifacts, or verification are read,
-on success as well as timeout/failure. Pier snapshots Linux sandbox processes
-before the run, preserves those task services, and terminates new processes
-with TERM then KILL, including detached tools. PID start times prevent PID reuse
-from exempting a new process. OpenCode V2 stops tools first while temporarily
+on success as well as timeout/failure. Pier tags harness execs with an inherited
+per-run environment variable and terminates only matching processes with TERM
+then KILL, including detached tools. Task services and workers they spawn during
+the run are not tagged and are left alone. Tools must inherit the harness's
+environment; deliberately stripping the tag is not a supported security boundary.
+The execution deadline ends before shutdown/collection, so cleanup cannot turn
+an already finished agent into a timeout. Cleanup still completes before the
+result returns, using its own bounded execs. OpenCode V2 stops tools first while temporarily
 preserving its recorded collectors for runner shutdown and usage collection,
 then sweeps again before downloading logs. If stopping cannot be confirmed,
 Pier stops the environment and fails without verification. This assumes an

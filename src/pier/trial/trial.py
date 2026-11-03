@@ -649,17 +649,10 @@ class Trial:
         try:
             step_result.agent_result = AgentContext()
             await self._invoke_hooks(TrialEvent.AGENT_START)
-            await asyncio.wait_for(
-                (
-                    self._agent.run_with_cleanup
-                    if isinstance(self._agent, BaseInstalledAgent)
-                    else self._agent.run
-                )(
-                    instruction=instruction,
-                    environment=self._environment,
-                    context=step_result.agent_result,
-                ),
-                timeout=timeout,
+            await self._execution.run_agent(
+                instruction=instruction,
+                context=step_result.agent_result,
+                timeout_sec=timeout,
             )
         except (asyncio.TimeoutError, NonZeroAgentExitCodeError) as e:
             step_result.exception_info = ExceptionInfo.from_exception(e)

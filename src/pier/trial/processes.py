@@ -3,6 +3,7 @@
 import asyncio
 import contextlib
 import shlex
+import uuid
 
 from pier.environments.base import BaseEnvironment
 
@@ -11,45 +12,42 @@ class AgentProcessCleanupError(RuntimeError):
     """The sandbox is unsafe to verify; do not treat this as an agent timeout."""
 
 
-# Use /proc and shell builtins: installed agents need neither Python nor ps.
-_PROCESS_LIST = """
-for path in /proc/[0-9]*; do
-    IFS= read -r stat < "$path/stat" 2>/dev/null || continue
-    fields=${stat##*) }
-    set -- $fields
-    [ "$1" = Z ] && continue
-    shift 19
-    printf '%s:%s\n' "${path##*/}" "$1"
-done
-"""
+AGENT_RUN_ENV = "PIER_AGENT_RUN"
 
 
 class AgentProcesses:
-    """Preserve pre-existing task services; sweep new processes, even setsid tools.
+    """Stop this run's tagged processes, including detached/reparented tools.
 
-    Each trial owns its sandbox. A process-group kill alone cannot reach tools
-    that detached or were reparented after their harness exited.
+    A tag inherited from the harness distinguishes agent tools from workers
+    spawned by task services during the run. Age and ancestry alone cannot.
     """
 
-    def __init__(self, environment: BaseEnvironment, baseline: set[str]):
+    def __init__(self, environment: BaseEnvironment, token: str):
         self.environment = environment
-        self.baseline = baseline
+        self.token = token
         self.stopped = False
 
     @classmethod
     async def start(cls, environment: BaseEnvironment) -> "AgentProcesses":
-        result = await environment.exec(_PROCESS_LIST, user="root", timeout_sec=10)
-        if result.return_code != 0 or not result.stdout:
-            raise RuntimeError("Could not snapshot sandbox processes before agent run")
-        return cls(environment, set(result.stdout.split()))
+        return cls(environment, uuid.uuid4().hex)
+
+    def owns_pid(self, expression: str) -> str:
+        """Shell guard for adapter PID files: never signal an untagged reuse."""
+        tag = shlex.quote(AGENT_RUN_ENV + "=" + self.token)
+        return (
+            f"{{ owned=false; while IFS= read -r -d '' entry; do "
+            f'if [ "$entry" = {tag} ]; then owned=true; break; fi; '
+            f'done < "/proc/{expression}/environ"; [ "$owned" = true ]; }} 2>/dev/null'
+        )
 
     async def stop(self, keep_pids: tuple[int, ...] = ()) -> None:
         if self.stopped:
             return
-        # Protect the cleanup exec and its ancestors too. They were not present
-        # in the snapshot, but killing them would cut off the sweep itself.
+        # Use /proc and shell builtins, without requiring Python or ps. The
+        # cleanup exec is untagged. Preserve collectors and their exec shells
+        # temporarily when OpenCode needs them for final session collection.
         command = f"""
-baseline={shlex.quote(" " + " ".join(sorted(self.baseline)) + " ")}
+tag={shlex.quote(AGENT_RUN_ENV + "=" + self.token)}
 keep=' '
 for pid in $$ {" ".join(map(str, keep_pids))}; do
     while [ "$pid" -gt 0 ]; do
@@ -69,8 +67,13 @@ for signal in TERM KILL KILL CHECK; do
         fields=${{stat##*) }}
         set -- $fields
         [ "$1" = Z ] && continue
-        shift 19
-        case "$baseline" in *" $pid:$1 "*) continue ;; esac
+        owned=false
+        {{
+            while IFS= read -r -d '' entry; do
+                if [ "$entry" = "$tag" ]; then owned=true; break; fi
+            done < "$path/environ"
+        }} 2>/dev/null
+        [ "$owned" = true ] || continue
         remaining=1
         if [ "$signal" != CHECK ]; then
             kill -"$signal" "$pid" 2>/dev/null || true
@@ -82,9 +85,12 @@ for signal in TERM KILL KILL CHECK; do
 done
 """
         try:
-            result = await self.environment.exec(command, user="root", timeout_sec=10)
-            if result.return_code != 0:
-                raise RuntimeError("Agent processes could not be confirmed stopped")
+            # Container root may lack CAP_SYS_PTRACE and cannot read another
+            # UID's environ. Scan as the agent user too, not just as root.
+            for user in ("root", None):
+                result = await self.environment.exec(command, user=user, timeout_sec=10)
+                if result.return_code != 0:
+                    raise RuntimeError("Agent processes could not be confirmed stopped")
         except Exception:
             # Do not allow verification on a workspace that is still changing.
             try:

@@ -1275,7 +1275,10 @@ class OpenCodeV2(BaseInstalledAgent):
             try:
                 pids = await self._probe(
                     environment,
-                    f"cat {shlex.quote(self._RUNNER_PIDFILE.as_posix())}",
+                    "; ".join(
+                        f"{self._pid_expr(key)}; echo {key}=$pid"
+                        for key in self._OWNED_PROCESSES
+                    ),
                     env,
                 )
             except Exception:
@@ -1293,6 +1296,7 @@ class OpenCodeV2(BaseInstalledAgent):
             await self.stop_processes(keep_pids)
             raise
         finally:
+            self.finish_execution()
             if getattr(self, "_process_cleanup_failed", False):
                 # The fallback already stopped the environment. Do not spend
                 # the runner grace period probing it or read mutable evidence.
@@ -1365,7 +1369,10 @@ class OpenCodeV2(BaseInstalledAgent):
         to select its own line; reading the file whole yields all three.
         """
         pidfile = shlex.quote(self._RUNNER_PIDFILE.as_posix())
-        return f"pid=$(sed -n 's/^{key}=//p' {pidfile} 2>/dev/null | head -n 1)"
+        command = f"pid=$(sed -n 's/^{key}=//p' {pidfile} 2>/dev/null | head -n 1)"
+        if processes := getattr(self, "_run_processes", None):
+            command += f'; {processes.owns_pid("$pid")} || pid=""'
+        return command
 
     async def _owned_states(
         self, environment: BaseEnvironment, env: dict[str, str] | None = None
@@ -1494,10 +1501,15 @@ class OpenCodeV2(BaseInstalledAgent):
         # Anything that escaped still runs the OpenCode binary itself. This
         # cannot be a plain `pkill -f`: the probe shell's own command line
         # contains the pattern, so pkill would match and kill itself.
+        sweep = _BINARY_SWEEP_SCRIPT
+        if processes := getattr(self, "_run_processes", None):
+            sweep = sweep.replace(
+                '  kill -KILL "$victim"',
+                f'  {processes.owns_pid("$victim")} || continue\n  kill -KILL "$victim"',
+            )
         await self._signal(
             environment,
-            f"PATTERN={shlex.quote(self._REMOTE_BINARY.as_posix())}; "
-            + _BINARY_SWEEP_SCRIPT,
+            f"PATTERN={shlex.quote(self._REMOTE_BINARY.as_posix())}; " + sweep,
             env,
         )
 

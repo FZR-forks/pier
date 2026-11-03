@@ -250,21 +250,27 @@ class TrialExecution:
         *,
         instruction: str,
         context: AgentContext,
+        timeout_sec: float | None = None,
     ) -> None:
+        timeout = self.agent_timeout_sec if timeout_sec is None else timeout_sec
         try:
-            await asyncio.wait_for(
-                (
-                    self.agent.run_with_cleanup
-                    if isinstance(self.agent, BaseInstalledAgent)
-                    else self.agent.run
-                )(
+            if isinstance(self.agent, BaseInstalledAgent):
+                await self.agent.run_with_cleanup(
                     instruction=instruction,
                     environment=self.environment,
                     context=context,
-                ),
-                timeout=self.agent_timeout_sec,
-            )
+                    timeout_sec=timeout,
+                )
+            else:
+                await asyncio.wait_for(
+                    self.agent.run(
+                        instruction=instruction,
+                        environment=self.environment,
+                        context=context,
+                    ),
+                    timeout=timeout,
+                )
         except asyncio.TimeoutError as e:
             raise AgentTimeoutError(
-                f"Agent execution timed out after {self.agent_timeout_sec} seconds"
+                f"Agent execution timed out after {timeout} seconds"
             ) from e
