@@ -749,17 +749,21 @@ class GeminiCli(BaseInstalledAgent):
             )
         finally:
             try:
-                await self.exec_as_agent(
-                    environment,
-                    command=(
-                        "src=$(find ~/.gemini/tmp -type f "
-                        "\\( -name 'session-*.jsonl' -o -name 'session-*.json' \\) "
-                        "-printf '%T@ %p\\n' 2>/dev/null | sort -nr | head -n1 "
-                        "| awk '{print $2}'); "
-                        'if [ -n "$src" ]; then '
-                        'cp "$src" "/logs/agent/gemini-cli.trajectory.${src##*.}"; '
-                        "fi"
-                    ),
-                )
-            except Exception:
-                pass
+                await self.stop_processes()
+            finally:
+                if not getattr(self, "_process_cleanup_failed", False):
+                    try:
+                        await self.exec_as_agent(
+                            environment,
+                            command=(
+                                "src=$(find ~/.gemini/tmp -type f "
+                                "\\( -name 'session-*.jsonl' -o -name 'session-*.json' \\) "
+                                "-printf '%T@ %p\\n' 2>/dev/null | sort -nr | head -n1 "
+                                "| awk '{print $2}'); "
+                                'if [ -n "$src" ]; then '
+                                'cp "$src" "/logs/agent/gemini-cli.trajectory.${src##*.}"; '
+                                "fi"
+                            ),
+                        )
+                    except Exception:
+                        pass

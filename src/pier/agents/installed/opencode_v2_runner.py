@@ -2289,9 +2289,14 @@ def main() -> None:
 
     def record_pid(key: str, pid: int) -> None:
         owned_pids[key] = str(pid)
+        try:
+            stat = Path(f"/proc/{pid}/stat").read_text()
+            owned_pids[f"{key}_start"] = stat.rsplit(") ", 1)[1].split()[19]
+        except (OSError, IndexError):
+            owned_pids[f"{key}_start"] = "unknown"
         write_pidfile()
 
-    write_pidfile()
+    record_pid("runner", os.getpid())
     work_dir = Path(args.work_dir).resolve()
     instruction = Path(args.instruction_file).read_text()
     binary = resolve_binary(args.binary)

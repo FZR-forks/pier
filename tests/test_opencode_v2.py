@@ -251,6 +251,34 @@ def test_all_collected_session_usage_survives_missing_intermediate_parent(
         assert not trajectory.get("subagent_trajectories")
 
 
+@pytest.mark.parametrize("partial", [False, True])
+def test_collected_child_usage_survives_failed_root_inspection(tmp_path, partial):
+    inspections = load_fixture()
+    write_inspections(tmp_path, [inspections[1], copy.deepcopy(inspections[1])])
+    runner_dir = tmp_path / "opencode-v2"
+    (runner_dir / "runner-result.json").write_text(
+        json.dumps(
+            {
+                "root_id": inspections[0]["session"]["id"],
+                "collection_complete": False,
+                "collection_errors": ["root inspection failed"],
+            }
+        )
+    )
+    if partial:
+        (runner_dir / "opencode-v2-sessions.jsonl").rename(
+            runner_dir / "opencode-v2-sessions.partial.jsonl"
+        )
+    context = AgentContext()
+    make_agent(tmp_path).populate_context_post_run(context)
+    usage = context.session_reported_usage
+    assert usage.complete is False
+    assert usage.n_input_tokens == 102
+    assert usage.cost_usd == 1.5
+    assert context.n_input_tokens is context.cost_usd is None
+    assert not (tmp_path / "trajectory.json").exists()  # no invented root
+
+
 # ---------------------------------------------------------------------------
 # Registration and naming
 # ---------------------------------------------------------------------------
@@ -2607,7 +2635,8 @@ def test_ambiguous_root_is_refused(tmp_path: Path):
     agent.populate_context_post_run(context)
 
     assert not (tmp_path / "trajectory.json").exists()
-    assert context.is_empty()
+    assert context.n_input_tokens is context.cost_usd is None
+    assert context.session_reported_usage.complete is False
 
 
 def test_empty_root_preserves_child_but_withholds_tree_totals(tmp_path: Path):
@@ -5135,6 +5164,8 @@ def test_timeout_shutdown_stops_opencode_without_killing_it(tmp_path: Path):
         pids = dict(
             line.split("=", 1) for line in pidfile.read_text().split() if "=" in line
         )
+        stat = Path(f"/proc/{pids['runner']}/stat").read_text()
+        assert pids["runner_start"] == stat.rsplit(") ", 1)[1].split()[19]
         os.kill(int(pids["runner"]), signal.SIGTERM)
         process.wait(timeout=30)
     finally:
@@ -5353,6 +5384,48 @@ def _pidfile_agent(tmp_path: Path, pidfile: Path):
     agent._REMOTE_BINARY = Path(f"/nonexistent/opencode-{uuid.uuid4().hex}")
     agent._RUNNER_STOP_POLL_SECONDS = 0.05
     return agent
+
+
+def test_shutdown_ignores_pidfile_reused_by_untagged_service(tmp_path):
+    from pier.trial.processes import AgentProcesses
+
+    service = subprocess.Popen(["sleep", "300"])
+    try:
+        pidfile = tmp_path / "runner.pid"
+        pidfile.write_text(f"runner={service.pid}\nserver=none\ncli=none\n")
+        agent = _pidfile_agent(tmp_path, pidfile)
+        environment = _LocalShellEnvironment()
+        agent._run_processes = AgentProcesses(environment, "different-run")
+        states = asyncio.run(agent._owned_states(environment))
+        assert states == {key: "GONE" for key in agent._OWNED_PROCESSES}
+        asyncio.run(agent._force_stop(environment, None))
+        assert service.poll() is None
+    finally:
+        service.terminate()
+        service.wait()
+
+
+def test_shutdown_rejects_tagged_pid_with_wrong_collector_start(tmp_path):
+    from pier.trial.processes import AGENT_RUN_ENV, AgentProcesses
+
+    process = subprocess.Popen(
+        ["sleep", "300"], env={**os.environ, AGENT_RUN_ENV: "same-run"}
+    )
+    try:
+        pidfile = tmp_path / "runner.pid"
+        pidfile.write_text(
+            f"runner={process.pid}\nrunner_start=0\nserver=none\ncli=none\n"
+        )
+        agent = _pidfile_agent(tmp_path, pidfile)
+        environment = _LocalShellEnvironment()
+        agent._run_processes = AgentProcesses(environment, "same-run")
+        states = asyncio.run(agent._owned_states(environment))
+        assert states == {key: "GONE" for key in agent._OWNED_PROCESSES}
+        asyncio.run(agent._force_stop(environment, None))
+        assert process.poll() is None
+    finally:
+        process.terminate()
+        process.wait()
 
 
 def test_shutdown_targets_the_runner_entry_of_a_multi_entry_pidfile(tmp_path: Path):

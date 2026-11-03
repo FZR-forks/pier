@@ -1269,7 +1269,40 @@ class OpenCodeV2(BaseInstalledAgent):
                 ),
                 env=env,
             )
+        except (asyncio.CancelledError, Exception):
+            # Stop tools immediately, but let the runner/server collect usage
+            # before the final sweep. Their parent exec shells must survive too.
+            try:
+                pids = await self._probe(
+                    environment,
+                    "; ".join(
+                        f"{self._pid_expr(key)}; echo {key}=$pid"
+                        for key in self._OWNED_PROCESSES
+                    ),
+                    env,
+                )
+            except Exception:
+                pids = ""  # No trusted collector identity: stop everything new.
+            keep_pids = tuple(
+                int(value)
+                for line in pids.splitlines()
+                if (value := line.partition("=")[2]).isdigit()
+            )
+            await self._signal(
+                environment,
+                f'{self._pid_expr("runner")}; [ -n "$pid" ] && kill -TERM "$pid"',
+                env,
+            )
+            await self.stop_processes(keep_pids)
+            raise
         finally:
+            self.finish_execution()
+            if getattr(self, "_process_cleanup_failed", False):
+                # The fallback already stopped the environment. Do not spend
+                # the runner grace period probing it or read mutable evidence.
+                from pier.trial.processes import AgentProcessCleanupError
+
+                raise AgentProcessCleanupError("OpenCode process shutdown failed")
             # A timed-out agent is cancelled host-side, and killing a
             # `docker compose exec` client does not signal the process inside
             # the container. Without this the runner, the OpenCode server and
@@ -1279,13 +1312,14 @@ class OpenCodeV2(BaseInstalledAgent):
                 await self._ensure_runner_stopped(environment, env)
             except Exception:
                 self.logger.exception("OpenCode V2 runner shutdown failed")
-            # Preserve the primary execution error even when artifact
-            # collection fails; the runner keeps its JSONL evidence on disk
-            # precisely so a failed run can still be graded.
             try:
-                await self._collect_runner_artifacts(environment)
-            except Exception:
-                self.logger.exception("OpenCode V2 artifact collection failed")
+                await self.stop_processes()
+            finally:
+                if not getattr(self, "_process_cleanup_failed", False):
+                    try:
+                        await self._collect_runner_artifacts(environment)
+                    except Exception:
+                        self.logger.exception("OpenCode V2 artifact collection failed")
 
     def _build_register_skills_command(self) -> str | None:
         if not self.skills_dir:
@@ -1335,7 +1369,16 @@ class OpenCodeV2(BaseInstalledAgent):
         to select its own line; reading the file whole yields all three.
         """
         pidfile = shlex.quote(self._RUNNER_PIDFILE.as_posix())
-        return f"pid=$(sed -n 's/^{key}=//p' {pidfile} 2>/dev/null | head -n 1)"
+        command = f"pid=$(sed -n 's/^{key}=//p' {pidfile} 2>/dev/null | head -n 1)"
+        if processes := getattr(self, "_run_processes", None):
+            command += f'; {processes.owns_pid("$pid")} || pid=""'
+            command += (
+                f"; expected=$(sed -n 's/^{key}_start=//p' {pidfile} | head -n 1)"
+                '; current=$(sed "s/.*) //" "/proc/$pid/stat" 2>/dev/null '
+                "| cut -d' ' -f20)"
+                '; [ -n "$expected" ] && [ "$current" = "$expected" ] || pid=""'
+            )
+        return command
 
     async def _owned_states(
         self, environment: BaseEnvironment, env: dict[str, str] | None = None
@@ -1464,10 +1507,15 @@ class OpenCodeV2(BaseInstalledAgent):
         # Anything that escaped still runs the OpenCode binary itself. This
         # cannot be a plain `pkill -f`: the probe shell's own command line
         # contains the pattern, so pkill would match and kill itself.
+        sweep = _BINARY_SWEEP_SCRIPT
+        if processes := getattr(self, "_run_processes", None):
+            sweep = sweep.replace(
+                '  kill -KILL "$victim"',
+                f'  {processes.owns_pid("$victim")} || continue\n  kill -KILL "$victim"',
+            )
         await self._signal(
             environment,
-            f"PATTERN={shlex.quote(self._REMOTE_BINARY.as_posix())}; "
-            + _BINARY_SWEEP_SCRIPT,
+            f"PATTERN={shlex.quote(self._REMOTE_BINARY.as_posix())}; " + sweep,
             env,
         )
 
@@ -2888,19 +2936,14 @@ class OpenCodeV2(BaseInstalledAgent):
                 self.logs_dir / "opencode-v2" / "opencode-v2-sessions.partial.jsonl"
             )
             if partial:
-                # Only adopt the partial snapshot when a confirmed root is
-                # actually in it. Otherwise root selection would fall back to
-                # graph inference and could crown an orphaned child -- a
-                # snapshot taken mid-collection often holds a child whose
-                # parent was not fetched -- giving the run the wrong identity.
+                # A confirmed root prevents graph inference from crowning an
+                # orphaned child. Even if that root is missing, keep collected
+                # child usage as incomplete accounting, not an exact trajectory.
                 live_evidence = self._live_evidence()
-                validated_root = live_evidence.get("validated_root_id")
-                snapshot_ids = {
-                    str((record.get("session") or {}).get("id"))
-                    for record in partial
-                    if isinstance(record.get("session"), dict)
-                }
-                if validated_root and str(validated_root) in snapshot_ids:
+                validated_root = (runner_result or {}).get(
+                    "root_id"
+                ) or live_evidence.get("validated_root_id")
+                if validated_root:
                     self.logger.warning(
                         "Using %d partial OpenCode V2 session snapshot record(s); "
                         "the runner did not finish collection",
@@ -2911,7 +2954,7 @@ class OpenCodeV2(BaseInstalledAgent):
                 else:
                     self.logger.warning(
                         "Ignoring %d partial OpenCode V2 session record(s): no "
-                        "confirmed root session is present in them",
+                        "confirmed root session is known",
                         len(partial),
                     )
         valid_inspections = [
@@ -3026,6 +3069,12 @@ class OpenCodeV2(BaseInstalledAgent):
         if not trajectories:
             self._raise_model_restriction_failure(restriction_mismatches)
             return
+
+        # Accounting is useful even when the root cannot be reconstructed. Do
+        # not promote an orphan to root or present these observations as exact.
+        context.session_reported_usage = self._collected_session_usage(
+            trajectories, complete=False
+        )
 
         recorded_root_id = (
             str(runner_result.get("root_id"))

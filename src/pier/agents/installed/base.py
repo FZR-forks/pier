@@ -1,3 +1,4 @@
+import asyncio
 import functools
 import os
 from abc import ABC, abstractmethod
@@ -12,6 +13,7 @@ from pier.agents.base import BaseAgent
 from pier.agents.ca_trust import EXTRA_CA_CERTS_ENV, ca_trust_env
 from pier.environments.base import BaseEnvironment
 from pier.models.agent.install import AgentInstallSpec
+from pier.trial.processes import AGENT_RUN_ENV, AgentProcessCleanupError, AgentProcesses
 from pier.utils.env import parse_bool_env_value
 from pier.utils.templating import render_prompt_template
 
@@ -340,6 +342,41 @@ class BaseInstalledAgent(BaseAgent, ABC):
         """
         return dict(env or {})
 
+    async def run_with_cleanup(
+        self,
+        instruction: str,
+        environment: BaseEnvironment,
+        context: "AgentContext",
+        *,
+        timeout_sec: float | None = None,
+    ) -> None:
+        async with await AgentProcesses.start(environment) as processes:
+            self._run_processes = processes
+            self._process_cleanup_failed = False
+            try:
+                async with asyncio.timeout(timeout_sec) as deadline:
+                    self._run_deadline = deadline
+                    await self.run(instruction, environment, context)
+            finally:
+                self._run_deadline = None
+                self._run_processes = None
+
+    def finish_execution(self) -> None:
+        """The inference command ended; shutdown/collection has its own bounds."""
+        deadline = getattr(self, "_run_deadline", None)
+        if deadline is not None and not deadline.expired():
+            deadline.reschedule(None)
+
+    async def stop_processes(self, keep_pids: tuple[int, ...] = ()) -> None:
+        """Stop tools before an adapter copies its native session logs."""
+        self.finish_execution()
+        if processes := getattr(self, "_run_processes", None):
+            try:
+                await processes.wait_stopped(keep_pids)
+            except AgentProcessCleanupError:
+                self._process_cleanup_failed = True
+                raise
+
     async def _exec(
         self,
         environment: BaseEnvironment,
@@ -377,10 +414,14 @@ class BaseInstalledAgent(BaseAgent, ABC):
             },
         )
 
+        process_env = environment.agent_process_env(merged_env)
+        if processes := getattr(self, "_run_processes", None):
+            process_env = {**(process_env or {}), AGENT_RUN_ENV: processes.token}
+
         result = await environment.exec(
             command=f"set -o pipefail; {command}",
             user=user,
-            env=environment.agent_process_env(merged_env),
+            env=process_env,
             cwd=cwd,
             timeout_sec=timeout_sec,
         )
