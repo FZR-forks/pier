@@ -81,6 +81,10 @@ per-run environment variable and terminates only matching processes with TERM
 then KILL, including detached tools. Task services and workers they spawn during
 the run are not tagged and are left alone. Tools must inherit the harness's
 environment; deliberately stripping the tag is not a supported security boundary.
+Unreadable environments are retried as the process's own UID; if ownership
+still cannot be determined, cleanup fails closed rather than killing unknown
+service processes or proceeding to grade. OpenCode collector PID entries also
+carry start times so a reused tagged tool cannot inherit a collector exemption.
 The execution deadline ends before shutdown/collection, so cleanup cannot turn
 an already finished agent into a timeout. Cleanup still completes before the
 result returns, using its own bounded execs. OpenCode V2 stops tools first while temporarily

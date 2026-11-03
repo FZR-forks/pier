@@ -28,6 +28,23 @@ async def test_cleanup_failure_is_not_an_agent_timeout():
 
 
 @pytest.mark.asyncio
+async def test_fallback_stop_has_its_own_deadline(monkeypatch):
+    async def hang(**kwargs):
+        await asyncio.Event().wait()
+
+    environment = SimpleNamespace(
+        exec=AsyncMock(side_effect=TimeoutError("exec unavailable")),
+        stop=AsyncMock(side_effect=hang),
+    )
+    monkeypatch.setattr(AgentProcesses, "_STOP_TIMEOUT_SEC", 0.01)
+    with pytest.raises(AgentProcessCleanupError):
+        await asyncio.wait_for(
+            AgentProcesses(environment, "test-run").wait_stopped(), 1
+        )
+    environment.stop.assert_awaited_once_with(delete=False)
+
+
+@pytest.mark.asyncio
 async def test_cleanup_finishes_before_cancellation_returns():
     entered, release = asyncio.Event(), asyncio.Event()
     environment = SimpleNamespace(exec=AsyncMock())
@@ -110,6 +127,11 @@ async def test_codex_copies_logs_after_cleanup_cancellation(tmp_path):
     commands = [call.kwargs["command"] for call in agent.exec_as_agent.await_args_list]
     assert any('rm -f "$CODEX_HOME/auth.json"' in cmd for cmd in commands)
     assert any('cp -R "$CODEX_HOME/sessions"' in cmd for cmd in commands)
+    assert all(
+        call.kwargs.get("timeout_sec") is not None
+        for call in agent.exec_as_agent.await_args_list
+        if 'rm -f "$CODEX_HOME/auth.json"' in call.kwargs["command"]
+    )
 
 
 @pytest.mark.asyncio
@@ -337,5 +359,57 @@ async def test_sandbox_sweep_stops_detached_tools_and_preserves_services(
             "-f",
             name,
             stdout=asyncio.subprocess.DEVNULL,
+        )
+        await remove.wait()
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(os.getenv("PIER_TEST_DOCKER") != "1", reason="opt-in Docker test")
+@pytest.mark.parametrize("unreadable", [False, True])
+async def test_cleanup_finds_tagged_tool_under_third_uid(unreadable):
+    name = f"pier-process-test-{uuid.uuid4().hex[:10]}"
+    start = await asyncio.create_subprocess_exec(
+        "docker",
+        "run",
+        "--rm",
+        "-d",
+        "--name",
+        name,
+        "python:3.13-slim",
+        "sleep",
+        "infinity",
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    await start.communicate()
+    assert start.returncode == 0
+    environment = DockerShell(name)
+    try:
+        await environment.exec("useradd -m worker; chmod 777 /")
+        processes = await AgentProcesses.start(environment)
+        script = (
+            "import ctypes,pathlib,time; "
+            + ("ctypes.CDLL(None).prctl(4,0); " if unreadable else "")
+            + "pathlib.Path('/started').touch(); time.sleep(5); "
+            "pathlib.Path('/late-write').touch()"
+        )
+        await environment.exec(
+            f"python3 -c {shlex.quote(script)} >/dev/null 2>&1 &",
+            user="worker",
+            env={AGENT_RUN_ENV: processes.token},
+        )
+        await environment.exec("while [ ! -f /started ]; do sleep .01; done")
+        if unreadable:
+            environment.stop = AsyncMock()
+            with pytest.raises(AgentProcessCleanupError):
+                await processes.wait_stopped()
+            environment.stop.assert_awaited_once_with(delete=False)
+            return
+        await processes.wait_stopped()
+        await asyncio.sleep(5)
+        assert (await environment.exec("test ! -f /late-write")).return_code == 0
+    finally:
+        remove = await asyncio.create_subprocess_exec(
+            "docker", "rm", "-f", name, stdout=asyncio.subprocess.DEVNULL
         )
         await remove.wait()

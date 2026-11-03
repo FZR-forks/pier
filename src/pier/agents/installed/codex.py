@@ -2396,6 +2396,7 @@ class Codex(BaseInstalledAgent):
                 await self.exec_as_agent(
                     environment,
                     command=f'rm -f "$CODEX_HOME/auth.json"; rm -rf {shlex.quote(remote_secrets_dir)}',
+                    timeout_sec=10,
                     env=env,
                 )
             except Exception:
@@ -2415,12 +2416,16 @@ class Codex(BaseInstalledAgent):
                                 "fi"
                             ),
                             env=env,
+                            timeout_sec=30,
                         )
                     except Exception:
                         pass
                     try:
                         await self.exec_as_agent(
-                            environment, command='rm -rf "$CODEX_HOME"', env=env
+                            environment,
+                            command='rm -rf "$CODEX_HOME"',
+                            env=env,
+                            timeout_sec=10,
                         )
                     except Exception:
                         pass

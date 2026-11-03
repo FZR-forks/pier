@@ -5164,6 +5164,8 @@ def test_timeout_shutdown_stops_opencode_without_killing_it(tmp_path: Path):
         pids = dict(
             line.split("=", 1) for line in pidfile.read_text().split() if "=" in line
         )
+        stat = Path(f"/proc/{pids['runner']}/stat").read_text()
+        assert pids["runner_start"] == stat.rsplit(") ", 1)[1].split()[19]
         os.kill(int(pids["runner"]), signal.SIGTERM)
         process.wait(timeout=30)
     finally:
@@ -5401,6 +5403,29 @@ def test_shutdown_ignores_pidfile_reused_by_untagged_service(tmp_path):
     finally:
         service.terminate()
         service.wait()
+
+
+def test_shutdown_rejects_tagged_pid_with_wrong_collector_start(tmp_path):
+    from pier.trial.processes import AGENT_RUN_ENV, AgentProcesses
+
+    process = subprocess.Popen(
+        ["sleep", "300"], env={**os.environ, AGENT_RUN_ENV: "same-run"}
+    )
+    try:
+        pidfile = tmp_path / "runner.pid"
+        pidfile.write_text(
+            f"runner={process.pid}\nrunner_start=0\nserver=none\ncli=none\n"
+        )
+        agent = _pidfile_agent(tmp_path, pidfile)
+        environment = _LocalShellEnvironment()
+        agent._run_processes = AgentProcesses(environment, "same-run")
+        states = asyncio.run(agent._owned_states(environment))
+        assert states == {key: "GONE" for key in agent._OWNED_PROCESSES}
+        asyncio.run(agent._force_stop(environment, None))
+        assert process.poll() is None
+    finally:
+        process.terminate()
+        process.wait()
 
 
 def test_shutdown_targets_the_runner_entry_of_a_multi_entry_pidfile(tmp_path: Path):

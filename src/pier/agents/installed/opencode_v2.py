@@ -1372,6 +1372,12 @@ class OpenCodeV2(BaseInstalledAgent):
         command = f"pid=$(sed -n 's/^{key}=//p' {pidfile} 2>/dev/null | head -n 1)"
         if processes := getattr(self, "_run_processes", None):
             command += f'; {processes.owns_pid("$pid")} || pid=""'
+            command += (
+                f"; expected=$(sed -n 's/^{key}_start=//p' {pidfile} | head -n 1)"
+                '; current=$(sed "s/.*) //" "/proc/$pid/stat" 2>/dev/null '
+                "| cut -d' ' -f20)"
+                '; [ -n "$expected" ] && [ "$current" = "$expected" ] || pid=""'
+            )
         return command
 
     async def _owned_states(

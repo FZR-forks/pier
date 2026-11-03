@@ -22,6 +22,8 @@ class AgentProcesses:
     spawned by task services during the run. Age and ancestry alone cannot.
     """
 
+    _STOP_TIMEOUT_SEC = 60
+
     def __init__(self, environment: BaseEnvironment, token: str):
         self.environment = environment
         self.token = token
@@ -48,6 +50,7 @@ class AgentProcesses:
         # temporarily when OpenCode needs them for final session collection.
         command = f"""
 tag={shlex.quote(AGENT_RUN_ENV + "=" + self.token)}
+my_uid=$(id -u) || exit 1
 keep=' '
 for pid in $$ {" ".join(map(str, keep_pids))}; do
     while [ "$pid" -gt 0 ]; do
@@ -68,11 +71,27 @@ for signal in TERM KILL KILL CHECK; do
         set -- $fields
         [ "$1" = Z ] && continue
         owned=false
+        readable=false
         {{
+            readable=true
             while IFS= read -r -d '' entry; do
                 if [ "$entry" = "$tag" ]; then owned=true; break; fi
-            done < "$path/environ"
-        }} 2>/dev/null
+            done
+            true
+        }} < "$path/environ" 2>/dev/null || readable=false
+        if [ "$readable" = false ]; then
+            [ -d "$path" ] || continue
+            uid=''
+            while read -r key value rest; do
+                [ "$key" = Uid: ] && {{ uid=$value; break; }}
+            done < "$path/status"
+            [ -n "$uid" ] || exit 1
+            # Retry other owners as their own UID. An unreadable environment
+            # even as its owner is unknown, not evidence that it is unowned.
+            [ "$uid" != "$my_uid" ] || exit 1
+            printf '%s\n' "$uid"
+            continue
+        fi
         [ "$owned" = true ] || continue
         remaining=1
         if [ "$signal" != CHECK ]; then
@@ -85,16 +104,24 @@ for signal in TERM KILL KILL CHECK; do
 done
 """
         try:
-            # Container root may lack CAP_SYS_PTRACE and cannot read another
-            # UID's environ. Scan as the agent user too, not just as root.
-            for user in ("root", None):
+            # Container root may lack CAP_SYS_PTRACE. Retry unreadable owners
+            # as their UID, including tools that switched away from the agent.
+            users = ["root"]
+            for user in users:
                 result = await self.environment.exec(command, user=user, timeout_sec=10)
                 if result.return_code != 0:
                     raise RuntimeError("Agent processes could not be confirmed stopped")
+                for uid in (result.stdout or "").split():
+                    if not uid.isdigit():
+                        raise RuntimeError("Invalid process owner in cleanup output")
+                    if uid not in users and uid != "0":
+                        users.append(uid)
         except Exception:
             # Do not allow verification on a workspace that is still changing.
             try:
-                await self.environment.stop(delete=False)
+                await asyncio.wait_for(
+                    self.environment.stop(delete=False), timeout=self._STOP_TIMEOUT_SEC
+                )
             finally:
                 raise AgentProcessCleanupError("Could not stop sandbox agent processes")
         self.stopped = not keep_pids
