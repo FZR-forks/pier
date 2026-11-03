@@ -436,3 +436,21 @@ async def test_cancel_waiting_for_start_accounting_lock_counts_retry(
     assert summary.stats.n_completed_trials == 1
     assert summary.stats.n_running_trials == 0
     assert summary.stats.n_retries == summary.stats.retry_overhead.n_attempts == 1
+
+
+@pytest.mark.asyncio
+async def test_unconfirmed_agent_shutdown_skips_verification(tmp_path):
+    from pier.trial.processes import AgentProcessCleanupError
+
+    config = trial_result(tmp_path).config
+    trial = lifecycle_trial(config)
+
+    async def unsafe():
+        raise AgentProcessCleanupError("still running")
+
+    trial._execute_agent = unsafe
+    trial._run_verification = AsyncMock()
+    result = await trial.run()
+    assert result.exception_info.exception_type == "AgentProcessCleanupError"
+    assert result.verifier_result is None
+    trial._run_verification.assert_not_awaited()
