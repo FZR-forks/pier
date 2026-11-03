@@ -55,7 +55,7 @@ keep=' '
 for pid in $$ {" ".join(map(str, keep_pids))}; do
     while [ "$pid" -gt 0 ]; do
         keep="$keep$pid "
-        IFS= read -r stat < "/proc/$pid/stat" 2>/dev/null || break
+        IFS= read -r stat 2>/dev/null < "/proc/$pid/stat" || break
         fields=${{stat##*) }}
         set -- $fields
         pid=$2
@@ -66,7 +66,7 @@ for signal in TERM KILL KILL CHECK; do
     for path in /proc/[0-9]*; do
         pid=${{path##*/}}
         case "$keep" in *" $pid "*) continue ;; esac
-        IFS= read -r stat < "$path/stat" 2>/dev/null || continue
+        IFS= read -r stat 2>/dev/null < "$path/stat" || continue
         fields=${{stat##*) }}
         set -- $fields
         [ "$1" = Z ] && continue
@@ -78,17 +78,26 @@ for signal in TERM KILL KILL CHECK; do
                 if [ "$entry" = "$tag" ]; then owned=true; break; fi
             done
             true
-        }} < "$path/environ" 2>/dev/null || readable=false
+        }} 2>/dev/null < "$path/environ" || readable=false
         if [ "$readable" = false ]; then
             [ -d "$path" ] || continue
+            # A process can exit between stat and environ (zombies keep /proc
+            # entries but are no longer able to write). Recheck before failing.
+            IFS= read -r stat 2>/dev/null < "$path/stat" || continue
+            fields=${{stat##*) }}
+            set -- $fields
+            [ "$1" = Z ] && continue
             uid=''
             while read -r key value rest; do
                 [ "$key" = Uid: ] && {{ uid=$value; break; }}
-            done < "$path/status"
+            done 2>/dev/null < "$path/status"
             [ -n "$uid" ] || exit 1
             # Retry other owners as their own UID. An unreadable environment
             # even as its owner is unknown, not evidence that it is unowned.
-            [ "$uid" != "$my_uid" ] || exit 1
+            if [ "$uid" = "$my_uid" ]; then
+                echo "Unreadable process environment: pid=$pid uid=$uid" >&2
+                exit 1
+            fi
             printf '%s\n' "$uid"
             continue
         fi
@@ -110,10 +119,15 @@ done
             for user in users:
                 result = await self.environment.exec(command, user=user, timeout_sec=10)
                 if result.return_code != 0:
-                    raise RuntimeError("Agent processes could not be confirmed stopped")
+                    raise RuntimeError(
+                        "Agent processes could not be confirmed stopped: "
+                        f"{result.stderr or result.stdout}"
+                    )
                 for uid in (result.stdout or "").split():
                     if not uid.isdigit():
-                        raise RuntimeError("Invalid process owner in cleanup output")
+                        raise RuntimeError(
+                            f"Invalid process owner in cleanup output: {uid}"
+                        )
                     if uid not in users and uid != "0":
                         users.append(uid)
         except Exception:

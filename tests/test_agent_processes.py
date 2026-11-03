@@ -235,7 +235,7 @@ class DockerShell:
             "-c",
             command,
             stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
         )
         try:
             stdout, stderr = await process.communicate()
@@ -246,7 +246,7 @@ class DockerShell:
         return ExecResult(
             return_code=process.returncode,
             stdout=stdout.decode(),
-            stderr=stderr.decode(),
+            stderr=stderr.decode() if stderr else None,
         )
 
 
