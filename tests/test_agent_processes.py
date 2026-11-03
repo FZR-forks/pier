@@ -43,10 +43,57 @@ async def test_cleanup_finishes_before_cancellation_returns():
     task.cancel()
     await asyncio.sleep(0)
     assert not task.done()
+    task.cancel()
+    await asyncio.sleep(0)
+    assert not task.done()
     release.set()
     with pytest.raises(asyncio.CancelledError):
         await task
     assert processes.stopped
+
+
+@pytest.mark.asyncio
+async def test_codex_copies_logs_after_cleanup_cancellation(tmp_path):
+    from pier.agents.installed.codex import Codex
+
+    agent = Codex(
+        logs_dir=tmp_path,
+        model_name="openai/test",
+        extra_env={"OPENAI_API_KEY": "test-key"},
+    )
+    agent.exec_as_agent = AsyncMock(return_value=ExecResult(return_code=0))
+    agent.stop_processes = AsyncMock(side_effect=asyncio.CancelledError())
+    with pytest.raises(asyncio.CancelledError):
+        await agent.run("task", SimpleNamespace(), AgentContext())
+    commands = [call.kwargs["command"] for call in agent.exec_as_agent.await_args_list]
+    assert any('rm -f "$CODEX_HOME/auth.json"' in cmd for cmd in commands)
+    assert any('cp -R "$CODEX_HOME/sessions"' in cmd for cmd in commands)
+
+
+@pytest.mark.asyncio
+async def test_codex_removes_credentials_but_skips_copy_if_shutdown_fails(tmp_path):
+    from pier.agents.installed.codex import Codex
+
+    agent = Codex(
+        logs_dir=tmp_path,
+        model_name="openai/test",
+        extra_env={"OPENAI_API_KEY": "test-key"},
+    )
+    agent.exec_as_agent = AsyncMock(return_value=ExecResult(return_code=0))
+
+    async def fail():
+        commands = [
+            call.kwargs["command"] for call in agent.exec_as_agent.await_args_list
+        ]
+        assert any('rm -f "$CODEX_HOME/auth.json"' in cmd for cmd in commands)
+        agent._process_cleanup_failed = True
+        raise AgentProcessCleanupError("failed")
+
+    agent.stop_processes = fail
+    with pytest.raises(AgentProcessCleanupError):
+        await agent.run("task", SimpleNamespace(), AgentContext())
+    commands = [call.kwargs["command"] for call in agent.exec_as_agent.await_args_list]
+    assert not any('cp -R "$CODEX_HOME/sessions"' in cmd for cmd in commands)
 
 
 @pytest.mark.asyncio
@@ -78,7 +125,11 @@ async def test_tools_stop_before_collectors_then_final_sweep():
         )
         await processes.wait_stopped((pid,))
         assert not processes.stopped
-        assert (await environment.exec(f"kill -0 {pid}")).return_code == 0
+        assert (
+            await environment.exec(
+                f"grep -qE '^State:[[:space:]]+[^Z]' /proc/{pid}/status"
+            )
+        ).return_code == 0
         await processes.wait_stopped()
         assert processes.stopped
         await asyncio.sleep(5)
@@ -158,6 +209,11 @@ async def test_sandbox_sweep_stops_detached_tools_and_preserves_services(
                 'setsid bash -c \'trap "" TERM; touch /started; '
                 "sleep 5; touch /late-write' >/dev/null 2>&1 &"
             )
+            for _ in range(100):
+                if (await environment.exec("test -f /started")).return_code == 0:
+                    break
+                await asyncio.sleep(0.01)
+            assert (await environment.exec("test -f /started")).return_code == 0
             if outcome in {"timeout", "cancel"}:
                 await agent.exec_as_agent(environment, "sleep 300")
             if outcome == "error":
@@ -187,7 +243,9 @@ async def test_sandbox_sweep_stops_detached_tools_and_preserves_services(
         else:
             await task
         assert (
-            await environment.exec(f"kill -0 {service.stdout.strip()}")
+            await environment.exec(
+                f"grep -qE '^State:[[:space:]]+[^Z]' /proc/{service.stdout.strip()}/status"
+            )
         ).return_code == 0
         await asyncio.sleep(5)
         assert (await environment.exec("test ! -f /late-write")).return_code == 0

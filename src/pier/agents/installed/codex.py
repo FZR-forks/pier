@@ -2391,31 +2391,35 @@ class Codex(BaseInstalledAgent):
                 env=env,
             )
         finally:
-            await self.stop_processes()
             try:
                 await self.exec_as_agent(
                     environment,
-                    command=(
-                        f"mkdir -p {EnvironmentPaths.agent_dir.as_posix()}\n"
-                        'if [ -d "$CODEX_HOME/sessions" ]; then\n'
-                        f"  rm -rf {
-                            (EnvironmentPaths.agent_dir / 'sessions').as_posix()
-                        }\n"
-                        f'  cp -R "$CODEX_HOME/sessions" {
-                            (EnvironmentPaths.agent_dir / "sessions").as_posix()
-                        }\n'
-                        "fi"
-                    ),
+                    command=f'rm -f "$CODEX_HOME/auth.json"; rm -rf {shlex.quote(remote_secrets_dir)}',
                     env=env,
                 )
             except Exception:
                 pass
-            # cleanup - best effort
             try:
-                await self.exec_as_agent(
-                    environment,
-                    command=f'rm -rf {shlex.quote(remote_secrets_dir)} "$CODEX_HOME"',
-                    env=env,
-                )
-            except Exception:
-                pass
+                await self.stop_processes()
+            finally:
+                if not getattr(self, "_process_cleanup_failed", False):
+                    try:
+                        await self.exec_as_agent(
+                            environment,
+                            command=(
+                                f"mkdir -p {EnvironmentPaths.agent_dir.as_posix()}\n"
+                                'if [ -d "$CODEX_HOME/sessions" ]; then\n'
+                                f"  rm -rf {(EnvironmentPaths.agent_dir / 'sessions').as_posix()}\n"
+                                f'  cp -R "$CODEX_HOME/sessions" {(EnvironmentPaths.agent_dir / "sessions").as_posix()}\n'
+                                "fi"
+                            ),
+                            env=env,
+                        )
+                    except Exception:
+                        pass
+                    try:
+                        await self.exec_as_agent(
+                            environment, command='rm -rf "$CODEX_HOME"', env=env
+                        )
+                    except Exception:
+                        pass

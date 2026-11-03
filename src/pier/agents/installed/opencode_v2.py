@@ -1293,6 +1293,12 @@ class OpenCodeV2(BaseInstalledAgent):
             await self.stop_processes(keep_pids)
             raise
         finally:
+            if getattr(self, "_process_cleanup_failed", False):
+                # The fallback already stopped the environment. Do not spend
+                # the runner grace period probing it or read mutable evidence.
+                from pier.trial.processes import AgentProcessCleanupError
+
+                raise AgentProcessCleanupError("OpenCode process shutdown failed")
             # A timed-out agent is cancelled host-side, and killing a
             # `docker compose exec` client does not signal the process inside
             # the container. Without this the runner, the OpenCode server and
@@ -1302,14 +1308,14 @@ class OpenCodeV2(BaseInstalledAgent):
                 await self._ensure_runner_stopped(environment, env)
             except Exception:
                 self.logger.exception("OpenCode V2 runner shutdown failed")
-            await self.stop_processes()
-            # Preserve the primary execution error even when artifact
-            # collection fails; the runner keeps its JSONL evidence on disk
-            # precisely so a failed run can still be graded.
             try:
-                await self._collect_runner_artifacts(environment)
-            except Exception:
-                self.logger.exception("OpenCode V2 artifact collection failed")
+                await self.stop_processes()
+            finally:
+                if not getattr(self, "_process_cleanup_failed", False):
+                    try:
+                        await self._collect_runner_artifacts(environment)
+                    except Exception:
+                        self.logger.exception("OpenCode V2 artifact collection failed")
 
     def _build_register_skills_command(self) -> str | None:
         if not self.skills_dir:

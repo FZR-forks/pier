@@ -50,6 +50,7 @@ from pier.models.trial.result import (
 )
 from pier.models.verifier.result import VerifierResult
 from pier.trial.artifact_handler import ArtifactHandler
+from pier.trial.processes import AgentProcessCleanupError
 from pier.trial.hooks import TrialEvent, TrialHookEvent
 from pier.trial.execution import (
     AgentSetupTimeoutError,
@@ -1058,6 +1059,12 @@ class Trial:
             await self._invoke_hooks(TrialEvent.CANCEL)
 
             raise e
+
+        except AgentProcessCleanupError as e:
+            # Neither downloads nor grading are safe when the sandbox could
+            # still be changing. Retain local evidence without reading more.
+            self.result.exception_info = ExceptionInfo.from_exception(e)
+            self._trial_paths.exception_message_path.write_text(traceback.format_exc())
 
         except Exception as e:
             self._logger.debug(f"Trial {self.config.trial_name} failed: {e}")

@@ -1,6 +1,7 @@
 """Bound an installed agent's processes to its run, not the host exec client."""
 
 import asyncio
+import contextlib
 import shlex
 
 from pier.environments.base import BaseEnvironment
@@ -98,7 +99,10 @@ done
         try:
             await asyncio.shield(cleanup)
         except asyncio.CancelledError:
-            await cleanup
+            while not cleanup.done():
+                with contextlib.suppress(asyncio.CancelledError):
+                    await asyncio.shield(cleanup)
+            cleanup.result()
             raise
 
     async def __aenter__(self) -> "AgentProcesses":

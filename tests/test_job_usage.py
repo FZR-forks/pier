@@ -454,3 +454,5 @@ async def test_unconfirmed_agent_shutdown_skips_verification(tmp_path):
     assert result.exception_info.exception_type == "AgentProcessCleanupError"
     assert result.verifier_result is None
     trial._run_verification.assert_not_awaited()
+    trial._maybe_download_logs.assert_not_awaited()
+    trial._collect_artifacts.assert_not_awaited()
