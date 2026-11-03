@@ -863,7 +863,10 @@ class TestCostFallback:
         if missing == "compaction":
             assert trajectory.steps[-1].extra["compaction"]["usage"]["cost_usd"] is None
 
-    def test_explicit_zero_model_prices_are_preserved(self, tmp_path, monkeypatch):
+    @pytest.mark.parametrize("config_kind", ["models", "modelOverrides"])
+    def test_explicit_zero_model_prices_are_preserved(
+        self, tmp_path, monkeypatch, config_kind
+    ):
         self._patch_model_cost(monkeypatch)
         agent = Pi(
             logs_dir=tmp_path,
@@ -886,6 +889,10 @@ class TestCostFallback:
                 }
             },
         )
+        if config_kind == "modelOverrides":
+            entry = agent._pi_config["providers"]["anthropic"]
+            model = entry.pop("models")[0]
+            entry["modelOverrides"] = {model.pop("id"): model}
         trajectory = agent._convert_events_to_trajectory(
             [
                 {
@@ -1084,3 +1091,27 @@ class TestCostFallback:
         context = AgentContext()
         agent.populate_context_post_run(context)
         assert context.cost_usd is not None and context.cost_usd > 0
+
+
+@pytest.mark.parametrize(
+    "custom,override,expected",
+    [
+        (None, dict(input=0, output=0, cacheRead=0, cacheWrite=0), True),
+        (None, dict(input=0), False),
+        (None, dict(input=False, output=0, cacheRead=0, cacheWrite=0), False),
+        (dict(input=0, output=1, cacheRead=0, cacheWrite=0), dict(output=0), True),
+        (dict(input=0, output=0, cacheRead=0, cacheWrite=0), dict(output=1), False),
+    ],
+)
+def test_explicit_zero_pricing_honors_effective_model_overrides(
+    tmp_path, custom, override, expected
+):
+    entry = {"modelOverrides": {"test": {"cost": override}}}
+    if custom is not None:
+        entry["models"] = [{"id": "test", "cost": custom}]
+    agent = Pi(
+        logs_dir=tmp_path,
+        model_name="openai/test",
+        pi_config={"providers": {"openai": entry}},
+    )
+    assert agent._explicit_zero_pricing() is expected

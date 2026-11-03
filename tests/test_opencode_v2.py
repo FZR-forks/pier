@@ -251,6 +251,34 @@ def test_all_collected_session_usage_survives_missing_intermediate_parent(
         assert not trajectory.get("subagent_trajectories")
 
 
+@pytest.mark.parametrize("partial", [False, True])
+def test_collected_child_usage_survives_failed_root_inspection(tmp_path, partial):
+    inspections = load_fixture()
+    write_inspections(tmp_path, [inspections[1], copy.deepcopy(inspections[1])])
+    runner_dir = tmp_path / "opencode-v2"
+    (runner_dir / "runner-result.json").write_text(
+        json.dumps(
+            {
+                "root_id": inspections[0]["session"]["id"],
+                "collection_complete": False,
+                "collection_errors": ["root inspection failed"],
+            }
+        )
+    )
+    if partial:
+        (runner_dir / "opencode-v2-sessions.jsonl").rename(
+            runner_dir / "opencode-v2-sessions.partial.jsonl"
+        )
+    context = AgentContext()
+    make_agent(tmp_path).populate_context_post_run(context)
+    usage = context.session_reported_usage
+    assert usage.complete is False
+    assert usage.n_input_tokens == 102
+    assert usage.cost_usd == 1.5
+    assert context.n_input_tokens is context.cost_usd is None
+    assert not (tmp_path / "trajectory.json").exists()  # no invented root
+
+
 # ---------------------------------------------------------------------------
 # Registration and naming
 # ---------------------------------------------------------------------------
@@ -2607,7 +2635,8 @@ def test_ambiguous_root_is_refused(tmp_path: Path):
     agent.populate_context_post_run(context)
 
     assert not (tmp_path / "trajectory.json").exists()
-    assert context.is_empty()
+    assert context.n_input_tokens is context.cost_usd is None
+    assert context.session_reported_usage.complete is False
 
 
 def test_empty_root_preserves_child_but_withholds_tree_totals(tmp_path: Path):

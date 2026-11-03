@@ -1269,6 +1269,11 @@ class OpenCodeV2(BaseInstalledAgent):
                 ),
                 env=env,
             )
+        except (asyncio.CancelledError, Exception):
+            # Do not spend the runner's graceful-shutdown budget letting a
+            # detached tool keep editing beyond the trial deadline.
+            await self.stop_processes()
+            raise
         finally:
             # A timed-out agent is cancelled host-side, and killing a
             # `docker compose exec` client does not signal the process inside
@@ -1279,6 +1284,7 @@ class OpenCodeV2(BaseInstalledAgent):
                 await self._ensure_runner_stopped(environment, env)
             except Exception:
                 self.logger.exception("OpenCode V2 runner shutdown failed")
+            await self.stop_processes()
             # Preserve the primary execution error even when artifact
             # collection fails; the runner keeps its JSONL evidence on disk
             # precisely so a failed run can still be graded.
@@ -2888,19 +2894,14 @@ class OpenCodeV2(BaseInstalledAgent):
                 self.logs_dir / "opencode-v2" / "opencode-v2-sessions.partial.jsonl"
             )
             if partial:
-                # Only adopt the partial snapshot when a confirmed root is
-                # actually in it. Otherwise root selection would fall back to
-                # graph inference and could crown an orphaned child -- a
-                # snapshot taken mid-collection often holds a child whose
-                # parent was not fetched -- giving the run the wrong identity.
+                # A confirmed root prevents graph inference from crowning an
+                # orphaned child. Even if that root is missing, keep collected
+                # child usage as incomplete accounting, not an exact trajectory.
                 live_evidence = self._live_evidence()
-                validated_root = live_evidence.get("validated_root_id")
-                snapshot_ids = {
-                    str((record.get("session") or {}).get("id"))
-                    for record in partial
-                    if isinstance(record.get("session"), dict)
-                }
-                if validated_root and str(validated_root) in snapshot_ids:
+                validated_root = (runner_result or {}).get(
+                    "root_id"
+                ) or live_evidence.get("validated_root_id")
+                if validated_root:
                     self.logger.warning(
                         "Using %d partial OpenCode V2 session snapshot record(s); "
                         "the runner did not finish collection",
@@ -2911,7 +2912,7 @@ class OpenCodeV2(BaseInstalledAgent):
                 else:
                     self.logger.warning(
                         "Ignoring %d partial OpenCode V2 session record(s): no "
-                        "confirmed root session is present in them",
+                        "confirmed root session is known",
                         len(partial),
                     )
         valid_inspections = [
@@ -3026,6 +3027,12 @@ class OpenCodeV2(BaseInstalledAgent):
         if not trajectories:
             self._raise_model_restriction_failure(restriction_mismatches)
             return
+
+        # Accounting is useful even when the root cannot be reconstructed. Do
+        # not promote an orphan to root or present these observations as exact.
+        context.session_reported_usage = self._collected_session_usage(
+            trajectories, complete=False
+        )
 
         recorded_root_id = (
             str(runner_result.get("root_id"))

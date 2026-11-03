@@ -12,6 +12,7 @@ from pier.agents.base import BaseAgent
 from pier.agents.ca_trust import EXTRA_CA_CERTS_ENV, ca_trust_env
 from pier.environments.base import BaseEnvironment
 from pier.models.agent.install import AgentInstallSpec
+from pier.trial.processes import AgentProcesses
 from pier.utils.env import parse_bool_env_value
 from pier.utils.templating import render_prompt_template
 
@@ -339,6 +340,21 @@ class BaseInstalledAgent(BaseAgent, ABC):
         is deliberately left untouched.
         """
         return dict(env or {})
+
+    async def run_with_cleanup(
+        self, instruction: str, environment: BaseEnvironment, context: "AgentContext"
+    ) -> None:
+        async with await AgentProcesses.start(environment) as processes:
+            self._run_processes = processes
+            try:
+                await self.run(instruction, environment, context)
+            finally:
+                self._run_processes = None
+
+    async def stop_processes(self) -> None:
+        """Stop tools before an adapter copies its native session logs."""
+        if processes := getattr(self, "_run_processes", None):
+            await processes.wait_stopped()
 
     async def _exec(
         self,

@@ -302,17 +302,26 @@ class Pi(BaseInstalledAgent):
         """An explicit free model is different from Pi's omitted-rate zeros."""
         provider, _, model = (self.model_name or "").partition("/")
         entry = (self._pi_config.get("providers") or {}).get(provider) or {}
-        return any(
-            item.get("id") == model
-            and isinstance(item.get("cost"), dict)
-            and all(
-                isinstance(item["cost"].get(key), (int, float))
-                and not isinstance(item["cost"][key], bool)
-                and item["cost"][key] == 0
-                for key in ("input", "output", "cacheRead", "cacheWrite")
-            )
-            for item in entry.get("models") or []
-            if isinstance(item, dict)
+        cost = next(
+            (
+                item.get("cost")
+                for item in entry.get("models") or []
+                if isinstance(item, dict) and item.get("id") == model
+            ),
+            None,
+        )
+        override = (entry.get("modelOverrides") or {}).get(model) or {}
+        # Pi applies modelOverrides after custom models, merging individual rates.
+        override_cost = override.get("cost")
+        cost = {
+            **(cost if isinstance(cost, dict) else {}),
+            **(override_cost if isinstance(override_cost, dict) else {}),
+        }
+        return all(
+            isinstance(cost.get(key), (int, float))
+            and not isinstance(cost[key], bool)
+            and cost[key] == 0
+            for key in ("input", "output", "cacheRead", "cacheWrite")
         )
 
     @staticmethod

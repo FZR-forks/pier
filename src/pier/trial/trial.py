@@ -649,7 +649,11 @@ class Trial:
             step_result.agent_result = AgentContext()
             await self._invoke_hooks(TrialEvent.AGENT_START)
             await asyncio.wait_for(
-                self._agent.run(
+                (
+                    self._agent.run_with_cleanup
+                    if isinstance(self._agent, BaseInstalledAgent)
+                    else self._agent.run
+                )(
                     instruction=instruction,
                     environment=self._environment,
                     context=step_result.agent_result,
@@ -969,15 +973,18 @@ class Trial:
 
         try:
             await self._invoke_hooks(TrialEvent.START)
-        except asyncio.CancelledError as exc:
-            # A replacement may be cancelled in its first hook, before the
-            # normal try/finally. Persist that attempt before notifying the job.
+        except (asyncio.CancelledError, Exception) as exc:
+            # START is part of the attempt, even if a hook fails before the
+            # environment starts. Keep a canonical result and notify the job.
             self.result.exception_info = ExceptionInfo.from_exception(exc)
+            self._trial_paths.exception_message_path.write_text(traceback.format_exc())
             try:
                 await self._cleanup_and_finalize()
             finally:
                 self._close_logger_handler()
-            raise
+            if isinstance(exc, asyncio.CancelledError):
+                raise
+            return self.result
 
         try:
             await self._setup_environment()

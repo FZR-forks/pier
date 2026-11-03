@@ -602,6 +602,11 @@ class Job:
         trial_name = trial_result.trial_name
 
         async with self._trial_completion_lock:
+            # START may have been interrupted while waiting for this lock.
+            # Reconcile the replacement here too; removal is idempotent.
+            previous = self._previous_trial_results.get(trial_name)
+            if previous is not None and previous.id != trial_result.id:
+                self._remove_completed_attempt_for_retry(trial_name)
             previous_result = self._previous_trial_results.get(trial_name)
 
             evals_key, dataset_name = self._evals_key_for_result(trial_result)

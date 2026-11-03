@@ -22,6 +22,9 @@ Collected sessions whose intermediate parent is missing still contribute to
 these observed totals; inability to attach them to the trajectory tree keeps
 `complete: false`. Failed summarizer requests retain usage, but only completed
 compactions increment `summarization_count`.
+If the root inspection itself is missing, collected child usage still survives
+in `agent_result.session_reported_usage` with `complete: false`; no child is
+promoted to root and exact totals remain unknown.
 
 Billed requests that have no message of their own are part of the totals:
 Claude Code compaction summaries (from the stream's cumulative `modelUsage`),
@@ -59,14 +62,27 @@ unknown. Existing lifecycle hooks and explicit resume behavior are unchanged.
 Backoff leaves the current trial directory in place. If loading a replacement
 is cancelled, the original observation is restored before cancellation escapes,
 so a resumed job finds the same canonical identity rather than inventing a trial.
+An exception in a replacement's START hook is saved as that attempt's canonical
+result. END accounting also reconciles a replacement whose START accounting was
+interrupted while waiting for the job lock.
 
 Pi aggregates a cost only when every recorded usage contribution includes its
 cost. Missing costs remain unknown instead of being summed as free usage.
-Explicitly configured all-zero model rates are preserved; Pi's default zeros
+Explicitly configured all-zero model rates (including `modelOverrides`, applied
+after custom `models` rates) are preserved; Pi's default zeros
 for an unpriced model continue to use the standard pricing fallback.
 Claude Code's reported cost is likewise unknown when any model in its
 `modelUsage` has `costBasis: "unknown"`: Claude Code had no price for that
 model ID and priced it at the default model's rate.
+
+Installed agents are stopped before logs, artifacts, or verification are read,
+on success as well as timeout/failure. Pier snapshots Linux sandbox processes
+before the run, preserves those task services, and terminates new processes
+with TERM then KILL, including detached tools. PID start times prevent PID reuse
+from exempting a new process. OpenCode V2 retains its own runner shutdown path;
+the shared sweep also catches detached tools. If stopping cannot be confirmed,
+Pier stops the environment and fails without verification. This assumes an
+isolated sandbox process namespace, not a host-shared PID namespace.
 
 These are inference observations, not gateway invoices. Standard provider
 prices and upstream LLM caching are in scope; gateway billing, gateway response

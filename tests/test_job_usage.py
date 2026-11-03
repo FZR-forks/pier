@@ -364,3 +364,75 @@ async def test_completed_retry_summary_and_overhead_reconcile_with_files(
         result.stats.retry_overhead.cost_usd == previous.agent_result.cost_usd == 0.01
     )
     assert result.stats.retry_overhead.n_attempts == result.stats.n_retries == 1
+
+
+@pytest.mark.asyncio
+async def test_replacement_start_failure_keeps_canonical_result(tmp_path, monkeypatch):
+    from pier.models.job.result import JobResult
+    from pier.trial.hooks import TrialEvent
+
+    job = lifecycle_job(tmp_path)
+    attempts = []
+
+    async def create(cls, config):
+        trial = lifecycle_trial(config, retryable_failure=not attempts)
+        attempts.append(trial)
+        return trial
+
+    async def fail_second_start(event):
+        if event.result.attempt == 2:
+            raise ConnectionError("START hook failed")
+
+    monkeypatch.setattr(Trial, "create", classmethod(create))
+    job.add_hook(TrialEvent.START, fail_second_start)
+    result = await job.run()
+    current = result.trial_results[0]
+    disk = TrialResult.model_validate_json(
+        (job.job_dir / current.trial_name / "result.json").read_text()
+    )
+    summary = JobResult.model_validate_json((job.job_dir / "result.json").read_text())
+    assert disk.id == current.id == attempts[1].result.id
+    assert disk.attempt == 2
+    assert disk.exception_info.exception_type == "ConnectionError"
+    assert summary.stats.n_completed_trials == 1
+    assert summary.stats.n_running_trials == 0
+    assert summary.stats.n_retries == summary.stats.retry_overhead.n_attempts == 1
+
+
+@pytest.mark.asyncio
+async def test_cancel_waiting_for_start_accounting_lock_counts_retry(
+    tmp_path, monkeypatch
+):
+    from pier.models.job.result import JobResult
+
+    job = lifecycle_job(tmp_path)
+    attempts = []
+    waiting = asyncio.Event()
+
+    async def create(cls, config):
+        trial = lifecycle_trial(config, retryable_failure=not attempts)
+        if attempts:
+            await job._trial_completion_lock.acquire()
+            waiting.set()
+        attempts.append(trial)
+        return trial
+
+    monkeypatch.setattr(Trial, "create", classmethod(create))
+    task = asyncio.create_task(job.run())
+    await asyncio.wait_for(waiting.wait(), 5)
+    # Let START reach the locked job hook, then cancel before it accounts.
+    await asyncio.sleep(0)
+    task.cancel()
+    await asyncio.sleep(0)
+    job._trial_completion_lock.release()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    summary = JobResult.model_validate_json((job.job_dir / "result.json").read_text())
+    current = attempts[1].result
+    disk = TrialResult.model_validate_json(
+        (job.job_dir / current.trial_name / "result.json").read_text()
+    )
+    assert disk.attempt == 2 and disk.exception_info.exception_type == "CancelledError"
+    assert summary.stats.n_completed_trials == 1
+    assert summary.stats.n_running_trials == 0
+    assert summary.stats.n_retries == summary.stats.retry_overhead.n_attempts == 1

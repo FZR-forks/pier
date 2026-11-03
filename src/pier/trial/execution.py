@@ -13,6 +13,7 @@ from tenacity import (
 )
 
 from pier.agents.factory import AgentFactory
+from pier.agents.installed.base import BaseInstalledAgent
 from pier.environments.base import BaseEnvironment
 from pier.environments.factory import EnvironmentFactory
 from pier.models.agent.context import AgentContext
@@ -252,7 +253,11 @@ class TrialExecution:
     ) -> None:
         try:
             await asyncio.wait_for(
-                self.agent.run(
+                (
+                    self.agent.run_with_cleanup
+                    if isinstance(self.agent, BaseInstalledAgent)
+                    else self.agent.run
+                )(
                     instruction=instruction,
                     environment=self.environment,
                     context=context,

@@ -2391,6 +2391,7 @@ class Codex(BaseInstalledAgent):
                 env=env,
             )
         finally:
+            await self.stop_processes()
             try:
                 await self.exec_as_agent(
                     environment,
