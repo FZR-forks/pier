@@ -49,6 +49,49 @@ async def test_cleanup_finishes_before_cancellation_returns():
     assert processes.stopped
 
 
+@pytest.mark.asyncio
+@pytest.mark.skipif(os.getenv("PIER_TEST_DOCKER") != "1", reason="opt-in Docker test")
+async def test_tools_stop_before_collectors_then_final_sweep():
+    name = f"pier-process-test-{uuid.uuid4().hex[:10]}"
+    start = await asyncio.create_subprocess_exec(
+        "docker",
+        "run",
+        "--rm",
+        "-d",
+        "--name",
+        name,
+        "python:3.13-slim",
+        "sleep",
+        "infinity",
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    await start.communicate()
+    assert start.returncode == 0
+    environment = DockerShell(name)
+    try:
+        processes = await AgentProcesses.start(environment)
+        collector = await environment.exec("sleep 300 >/dev/null 2>&1 & echo $!")
+        pid = int(collector.stdout.strip())
+        await environment.exec(
+            "setsid bash -c 'sleep 5; touch /late-write' >/dev/null 2>&1 &"
+        )
+        await processes.wait_stopped((pid,))
+        assert not processes.stopped
+        assert (await environment.exec(f"kill -0 {pid}")).return_code == 0
+        await processes.wait_stopped()
+        assert processes.stopped
+        await asyncio.sleep(5)
+        assert (await environment.exec("test ! -f /late-write")).return_code == 0
+        state = await environment.exec(f"cat /proc/{pid}/stat 2>/dev/null || true")
+        assert not state.stdout or state.stdout.split(") ")[1].startswith("Z ")
+    finally:
+        remove = await asyncio.create_subprocess_exec(
+            "docker", "rm", "-f", name, stdout=asyncio.subprocess.DEVNULL
+        )
+        await remove.wait()
+
+
 class DockerShell:
     """Cancel only the docker client, reproducing the real timeout failure."""
 

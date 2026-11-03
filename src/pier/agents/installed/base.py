@@ -351,10 +351,10 @@ class BaseInstalledAgent(BaseAgent, ABC):
             finally:
                 self._run_processes = None
 
-    async def stop_processes(self) -> None:
+    async def stop_processes(self, keep_pids: tuple[int, ...] = ()) -> None:
         """Stop tools before an adapter copies its native session logs."""
         if processes := getattr(self, "_run_processes", None):
-            await processes.wait_stopped()
+            await processes.wait_stopped(keep_pids)
 
     async def _exec(
         self,

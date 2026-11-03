@@ -79,8 +79,9 @@ Installed agents are stopped before logs, artifacts, or verification are read,
 on success as well as timeout/failure. Pier snapshots Linux sandbox processes
 before the run, preserves those task services, and terminates new processes
 with TERM then KILL, including detached tools. PID start times prevent PID reuse
-from exempting a new process. OpenCode V2 retains its own runner shutdown path;
-the shared sweep also catches detached tools. If stopping cannot be confirmed,
+from exempting a new process. OpenCode V2 stops tools first while temporarily
+preserving its recorded collectors for runner shutdown and usage collection,
+then sweeps again before downloading logs. If stopping cannot be confirmed,
 Pier stops the environment and fails without verification. This assumes an
 isolated sandbox process namespace, not a host-shared PID namespace.
 

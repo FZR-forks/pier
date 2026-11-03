@@ -42,7 +42,7 @@ class AgentProcesses:
             raise RuntimeError("Could not snapshot sandbox processes before agent run")
         return cls(environment, set(result.stdout.split()))
 
-    async def stop(self) -> None:
+    async def stop(self, keep_pids: tuple[int, ...] = ()) -> None:
         if self.stopped:
             return
         # Protect the cleanup exec and its ancestors too. They were not present
@@ -50,13 +50,14 @@ class AgentProcesses:
         command = f"""
 baseline={shlex.quote(" " + " ".join(sorted(self.baseline)) + " ")}
 keep=' '
-pid=$$
-while [ "$pid" -gt 0 ]; do
-    keep="$keep$pid "
-    IFS= read -r stat < "/proc/$pid/stat" || exit 1
-    fields=${{stat##*) }}
-    set -- $fields
-    pid=$2
+for pid in $$ {" ".join(map(str, keep_pids))}; do
+    while [ "$pid" -gt 0 ]; do
+        keep="$keep$pid "
+        IFS= read -r stat < "/proc/$pid/stat" 2>/dev/null || break
+        fields=${{stat##*) }}
+        set -- $fields
+        pid=$2
+    done
 done
 for signal in TERM KILL KILL CHECK; do
     remaining=0
@@ -89,11 +90,11 @@ done
                 await self.environment.stop(delete=False)
             finally:
                 raise AgentProcessCleanupError("Could not stop sandbox agent processes")
-        self.stopped = True
+        self.stopped = not keep_pids
 
-    async def wait_stopped(self) -> None:
+    async def wait_stopped(self, keep_pids: tuple[int, ...] = ()) -> None:
         """Do not leave cleanup running in the background on cancellation."""
-        cleanup = asyncio.create_task(self.stop())
+        cleanup = asyncio.create_task(self.stop(keep_pids))
         try:
             await asyncio.shield(cleanup)
         except asyncio.CancelledError:

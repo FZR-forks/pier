@@ -1270,9 +1270,27 @@ class OpenCodeV2(BaseInstalledAgent):
                 env=env,
             )
         except (asyncio.CancelledError, Exception):
-            # Do not spend the runner's graceful-shutdown budget letting a
-            # detached tool keep editing beyond the trial deadline.
-            await self.stop_processes()
+            # Stop tools immediately, but let the runner/server collect usage
+            # before the final sweep. Their parent exec shells must survive too.
+            try:
+                pids = await self._probe(
+                    environment,
+                    f"cat {shlex.quote(self._RUNNER_PIDFILE.as_posix())}",
+                    env,
+                )
+            except Exception:
+                pids = ""  # No trusted collector identity: stop everything new.
+            keep_pids = tuple(
+                int(value)
+                for line in pids.splitlines()
+                if (value := line.partition("=")[2]).isdigit()
+            )
+            await self._signal(
+                environment,
+                f'{self._pid_expr("runner")}; [ -n "$pid" ] && kill -TERM "$pid"',
+                env,
+            )
+            await self.stop_processes(keep_pids)
             raise
         finally:
             # A timed-out agent is cancelled host-side, and killing a
