@@ -152,6 +152,10 @@ an empty tools array after tool history can set
 
 ## Validation
 
+- Final project suite: `pytest tests -q` — **683 passed, 11 skipped** (one
+  existing deprecated-memory-field warning). Bare `pytest -q` encounters a
+  pre-existing duplicate `test_state` module name in the example tasks.
+- Ruff checks on changed Python files and `git diff --check` passed.
 - Added coverage for the OpenCode 2.3.0 compaction ceiling and background-child
   parent wakeup, plus forwarding Claude Code's gateway context-window override.
 - Added install regressions for root-level ripgrep provisioning, shell syntax,
