@@ -620,6 +620,25 @@ async def test_all_claude_model_channels_are_pinned(
 
 
 @pytest.mark.asyncio
+async def test_gateway_context_window_override_is_forwarded(tmp_path: Path):
+    """Unknown gateway IDs default to 1M in Claude Code 2.1.323+."""
+    agent = ClaudeCode(
+        logs_dir=tmp_path,
+        model_name="deepseek/deepseek-v4.1-flash",
+        extra_env={
+            "ANTHROPIC_BASE_URL": "https://proxy.example.com",
+            "CLAUDE_CODE_MAX_CONTEXT_TOKENS": "272000",
+        },
+    )
+    environment = FakeEnvironment()
+    await agent.run("Fix the bug", cast(BaseEnvironment, environment), AgentContext())
+
+    env = environment.envs[-1]
+    assert env["ANTHROPIC_MODEL"] == "deepseek/deepseek-v4.1-flash"
+    assert env["CLAUDE_CODE_MAX_CONTEXT_TOKENS"] == "272000"
+
+
+@pytest.mark.asyncio
 async def test_refusal_fallback_can_be_reenabled_from_agent_env(tmp_path: Path):
     agent = ClaudeCode(
         logs_dir=tmp_path,
