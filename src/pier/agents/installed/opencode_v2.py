@@ -1027,7 +1027,13 @@ class OpenCodeV2(BaseInstalledAgent):
                 InstallStep(
                     user="root",
                     env={"DEBIAN_FRONTEND": "noninteractive"},
-                    run="apt-get update && apt-get install -y curl python3",
+                    # OpenCode downloads rg on first search if it is absent.
+                    # Provision it in the agent layer before runtime egress is
+                    # restricted, without changing the task's base image.
+                    run=(
+                        "apt-get update && apt-get install -y curl python3 ripgrep "
+                        "&& rg --version"
+                    ),
                 ),
                 InstallStep(
                     user="root",

@@ -3574,10 +3574,11 @@ def test_preflight_reports_opencode_compaction_ceiling(
     assert result["compaction_prompt_ceiling"] == expected
 
 
+@pytest.mark.parametrize("version", [(2, 2, 5), (2, 3, 0)])
 @pytest.mark.parametrize(
     ("resolved_limit", "compaction", "expected"),
     [
-        # OpenCode 2.2.5 keeps 15%, and at least 16k, of the window free.
+        # OpenCode 2.2.5 and 2.3.0 keep 15%, and at least 16k, free.
         ({"context": 1000000, "output": 384000}, None, 850000),
         ({"context": 272000, "input": 144000, "output": 128000}, None, 122400),
         ({"context": 40000, "output": 8192}, None, 24000),
@@ -3605,10 +3606,10 @@ def test_preflight_reports_opencode_compaction_ceiling(
     ],
 )
 def test_preflight_reports_current_opencode_compaction_ceiling(
-    tmp_path: Path, monkeypatch, resolved_limit, compaction, expected
+    tmp_path: Path, monkeypatch, resolved_limit, compaction, expected, version
 ):
     result = _preflight_with_limits(
-        tmp_path, monkeypatch, resolved_limit, compaction, version=(2, 2, 5)
+        tmp_path, monkeypatch, resolved_limit, compaction, version=version
     )
     assert result["compaction_prompt_ceiling"] == expected
 
@@ -3710,7 +3711,9 @@ def test_install_spec_uses_configured_version_checksum_and_target_architecture(
     spec = agent.install_spec()
     assert spec.agent_name == "opencode-v2"
     assert spec.version == "2.0.6"
-    assert spec.steps[0].run == "apt-get update && apt-get install -y curl python3"
+    assert spec.steps[0].run == (
+        "apt-get update && apt-get install -y curl python3 ripgrep && rg --version"
+    )
     joined = "\n".join(step.run for step in spec.steps)
     assert 'machine="$(uname -m)"' in joined
     assert "target=linux-x64" in joined
@@ -3729,6 +3732,25 @@ def test_install_spec_uses_configured_version_checksum_and_target_architecture(
         text=True,
         check=True,
     )
+
+
+def test_install_spec_provisions_ripgrep_in_root_build_layer(tmp_path: Path):
+    spec = make_agent(tmp_path).install_spec()
+    prerequisites = spec.steps[0]
+    assert prerequisites.user == "root"
+    assert prerequisites.env == {"DEBIAN_FRONTEND": "noninteractive"}
+    assert "apt-get install -y curl python3 ripgrep" in prerequisites.run
+    assert prerequisites.run.endswith("&& rg --version")
+    subprocess.run(["bash", "-n"], input=prerequisites.run, text=True, check=True)
+
+
+def test_ripgrep_dependency_invalidates_pinned_install_cache(tmp_path: Path):
+    spec = make_agent(tmp_path).install_spec()
+    previous = spec.model_copy(deep=True)
+    previous.steps[0].run = "apt-get update && apt-get install -y curl python3"
+
+    assert spec.cache_key is None
+    assert spec.fingerprint() != previous.fingerprint()
 
 
 def test_install_spec_respects_explicit_version(tmp_path: Path):
@@ -4438,6 +4460,69 @@ def test_child_failure_preserves_the_root_inspection_and_records_why(
     assert child, "the child failure was never recorded"
     assert "child message page timed out" in child[0]["message"]
     assert child[0]["sessionID"] == "ses_child"
+
+
+def test_collect_tree_waits_for_background_child_and_parent_wakeup(monkeypatch):
+    """2.3 children return immediately and can wake an already-idle parent."""
+    rounds = [0]
+    waited = []
+    root = {"id": "ses_root", "outcome": "succeeded"}
+    child = {"id": "ses_child", "parentID": "ses_root", "outcome": "succeeded"}
+
+    class Server:
+        collection_deadline = None
+
+        def collect_descendants(self, root_id):
+            assert root_id == "ses_root"
+            rounds[0] += 1
+            assert rounds[0] <= 5, "the settled tree should not need more rounds"
+            return [root, child]
+
+        def wait_session(self, session_id):
+            waited.append(session_id)
+            return True
+
+        def running_session_ids(self):
+            if rounds[0] == 1:
+                return {"ses_child"}
+            if rounds[0] == 3:
+                return {"ses_root"}
+            return set()
+
+        def inspect_session(self, session, active_ids=None):
+            is_root = session["id"] == "ses_root"
+            inbox = (
+                [{"id": "msg_child_report", "type": "synthetic"}]
+                if is_root and rounds[0] == 2
+                else []
+            )
+            messages = (
+                [{"id": "msg_parent_reply", "type": "assistant", "time": {"completed": 1}}]
+                if is_root and rounds[0] >= 4
+                else []
+            )
+            return {
+                "session": session,
+                "messages": messages,
+                "active": {"type": "running"}
+                if session["id"] in active_ids
+                else None,
+                "inbox": inbox,
+            }
+
+    monkeypatch.setattr(runner_module.time, "sleep", lambda _seconds: None)
+    errors = []
+    server = Server()
+    inspections, settled = runner_module._collect_tree(
+        server, "ses_root", deadline=time.monotonic() + 5, errors=errors
+    )
+
+    assert settled
+    assert not errors
+    assert rounds[0] == 5
+    assert waited == ["ses_root", "ses_child"] * 5
+    assert inspections[0]["messages"][0]["id"] == "msg_parent_reply"
+    assert server.collection_deadline is None
 
 
 def test_transient_collection_failure_does_not_invalidate_a_clean_settle(
