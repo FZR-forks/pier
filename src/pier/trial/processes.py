@@ -11,6 +11,11 @@ from pier.environments.base import BaseEnvironment
 class AgentProcessCleanupError(RuntimeError):
     """The sandbox is unsafe to verify; do not treat this as an agent timeout."""
 
+    def __init__(self, message: str, *, sandbox_stopped: bool = False):
+        super().__init__(message)
+        self.sandbox_stopped = sandbox_stopped
+        self.primary_exception: BaseException | None = None
+
 
 AGENT_RUN_ENV = "PIER_AGENT_RUN"
 
@@ -23,6 +28,8 @@ class AgentProcesses:
     """
 
     _STOP_TIMEOUT_SEC = 60
+    _SCAN_TIMEOUT_SEC = 10
+    _UNREADABLE_RETRIES = 2
 
     def __init__(self, environment: BaseEnvironment, token: str):
         self.environment = environment
@@ -95,8 +102,11 @@ for signal in TERM KILL KILL CHECK; do
             # Retry other owners as their own UID. An unreadable environment
             # even as its owner is unknown, not evidence that it is unowned.
             if [ "$uid" = "$my_uid" ]; then
-                echo "Unreadable process environment: pid=$pid uid=$uid" >&2
-                exit 1
+                # Do not leak command lines or environment values. Return a
+                # distinct transient status so the caller can recheck a process
+                # which is currently execing/exiting, without ignoring it.
+                echo "Unreadable process environment: pid=$pid uid=$uid state=$1" >&2
+                exit 75
             fi
             printf '%s\n' "$uid"
             continue
@@ -117,7 +127,13 @@ done
             # as their UID, including tools that switched away from the agent.
             users = ["root"]
             for user in users:
-                result = await self.environment.exec(command, user=user, timeout_sec=10)
+                for attempt in range(self._UNREADABLE_RETRIES + 1):
+                    result = await self.environment.exec(
+                        command, user=user, timeout_sec=self._SCAN_TIMEOUT_SEC
+                    )
+                    if result.return_code != 75 or attempt == self._UNREADABLE_RETRIES:
+                        break
+                    await asyncio.sleep(0.05)
                 if result.return_code != 0:
                     raise RuntimeError(
                         "Agent processes could not be confirmed stopped: "
@@ -130,14 +146,27 @@ done
                         )
                     if uid not in users and uid != "0":
                         users.append(uid)
-        except Exception:
+        except Exception as cause:
             # Do not allow verification on a workspace that is still changing.
+            # A successful stop() alone isn't proof: some backends intentionally
+            # log stop errors without raising. Only a backend's strict check can
+            # authorize parsing already-local, now immutable logs.
+            sandbox_stopped = False
             try:
                 await asyncio.wait_for(
                     self.environment.stop(delete=False), timeout=self._STOP_TIMEOUT_SEC
                 )
-            finally:
-                raise AgentProcessCleanupError("Could not stop sandbox agent processes")
+                checker = getattr(self.environment, "agent_sandbox_is_stopped", None)
+                if checker is not None:
+                    sandbox_stopped = (
+                        await asyncio.wait_for(checker(), timeout=10) is True
+                    )
+            except Exception:
+                pass
+            raise AgentProcessCleanupError(
+                "Could not stop sandbox agent processes",
+                sandbox_stopped=sandbox_stopped,
+            ) from cause
         self.stopped = not keep_pids
 
     async def wait_stopped(self, keep_pids: tuple[int, ...] = ()) -> None:
@@ -155,5 +184,11 @@ done
     async def __aenter__(self) -> "AgentProcesses":
         return self
 
-    async def __aexit__(self, *_exc) -> None:
-        await self.wait_stopped()
+    async def __aexit__(self, _type=None, primary=None, _tb=None) -> None:
+        try:
+            await self.wait_stopped()
+        except AgentProcessCleanupError as exc:
+            # Don't lose the execution timeout (or other primary error) when a
+            # second, independent failure occurs during shutdown.
+            exc.primary_exception = primary
+            raise

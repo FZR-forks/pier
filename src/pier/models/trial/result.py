@@ -80,6 +80,8 @@ class TrialResult(BaseModel):
     verifier_result: VerifierResult | None = None
     exception_info: ExceptionInfo | None = None
     started_at: datetime | None = None
+    agent_cleanup_error: ExceptionInfo | None = None
+    agent_sandbox_stopped_after_cleanup_error: bool | None = None
     finished_at: datetime | None = None
     environment_setup: TimingInfo | None = None
     agent_setup: TimingInfo | None = None

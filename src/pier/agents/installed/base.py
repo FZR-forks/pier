@@ -357,6 +357,7 @@ class BaseInstalledAgent(BaseAgent, ABC):
                 async with asyncio.timeout(timeout_sec) as deadline:
                     self._run_deadline = deadline
                     await self.run(instruction, environment, context)
+                    self.finish_execution()
             finally:
                 self._run_deadline = None
                 self._run_processes = None
@@ -366,6 +367,15 @@ class BaseInstalledAgent(BaseAgent, ABC):
         deadline = getattr(self, "_run_deadline", None)
         if deadline is not None and not deadline.expired():
             deadline.reschedule(None)
+
+    def populate_local_context_after_cleanup_failure(
+        self, context: "AgentContext"
+    ) -> None:
+        """Optional offline-only recovery after runtime-confirmed sandbox stop.
+
+        Only adapters whose native evidence is already local may override this.
+        Never issue environment commands/downloads here or imply full usage.
+        """
 
     async def stop_processes(self, keep_pids: tuple[int, ...] = ()) -> None:
         """Stop tools before an adapter copies its native session logs."""

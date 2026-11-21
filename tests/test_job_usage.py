@@ -456,3 +456,68 @@ async def test_unconfirmed_agent_shutdown_skips_verification(tmp_path):
     trial._run_verification.assert_not_awaited()
     trial._maybe_download_logs.assert_not_awaited()
     trial._collect_artifacts.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("confirmed", [False, True])
+@pytest.mark.parametrize("timed_out", [False, True])
+@pytest.mark.parametrize("mounted", [False, True])
+async def test_cleanup_recovery_only_after_confirmed_stop_and_never_grades(
+    tmp_path, confirmed, timed_out, mounted
+):
+    from pier.agents.installed.pi import Pi
+    from pier.trial.processes import AgentProcessCleanupError
+
+    config = trial_result(tmp_path).config
+    trial = lifecycle_trial(config)
+    agent = Pi(
+        logs_dir=trial._trial_paths.agent_dir, model_name="anthropic/claude-haiku-5-5"
+    )
+    calls = []
+
+    def recover(context):
+        calls.append(context)
+
+    agent.populate_local_context_after_cleanup_failure = recover
+    trial._agent = agent
+    trial._environment.capabilities = SimpleNamespace(mounted=mounted)
+
+    async def unsafe():
+        trial.result.agent_result = AgentContext()
+        error = AgentProcessCleanupError("failed", sandbox_stopped=confirmed)
+        error.primary_exception = TimeoutError("agent deadline") if timed_out else None
+        raise error
+
+    trial._execute_agent = unsafe
+    trial._run_verification = AsyncMock()
+    result = await trial.run()
+    assert result.exception_info.exception_type == (
+        "AgentTimeoutError" if timed_out else "AgentProcessCleanupError"
+    )
+    assert result.agent_cleanup_error.exception_type == "AgentProcessCleanupError"
+    assert result.agent_sandbox_stopped_after_cleanup_error is confirmed
+    assert bool(calls) is (confirmed and mounted)
+    assert result.verifier_result is None
+    trial._run_verification.assert_not_awaited()
+    trial._maybe_download_logs.assert_not_awaited()
+    trial._collect_artifacts.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_cleanup_failure_does_not_swallow_operator_cancellation(tmp_path):
+    from pier.trial.processes import AgentProcessCleanupError
+
+    trial = lifecycle_trial(trial_result(tmp_path).config)
+
+    async def unsafe():
+        error = AgentProcessCleanupError("failed")
+        error.primary_exception = asyncio.CancelledError()
+        raise error
+
+    trial._execute_agent = unsafe
+    trial._run_verification = AsyncMock()
+    with pytest.raises(asyncio.CancelledError):
+        await trial.run()
+    assert trial.result.exception_info.exception_type == "CancelledError"
+    assert trial.result.agent_cleanup_error.exception_type == "AgentProcessCleanupError"
+    trial._run_verification.assert_not_awaited()

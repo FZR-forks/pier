@@ -1034,3 +1034,45 @@ class Pi(BaseInstalledAgent):
 
         if error := self._final_error(events):
             raise NonZeroAgentExitCodeError(f"pi ended on a failed turn: {error}")
+
+    def populate_local_context_after_cleanup_failure(
+        self, context: AgentContext
+    ) -> None:
+        # The caller independently confirmed the sandbox is stopped and these
+        # are bind-mounted local logs. No sandbox read or grading is performed.
+        from pier.models.agent.session_usage import SessionUsage
+
+        events = self._parse_stdout()
+        trajectory = self._convert_events_to_trajectory(events)
+        if trajectory is None or trajectory.final_metrics is None:
+            return
+        metrics = trajectory.final_metrics
+        reported = SessionUsage(
+            source="pi.local_stdout.after_cleanup_failure",
+            complete=False,
+            n_input_tokens=metrics.total_prompt_tokens,
+            n_cache_tokens=metrics.total_cached_tokens,
+            n_output_tokens=metrics.total_completion_tokens,
+            cost_usd=metrics.total_cost_usd,
+        )
+        # A live request might not have a usage event. Preserve observed totals
+        # separately instead of turning partial accounting into exact totals.
+        metrics.extra = {
+            **(metrics.extra or {}),
+            "session_reported_usage": reported.model_dump(),
+            "cleanup_failed": True,
+        }
+        metrics.total_prompt_tokens = None
+        metrics.total_cached_tokens = None
+        metrics.total_completion_tokens = None
+        metrics.total_cost_usd = None
+        trajectory_path = self.logs_dir / "trajectory.json"
+        trajectory_path.write_text(format_trajectory_json(trajectory.to_json_dict()))
+        context.session_reported_usage = reported
+        context.n_input_tokens = None
+        context.n_cache_tokens = None
+        context.n_output_tokens = None
+        context.cost_usd = None
+        context.peak_context_tokens = (metrics.extra or {}).get("peak_context_tokens")
+        context.summarization_count = (metrics.extra or {}).get("summarization_count")
+        context.metadata = {**(context.metadata or {}), "cleanup_failed": True}

@@ -1054,10 +1054,39 @@ class Trial:
             raise e
 
         except AgentProcessCleanupError as e:
-            # Neither downloads nor grading are safe when the sandbox could
-            # still be changing. Retain local evidence without reading more.
-            self.result.exception_info = ExceptionInfo.from_exception(e)
+            self.result.agent_cleanup_error = ExceptionInfo.from_exception(e)
+            self.result.agent_sandbox_stopped_after_cleanup_error = e.sandbox_stopped
+            # Cleanup must not mask an execution timeout. Keep both failures,
+            # but retain the original execution failure as the primary outcome.
+            primary = e.primary_exception
+            if isinstance(primary, TimeoutError):
+                primary = AgentTimeoutError(
+                    "Agent execution timed out before sandbox cleanup failed"
+                )
+            self.result.exception_info = ExceptionInfo.from_exception(primary or e)
             self._trial_paths.exception_message_path.write_text(traceback.format_exc())
+            # stop() on some backends is best-effort: only a strict independent
+            # runtime check can make local logs safe. Never download, collect
+            # artifacts, or verify on this branch, even after successful stop.
+            if (
+                e.sandbox_stopped
+                and self._environment.capabilities.mounted
+                and isinstance(self._agent, BaseInstalledAgent)
+                and self.result.agent_result is not None
+            ):
+                try:
+                    self._agent.populate_local_context_after_cleanup_failure(
+                        self.result.agent_result
+                    )
+                except Exception:
+                    self._logger.warning(
+                        "Failed to recover local usage after cleanup failure",
+                        exc_info=True,
+                    )
+            if isinstance(primary, asyncio.CancelledError):
+                # Keep the operator's cancellation semantics after recording the
+                # secondary failure; don't turn it into a normal trial return.
+                raise primary
 
         except Exception as e:
             self._logger.debug(f"Trial {self.config.trial_name} failed: {e}")

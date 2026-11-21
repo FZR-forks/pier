@@ -568,6 +568,14 @@ class BaseEnvironment(ABC):
         written by the in-container agent user; other environments are no-ops.
         """
 
+    async def agent_sandbox_is_stopped(self) -> bool:
+        """Strictly confirm shutdown before reading local logs after failed cleanup.
+
+        Backends without an independent runtime-state check remain fail-closed.
+        This does not authorize grading or downloads from the failed sandbox.
+        """
+        return False
+
     @abstractmethod
     async def upload_file(self, source_path: Path | str, target_path: str):
         """

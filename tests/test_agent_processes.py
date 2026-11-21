@@ -28,6 +28,78 @@ async def test_cleanup_failure_is_not_an_agent_timeout():
 
 
 @pytest.mark.asyncio
+async def test_transient_unreadable_process_is_rechecked_without_stopping_sandbox():
+    environment = SimpleNamespace(
+        exec=AsyncMock(
+            side_effect=[
+                ExecResult(
+                    return_code=75,
+                    stderr="Unreadable process environment: pid=4 uid=0 state=S",
+                ),
+                ExecResult(return_code=0),
+            ]
+        ),
+        stop=AsyncMock(),
+    )
+    processes = AgentProcesses(environment, "test-run")
+    await processes.stop()
+    assert processes.stopped
+    assert environment.exec.await_count == 2
+    environment.stop.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("confirmed", [False, True])
+async def test_permanent_unreadable_process_stays_error_with_shutdown_status(confirmed):
+    environment = SimpleNamespace(
+        exec=AsyncMock(
+            return_value=ExecResult(
+                return_code=75, stderr="Unreadable process environment"
+            )
+        ),
+        stop=AsyncMock(),
+        agent_sandbox_is_stopped=AsyncMock(return_value=confirmed),
+    )
+    with pytest.raises(AgentProcessCleanupError) as caught:
+        await AgentProcesses(environment, "test-run").stop()
+    assert caught.value.sandbox_stopped is confirmed
+    assert environment.exec.await_count == 3
+    environment.stop.assert_awaited_once_with(delete=False)
+
+
+@pytest.mark.asyncio
+async def test_best_effort_stop_is_not_confirmed_when_state_query_fails():
+    environment = SimpleNamespace(
+        exec=AsyncMock(side_effect=TimeoutError("exec unavailable")),
+        stop=AsyncMock(),
+        agent_sandbox_is_stopped=AsyncMock(
+            side_effect=RuntimeError("daemon unavailable")
+        ),
+    )
+    with pytest.raises(AgentProcessCleanupError) as caught:
+        await AgentProcesses(environment, "test-run").stop()
+    assert not caught.value.sandbox_stopped
+
+
+@pytest.mark.asyncio
+async def test_cleanup_error_keeps_primary_execution_timeout(tmp_path):
+    environment = SimpleNamespace(
+        exec=AsyncMock(side_effect=TimeoutError("cleanup timed out")),
+        stop=AsyncMock(),
+    )
+    agent = Pi(logs_dir=tmp_path, model_name="openai/test")
+
+    async def run(*args, **kwargs):
+        await asyncio.Event().wait()
+
+    agent.run = run
+    execution = TrialExecution(None, agent, environment, 0.01, 1, 1)
+    with pytest.raises(AgentProcessCleanupError) as caught:
+        await execution.run_agent(instruction="", context=AgentContext())
+    assert isinstance(caught.value.primary_exception, TimeoutError)
+
+
+@pytest.mark.asyncio
 async def test_fallback_stop_has_its_own_deadline(monkeypatch):
     async def hang(**kwargs):
         await asyncio.Event().wait()
