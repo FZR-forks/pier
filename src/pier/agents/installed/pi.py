@@ -1043,18 +1043,66 @@ class Pi(BaseInstalledAgent):
         from pier.models.agent.session_usage import SessionUsage
 
         events = self._parse_stdout()
+        if not events:
+            return
+        # The normal converter intentionally nulls complete totals if even one
+        # interrupted message lacks usage. This branch preserves only observed
+        # contributions; do not weaken the normal converter's exact semantics.
+        usages = []
+        for record in self._records(events):
+            if record["kind"] == "agent":
+                usages.append(record["message"].get("usage"))
+                usages.extend(
+                    item.get("usage")
+                    for item in record["tool_results"]
+                    if isinstance(item.get("usage"), dict)
+                )
+            else:
+                usages.append(record["result"].get("usage"))
+        warming = {}
+        for event in events:
+            entry = (
+                event.get("entry") if event.get("type") == "entry_appended" else None
+            )
+            if isinstance(entry, dict) and entry.get("type") == "usage":
+                warming[str(entry.get("id") or len(warming))] = entry.get("usage")
+        usages.extend(warming.values())
+        known = [item for item in usages if isinstance(item, dict)]
+
+        def observed(*fields: str) -> int | None:
+            values = [
+                sum(item[key] for key in fields)
+                for item in known
+                if all(
+                    isinstance(item.get(key), int)
+                    and not isinstance(item[key], bool)
+                    and item[key] >= 0
+                    for key in fields
+                )
+            ]
+            return sum(values) if values else None
+
+        costs = [self._reported_cost(item) for item in known]
+        reported = SessionUsage(
+            source="pi.local_stdout.after_cleanup_failure",
+            complete=False,
+            n_input_tokens=observed("input", "cacheRead", "cacheWrite"),
+            n_cache_tokens=observed("cacheRead"),
+            n_output_tokens=observed("output"),
+            cost_usd=sum(costs)
+            if costs and all(value is not None for value in costs)
+            else None,
+        )
+        context.session_reported_usage = reported
+        context.n_input_tokens = None
+        context.n_cache_tokens = None
+        context.n_output_tokens = None
+        context.cost_usd = None
+        context.metadata = {**(context.metadata or {}), "cleanup_failed": True}
         trajectory = self._convert_events_to_trajectory(events)
         if trajectory is None or trajectory.final_metrics is None:
             return
         metrics = trajectory.final_metrics
-        reported = SessionUsage(
-            source="pi.local_stdout.after_cleanup_failure",
-            complete=False,
-            n_input_tokens=metrics.total_prompt_tokens,
-            n_cache_tokens=metrics.total_cached_tokens,
-            n_output_tokens=metrics.total_completion_tokens,
-            cost_usd=metrics.total_cost_usd,
-        )
         # A live request might not have a usage event. Preserve observed totals
         # separately instead of turning partial accounting into exact totals.
         metrics.extra = {
@@ -1066,13 +1114,14 @@ class Pi(BaseInstalledAgent):
         metrics.total_cached_tokens = None
         metrics.total_completion_tokens = None
         metrics.total_cost_usd = None
-        trajectory_path = self.logs_dir / "trajectory.json"
-        trajectory_path.write_text(format_trajectory_json(trajectory.to_json_dict()))
-        context.session_reported_usage = reported
-        context.n_input_tokens = None
-        context.n_cache_tokens = None
-        context.n_output_tokens = None
-        context.cost_usd = None
         context.peak_context_tokens = (metrics.extra or {}).get("peak_context_tokens")
         context.summarization_count = (metrics.extra or {}).get("summarization_count")
-        context.metadata = {**(context.metadata or {}), "cleanup_failed": True}
+        trajectory_path = self.logs_dir / "trajectory.json"
+        try:
+            trajectory_path.write_text(
+                format_trajectory_json(trajectory.to_json_dict())
+            )
+        except OSError:
+            self.logger.warning(
+                "Could not write Pi cleanup trajectory; reported usage retained"
+            )

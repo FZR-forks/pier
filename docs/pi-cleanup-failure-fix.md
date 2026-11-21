@@ -37,6 +37,22 @@ exact historical state. Exec/exit races can cause temporary read failures too.
 - End the inference deadline after a successful adapter return, rather than
   accidentally extending it into shutdown work.
 
+## First review follow-up
+
+- Preserve known contributions if the interrupted final response lacks usage;
+  exact-total conversion is unchanged. Recovery is populated independently of a
+  best-effort trajectory write, so a read-only output cannot erase accounting.
+- Use the same effective Docker client environment for Compose and both runtime
+  state queries; per-run `DOCKER_HOST`/`DOCKER_CONTEXT` selection must not query
+  a different daemon and mistake an empty result for stopped containers.
+- Preserve cancellation arriving during cleanup, and execution errors replaced
+  by cleanup inside an adapter's `finally` block. Do not replace an existing
+  primary error with another cleanup exception or confuse an operator cancel
+  with an execution deadline.
+- Recover into the active multi-step context when applicable, while leaving
+  prior steps unchanged. Shutdown confirmation and mounted-log guards still
+  apply, and verification/downloads remain prohibited.
+
 ## Safety limits
 
 This patch does not make permanent unreadable-process cleanup a successful

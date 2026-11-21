@@ -64,6 +64,9 @@ class IsolatedDocker:
     async def agent_sandbox_is_stopped(self):
         return await DockerEnvironment.agent_sandbox_is_stopped(self)
 
+    def _docker_client_env(self):
+        return os.environ.copy()
+
     def agent_process_env(self, env):
         return env
 

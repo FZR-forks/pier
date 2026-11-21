@@ -654,6 +654,11 @@ class Trial:
                 context=step_result.agent_result,
                 timeout_sec=timeout,
             )
+        except AgentProcessCleanupError:
+            # The outer fail-closed handler needs this step's context. Logs are
+            # still in the common agent directory: relocation has not run yet.
+            self._cleanup_failure_step = step_result
+            raise
         except (asyncio.TimeoutError, NonZeroAgentExitCodeError) as e:
             step_result.exception_info = ExceptionInfo.from_exception(e)
         finally:
@@ -1064,6 +1069,12 @@ class Trial:
                     "Agent execution timed out before sandbox cleanup failed"
                 )
             self.result.exception_info = ExceptionInfo.from_exception(primary or e)
+            step = getattr(self, "_cleanup_failure_step", None)
+            if step is not None:
+                step.exception_info = self.result.exception_info
+            recovery_context = (
+                step.agent_result if step is not None else self.result.agent_result
+            )
             self._trial_paths.exception_message_path.write_text(traceback.format_exc())
             # stop() on some backends is best-effort: only a strict independent
             # runtime check can make local logs safe. Never download, collect
@@ -1072,11 +1083,11 @@ class Trial:
                 e.sandbox_stopped
                 and self._environment.capabilities.mounted
                 and isinstance(self._agent, BaseInstalledAgent)
-                and self.result.agent_result is not None
+                and recovery_context is not None
             ):
                 try:
                     self._agent.populate_local_context_after_cleanup_failure(
-                        self.result.agent_result
+                        recovery_context
                     )
                 except Exception:
                     self._logger.warning(

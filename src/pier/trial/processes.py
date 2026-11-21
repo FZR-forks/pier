@@ -174,11 +174,16 @@ done
         cleanup = asyncio.create_task(self.stop(keep_pids))
         try:
             await asyncio.shield(cleanup)
-        except asyncio.CancelledError:
-            while not cleanup.done():
-                with contextlib.suppress(asyncio.CancelledError):
-                    await asyncio.shield(cleanup)
-            cleanup.result()
+        except asyncio.CancelledError as cancelled:
+            try:
+                while not cleanup.done():
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await asyncio.shield(cleanup)
+                cleanup.result()
+            except AgentProcessCleanupError as exc:
+                if exc.primary_exception is None:
+                    exc.primary_exception = cancelled
+                raise
             raise
 
     async def __aenter__(self) -> "AgentProcesses":
@@ -190,5 +195,8 @@ done
         except AgentProcessCleanupError as exc:
             # Don't lose the execution timeout (or other primary error) when a
             # second, independent failure occurs during shutdown.
-            exc.primary_exception = primary
+            if isinstance(primary, AgentProcessCleanupError):
+                primary = primary.primary_exception
+            if primary is not None:
+                exc.primary_exception = primary
             raise

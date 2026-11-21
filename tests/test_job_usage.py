@@ -521,3 +521,44 @@ async def test_cleanup_failure_does_not_swallow_operator_cancellation(tmp_path):
     assert trial.result.exception_info.exception_type == "CancelledError"
     assert trial.result.agent_cleanup_error.exception_type == "AgentProcessCleanupError"
     trial._run_verification.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_multistep_cleanup_recovers_into_current_step_only(tmp_path):
+    from pier.agents.installed.pi import Pi
+    from pier.trial.processes import AgentProcessCleanupError
+
+    trial = lifecycle_trial(trial_result(tmp_path).config)
+    trial._task.has_steps = True
+    trial._task.step_instruction = lambda name: "step instruction"
+    trial._environment.capabilities = SimpleNamespace(mounted=True)
+    trial._execution = SimpleNamespace(
+        run_agent=AsyncMock(
+            side_effect=AgentProcessCleanupError("failed", sandbox_stopped=True)
+        )
+    )
+    agent = Pi(
+        logs_dir=trial._trial_paths.agent_dir, model_name="anthropic/claude-haiku-5-5"
+    )
+    calls = []
+    agent.populate_local_context_after_cleanup_failure = calls.append
+    trial._agent = agent
+    trial._run_verification = AsyncMock()
+    previous = StepResult(
+        step_name="previous", agent_result=AgentContext(n_input_tokens=12)
+    )
+    current = StepResult(step_name="current")
+    step_config = SimpleNamespace(name="current", agent=SimpleNamespace(timeout_sec=1))
+
+    async def steps():
+        trial.result.step_results = [previous, current]
+        await trial._execute_step_agent(step_config, current)
+
+    trial._run_steps = steps
+    result = await trial.run()
+    assert result.agent_result is None
+    assert calls == [current.agent_result]
+    assert calls[0] is not previous.agent_result
+    assert current.exception_info.exception_type == "AgentProcessCleanupError"
+    trial._run_verification.assert_not_awaited()
+    trial._maybe_download_logs.assert_not_awaited()

@@ -486,18 +486,9 @@ class DockerEnvironment(BaseEnvironment):
             full_command.extend(["-f", str(path.resolve().absolute())])
         full_command.extend(command)
 
-        env = self._env_vars.to_env_dict(include_os_env=True)
-        if self._compose_task_env:
-            env.update(self._compose_task_env)
-        if self._persistent_env:
-            env.update(self._persistent_env)
-        # Inject after user env so it cannot be accidentally overridden.
-        if self._windows_container_name:
-            env["PIER_CONTAINER_NAME"] = self._windows_container_name
-
         process = await asyncio.create_subprocess_exec(
             *full_command,
-            env=env,
+            env=self._docker_client_env(),
             stdin=asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
@@ -540,6 +531,15 @@ class DockerEnvironment(BaseEnvironment):
             )
 
         return result
+
+    def _docker_client_env(self) -> dict[str, str]:
+        """Use identical daemon/context selection for Compose and state queries."""
+        env = self._env_vars.to_env_dict(include_os_env=True)
+        env.update(self._compose_task_env or {})
+        env.update(self._persistent_env or {})
+        if self._windows_container_name:
+            env["PIER_CONTAINER_NAME"] = self._windows_container_name
+        return env
 
     def _validate_daemon_mode(self) -> None:
         """Verify the Docker daemon mode matches the task's declared OS.
@@ -721,6 +721,7 @@ class DockerEnvironment(BaseEnvironment):
             process = await asyncio.create_subprocess_exec(
                 "docker",
                 *args,
+                env=self._docker_client_env(),
                 stdin=asyncio.subprocess.DEVNULL,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.DEVNULL,

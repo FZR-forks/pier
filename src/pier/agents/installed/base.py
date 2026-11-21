@@ -1,6 +1,7 @@
 import asyncio
 import functools
 import os
+import sys
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from pathlib import Path
@@ -358,6 +359,17 @@ class BaseInstalledAgent(BaseAgent, ABC):
                     self._run_deadline = deadline
                     await self.run(instruction, environment, context)
                     self.finish_execution()
+            except AgentProcessCleanupError as exc:
+                # Adapter cleanup in a finally block can replace the deadline's
+                # CancelledError before asyncio.timeout sees it. Restore timeout
+                # classification without confusing an operator cancellation.
+                if deadline.expired() and isinstance(
+                    exc.primary_exception, asyncio.CancelledError
+                ):
+                    exc.primary_exception = TimeoutError(
+                        "Agent execution deadline expired"
+                    )
+                raise
             finally:
                 self._run_deadline = None
                 self._run_processes = None
@@ -379,12 +391,17 @@ class BaseInstalledAgent(BaseAgent, ABC):
 
     async def stop_processes(self, keep_pids: tuple[int, ...] = ()) -> None:
         """Stop tools before an adapter copies its native session logs."""
+        primary = sys.exception()
+        if isinstance(primary, AgentProcessCleanupError):
+            primary = primary.primary_exception
         self.finish_execution()
         if processes := getattr(self, "_run_processes", None):
             try:
                 await processes.wait_stopped(keep_pids)
-            except AgentProcessCleanupError:
+            except AgentProcessCleanupError as exc:
                 self._process_cleanup_failed = True
+                if primary is not None:
+                    exc.primary_exception = primary
                 raise
 
     async def _exec(
