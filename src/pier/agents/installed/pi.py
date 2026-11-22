@@ -1,6 +1,5 @@
 import copy
 import json
-import math
 import shlex
 from datetime import datetime, timezone
 from typing import Any
@@ -12,11 +11,13 @@ from pier.agents.installed.base import (
     with_prompt_template,
 )
 from pier.agents.network import allowlist_from_urls, collect_url_values
+from pier.agents.installed.pi_usage import PiUsage, reported_cost
 from pier.environments.base import BaseEnvironment
 from pier.models.agent.context import AgentContext
 from pier.models.agent.install import AgentInstallSpec, InstallStep
 from pier.models.agent.name import AgentName
 from pier.models.agent.network import NetworkAllowlist
+from pier.models.agent.session_usage import SessionUsage
 from pier.models.trajectories import (
     Agent,
     FinalMetrics,
@@ -324,19 +325,6 @@ class Pi(BaseInstalledAgent):
             for key in ("input", "output", "cacheRead", "cacheWrite")
         )
 
-    @staticmethod
-    def _reported_cost(usage: Any) -> float | None:
-        cost = usage.get("cost") if isinstance(usage, dict) else None
-        value = cost.get("total") if isinstance(cost, dict) else None
-        return (
-            float(value)
-            if isinstance(value, (int, float))
-            and not isinstance(value, bool)
-            and math.isfinite(value)
-            and value >= 0
-            else None
-        )
-
     def network_allowlist(self) -> NetworkAllowlist:
         provider = self._provider()
         if provider is None:
@@ -547,10 +535,7 @@ class Pi(BaseInstalledAgent):
         flush()
         return records
 
-    def _agent_step(
-        self, step_id: int, record: dict[str, Any]
-    ) -> tuple[Step, dict[str, int | float]]:
-        """Build one ATIF step for an API turn, plus its usage contribution."""
+    def _agent_step(self, step_id: int, record: dict[str, Any]) -> Step:
         message = record["message"]
         content = message.get("content")
         usage = message.get("usage") if isinstance(message.get("usage"), dict) else {}
@@ -582,10 +567,6 @@ class Pi(BaseInstalledAgent):
                 )
 
         observation_results: list[ObservationResult] = []
-        tool_input = tool_output = 0
-        tool_cached = tool_cache_write = tool_cache_write_1h = 0
-        tool_reasoning = 0
-        tool_cost = 0.0
         for result in record["tool_results"]:
             observation_results.append(
                 ObservationResult(
@@ -594,25 +575,13 @@ class Pi(BaseInstalledAgent):
                     extra={"is_error": True} if result.get("isError") else None,
                 )
             )
-            # Tools may perform their own LLM work; pi bills it, so it belongs in
-            # the run totals even though it is not part of the main context.
-            if isinstance(result.get("usage"), dict):
-                tool_usage = result["usage"]
-                tool_input += int(tool_usage.get("input") or 0)
-                tool_output += int(tool_usage.get("output") or 0)
-                tool_cached += int(tool_usage.get("cacheRead") or 0)
-                tool_cache_write += int(tool_usage.get("cacheWrite") or 0)
-                tool_cache_write_1h += int(tool_usage.get("cacheWrite1h") or 0)
-                tool_reasoning += int(tool_usage.get("reasoning") or 0)
-                tool_cost += self._reported_cost(tool_usage) or 0.0
-
         input_tokens = int(usage.get("input") or 0)
         output_tokens = int(usage.get("output") or 0)
         cache_read = int(usage.get("cacheRead") or 0)
         cache_write = int(usage.get("cacheWrite") or 0)
         cache_write_1h = int(usage.get("cacheWrite1h") or 0)
         reasoning_tokens = int(usage.get("reasoning") or 0)
-        cost_total = self._reported_cost(usage) or 0.0
+        cost_total = reported_cost(usage) or 0.0
 
         # pi reports `input` net of cache, so the full prompt is the sum of all
         # three components (matching provider-reported prompt_tokens).
@@ -633,7 +602,7 @@ class Pi(BaseInstalledAgent):
                 prompt_tokens=prompt_tokens,
                 completion_tokens=output_tokens,
                 cached_tokens=cache_read,
-                cost_usd=self._reported_cost(usage)
+                cost_usd=reported_cost(usage)
                 if cost_total or self._explicit_zero_pricing()
                 else None,
                 extra=metrics_extra or None,
@@ -670,20 +639,9 @@ class Pi(BaseInstalledAgent):
         if step_extra:
             step_kwargs["extra"] = step_extra
 
-        totals: dict[str, int | float] = {
-            "prompt": prompt_tokens + tool_input + tool_cached + tool_cache_write,
-            "completion": output_tokens + tool_output,
-            "cached": cache_read + tool_cached,
-            "cache_write": cache_write + tool_cache_write,
-            "cache_write_1h": cache_write_1h + tool_cache_write_1h,
-            "reasoning": reasoning_tokens + tool_reasoning,
-            "cost": cost_total + tool_cost,
-        }
-        return Step(**step_kwargs), totals
+        return Step(**step_kwargs)
 
-    def _compaction_step(
-        self, step_id: int, record: dict[str, Any]
-    ) -> tuple[Step, dict[str, int | float]]:
+    def _compaction_step(self, step_id: int, record: dict[str, Any]) -> Step:
         """Build a system step recording one context compaction."""
         result = record["result"]
         usage = result.get("usage") if isinstance(result.get("usage"), dict) else {}
@@ -694,7 +652,6 @@ class Pi(BaseInstalledAgent):
         cache_write = int(usage.get("cacheWrite") or 0)
         cache_write_1h = int(usage.get("cacheWrite1h") or 0)
         reasoning_tokens = int(usage.get("reasoning") or 0)
-        cost_total = self._reported_cost(usage) or 0.0
         prompt_tokens = input_tokens + cache_read + cache_write
 
         compaction_extra = {
@@ -718,7 +675,7 @@ class Pi(BaseInstalledAgent):
                 "cache_write_tokens": cache_write,
                 "cache_write_1h_tokens": cache_write_1h,
                 "reasoning_tokens": reasoning_tokens,
-                "cost_usd": self._reported_cost(usage),
+                "cost_usd": reported_cost(usage),
             }
 
         step_kwargs: dict[str, Any] = {
@@ -728,16 +685,7 @@ class Pi(BaseInstalledAgent):
             "extra": {"compaction": compaction_extra},
         }
 
-        totals: dict[str, int | float] = {
-            "prompt": prompt_tokens,
-            "completion": output_tokens,
-            "cached": cache_read,
-            "cache_write": cache_write,
-            "cache_write_1h": cache_write_1h,
-            "reasoning": reasoning_tokens,
-            "cost": cost_total,
-        }
-        return Step(**step_kwargs), totals
+        return Step(**step_kwargs)
 
     def _compute_cost_from_pricing(
         self,
@@ -811,6 +759,22 @@ class Pi(BaseInstalledAgent):
             + output * output_rate
         )
 
+    def _usage_cost(self, usage: PiUsage, *, observed: bool = False) -> float | None:
+        cost = usage.observed_cost if observed else usage.cost
+        if cost == 0 and not self._explicit_zero_pricing():
+            return (
+                self._compute_cost_from_pricing(
+                    usage.observed("input", "cacheRead", "cacheWrite"),
+                    usage.observed("output"),
+                    usage.observed("cacheRead"),
+                    usage.observed("cacheWrite"),
+                    usage.observed("cacheWrite1h"),
+                )
+                if usage.complete
+                else None
+            )
+        return cost
+
     def _convert_events_to_trajectory(
         self, events: list[dict[str, Any]]
     ) -> Trajectory | None:
@@ -830,15 +794,7 @@ class Pi(BaseInstalledAgent):
         )
 
         steps: list[Step] = []
-        totals = {
-            "prompt": 0,
-            "completion": 0,
-            "cached": 0,
-            "cache_write": 0,
-            "cache_write_1h": 0,
-            "reasoning": 0,
-            "cost": 0.0,
-        }
+        usage = PiUsage(records, events)
         summarization_count = 0
         compaction_reasons: list[str] = []
 
@@ -851,57 +807,19 @@ class Pi(BaseInstalledAgent):
         for record in records:
             step_id = len(steps) + 1
             if record["kind"] == "agent":
-                step, contribution = self._agent_step(step_id, record)
+                step = self._agent_step(step_id, record)
             else:
-                step, contribution = self._compaction_step(step_id, record)
+                step = self._compaction_step(step_id, record)
                 summarization_count += 1
                 if reason := record.get("reason"):
                     compaction_reasons.append(str(reason))
             steps.append(step)
-            for key, value in contribution.items():
-                totals[key] += value
 
         if not any(step.source != "user" for step in steps):
             return None
 
-        # Billed requests recorded only as session `usage` entries (Pi 1.x
-        # cache warming). They are not turns, so they add to the totals only.
-        usage_entries: dict[str, dict[str, Any]] = {}
-        for event in events:
-            entry = (
-                event.get("entry") if event.get("type") == "entry_appended" else None
-            )
-            if (
-                isinstance(entry, dict)
-                and entry.get("type") == "usage"
-                and isinstance(entry.get("usage"), dict)
-            ):
-                usage_entries[str(entry.get("id") or len(usage_entries))] = entry
-        usage_by_kind: dict[str, dict[str, Any]] = {}
-        for entry in usage_entries.values():
-            usage = entry["usage"]
-            contribution = {
-                "prompt": int(usage.get("input") or 0)
-                + int(usage.get("cacheRead") or 0)
-                + int(usage.get("cacheWrite") or 0),
-                "completion": int(usage.get("output") or 0),
-                "cached": int(usage.get("cacheRead") or 0),
-                "cache_write": int(usage.get("cacheWrite") or 0),
-                "cache_write_1h": int(usage.get("cacheWrite1h") or 0),
-                "reasoning": int(usage.get("reasoning") or 0),
-                "cost": self._reported_cost(usage) or 0.0,
-            }
-            for key, value in contribution.items():
-                totals[key] += value
-            summary = usage_by_kind.setdefault(
-                str(entry.get("kind") or "unknown"),
-                {"count": 0, "prompt_tokens": 0, "completion_tokens": 0},
-            )
-            summary["count"] += 1
-            summary["prompt_tokens"] += contribution["prompt"]
-            summary["completion_tokens"] += contribution["completion"]
-
         final_extra: dict[str, Any] = {}
+        usage_by_kind = usage.warming_summary()
         if usage_by_kind:
             final_extra["usage_entries"] = usage_by_kind
         from pier.utils.rejected_request import rejected_requests_from_errors
@@ -909,12 +827,13 @@ class Pi(BaseInstalledAgent):
         rejected = rejected_requests_from_errors(events, source="pi.errorMessage")
         if rejected:
             final_extra["rejected_request_tokens"] = rejected
-        if totals["cache_write"]:
-            final_extra["total_cache_write_tokens"] = totals["cache_write"]
-        if totals["cache_write_1h"]:
-            final_extra["total_cache_write_1h_tokens"] = totals["cache_write_1h"]
-        if totals["reasoning"]:
-            final_extra["total_reasoning_tokens"] = totals["reasoning"]
+        for field, key in [
+            ("cacheWrite", "total_cache_write_tokens"),
+            ("cacheWrite1h", "total_cache_write_1h_tokens"),
+            ("reasoning", "total_reasoning_tokens"),
+        ]:
+            if count := usage.observed(field):
+                final_extra[key] = count
         if summarization_count:
             final_extra["compacted"] = True
         if compaction_reasons:
@@ -924,42 +843,15 @@ class Pi(BaseInstalledAgent):
         if stop_reason := self._final_stop_reason(records):
             final_extra["stop_reason"] = stop_reason
 
-        usages = []
-        for record in records:
-            if record["kind"] == "agent":
-                usages.append(record["message"].get("usage"))
-                usages.extend(
-                    item["usage"]
-                    for item in record["tool_results"]
-                    if isinstance(item.get("usage"), dict)
-                )
-            else:
-                usages.append(record["result"].get("usage"))
-        usages.extend(entry["usage"] for entry in usage_entries.values())
-        usage_known = all(
-            isinstance(item, dict)
-            and all(
-                isinstance(item.get(key), int)
-                for key in ("input", "output", "cacheRead", "cacheWrite")
-            )
-            for item in usages
-        )
-        costs = [self._reported_cost(item) for item in usages]
-        total_cost = sum(costs) if all(value is not None for value in costs) else None
-        if total_cost == 0 and not self._explicit_zero_pricing() and usage_known:
-            # Pi defaults absent custom-model rates to zero. Preserve explicit
-            # free pricing, otherwise retain the standard-price fallback.
-            total_cost = self._compute_cost_from_pricing(
-                totals["prompt"],
-                totals["completion"],
-                totals["cached"],
-                totals["cache_write"],
-                totals["cache_write_1h"],
-            )
+        usage_known = usage.complete
+        prompt = usage.observed("input", "cacheRead", "cacheWrite")
+        completion = usage.observed("output")
+        cached = usage.observed("cacheRead")
+        total_cost = self._usage_cost(usage)
         final_metrics = FinalMetrics(
-            total_prompt_tokens=totals["prompt"] if usage_known else None,
-            total_completion_tokens=totals["completion"] if usage_known else None,
-            total_cached_tokens=totals["cached"] if usage_known else None,
+            total_prompt_tokens=prompt if usage_known else None,
+            total_completion_tokens=completion if usage_known else None,
+            total_cached_tokens=cached if usage_known else None,
             total_cost_usd=total_cost if usage_known else None,
             total_steps=len(steps),
             extra=extra_with_context_metrics(
@@ -1018,80 +910,36 @@ class Pi(BaseInstalledAgent):
             trajectory = None
 
         if trajectory is not None:
-            trajectory_path = self.logs_dir / "trajectory.json"
-            try:
-                trajectory_path.write_text(
-                    format_trajectory_json(trajectory.to_json_dict())
-                )
-                self.logger.debug(f"Wrote pi trajectory to {trajectory_path}")
-            except OSError as exc:
-                self.logger.debug(
-                    f"Failed to write trajectory file {trajectory_path}: {exc}"
-                )
-
             if trajectory.final_metrics:
                 populate_context_from_final_metrics(context, trajectory.final_metrics)
+            self._write_trajectory(trajectory)
 
         if error := self._final_error(events):
             raise NonZeroAgentExitCodeError(f"pi ended on a failed turn: {error}")
 
+    def _write_trajectory(self, trajectory: Trajectory) -> None:
+        try:
+            (self.logs_dir / "trajectory.json").write_text(
+                format_trajectory_json(trajectory.to_json_dict())
+            )
+        except OSError:
+            self.logger.warning("Could not write Pi trajectory; context usage retained")
+
     def populate_local_context_after_cleanup_failure(
         self, context: AgentContext
     ) -> None:
-        # The caller independently confirmed the sandbox is stopped and these
-        # are bind-mounted local logs. No sandbox read or grading is performed.
-        from pier.models.agent.session_usage import SessionUsage
-
+        # Only runtime-confirmed shutdown makes bind-mounted logs stable.
         events = self._parse_stdout()
         if not events:
             return
-        # The normal converter intentionally nulls complete totals if even one
-        # interrupted message lacks usage. This branch preserves only observed
-        # contributions; do not weaken the normal converter's exact semantics.
-        usages = []
-        for record in self._records(events):
-            if record["kind"] == "agent":
-                usages.append(record["message"].get("usage"))
-                usages.extend(
-                    item.get("usage")
-                    for item in record["tool_results"]
-                    if isinstance(item.get("usage"), dict)
-                )
-            else:
-                usages.append(record["result"].get("usage"))
-        warming = {}
-        for event in events:
-            entry = (
-                event.get("entry") if event.get("type") == "entry_appended" else None
-            )
-            if isinstance(entry, dict) and entry.get("type") == "usage":
-                warming[str(entry.get("id") or len(warming))] = entry.get("usage")
-        usages.extend(warming.values())
-        known = [item for item in usages if isinstance(item, dict)]
-
-        def observed(*fields: str) -> int | None:
-            values = [
-                sum(item[key] for key in fields)
-                for item in known
-                if all(
-                    isinstance(item.get(key), int)
-                    and not isinstance(item[key], bool)
-                    and item[key] >= 0
-                    for key in fields
-                )
-            ]
-            return sum(values) if values else None
-
-        costs = [self._reported_cost(item) for item in known]
+        usage = PiUsage(self._records(events), events)
         reported = SessionUsage(
             source="pi.local_stdout.after_cleanup_failure",
             complete=False,
-            n_input_tokens=observed("input", "cacheRead", "cacheWrite"),
-            n_cache_tokens=observed("cacheRead"),
-            n_output_tokens=observed("output"),
-            cost_usd=sum(costs)
-            if costs and all(value is not None for value in costs)
-            else None,
+            n_input_tokens=usage.observed("input", "cacheRead", "cacheWrite"),
+            n_cache_tokens=usage.observed("cacheRead"),
+            n_output_tokens=usage.observed("output"),
+            cost_usd=self._usage_cost(usage, observed=True),
         )
         context.session_reported_usage = reported
         context.n_input_tokens = None
@@ -1103,8 +951,7 @@ class Pi(BaseInstalledAgent):
         if trajectory is None or trajectory.final_metrics is None:
             return
         metrics = trajectory.final_metrics
-        # A live request might not have a usage event. Preserve observed totals
-        # separately instead of turning partial accounting into exact totals.
+        # An interrupted request may never emit usage; observed is not exact.
         metrics.extra = {
             **(metrics.extra or {}),
             "session_reported_usage": reported.model_dump(),
@@ -1116,12 +963,4 @@ class Pi(BaseInstalledAgent):
         metrics.total_cost_usd = None
         context.peak_context_tokens = (metrics.extra or {}).get("peak_context_tokens")
         context.summarization_count = (metrics.extra or {}).get("summarization_count")
-        trajectory_path = self.logs_dir / "trajectory.json"
-        try:
-            trajectory_path.write_text(
-                format_trajectory_json(trajectory.to_json_dict())
-            )
-        except OSError:
-            self.logger.warning(
-                "Could not write Pi cleanup trajectory; reported usage retained"
-            )
+        self._write_trajectory(trajectory)

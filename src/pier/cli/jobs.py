@@ -821,12 +821,17 @@ def resume(
                 trial_paths.result_path.read_text()
             )
             if (
+                "CancelledError" in filter_error_types_set and trial_result.is_cancelled
+            ) or (
                 trial_result.exception_info is not None
                 and trial_result.exception_info.exception_type in filter_error_types_set
             ):
                 console.print(
                     f"Removing trial directory with {
-                        trial_result.exception_info.exception_type
+                        'operator cancellation'
+                        if trial_result.is_cancelled
+                        and 'CancelledError' in filter_error_types_set
+                        else trial_result.exception_info.exception_type
                     }: {trial_dir.name}"
                 )
                 shutil.rmtree(trial_dir)

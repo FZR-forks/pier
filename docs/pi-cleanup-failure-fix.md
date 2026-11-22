@@ -22,10 +22,12 @@ exact historical state. Exec/exit races can cause temporary read failures too.
 - Retry only the distinct unreadable-process status a bounded number of times.
   Re-run ownership checks: never infer ownership from age, UID, or ancestry.
   Persistent permission failures remain errors and stop the sandbox.
-- Keep the primary execution failure separately from a secondary cleanup error.
-  An agent deadline remains an agent timeout; an operator cancellation still
-  propagates. Trial results retain `agent_cleanup_error` and whether fallback
-  shutdown was independently confirmed.
+- Keep the execution failure, cleanup failure, and cancellation request as
+  independent facts. An agent deadline remains an agent timeout; an operator
+  cancellation still propagates even if the body previously failed. Trial results
+  retain `agent_cleanup_error`, `agent_cleanup_cancelled`, and whether fallback
+  shutdown was independently confirmed. Cleanup-affected trials are never retried,
+  including when their primary failure is normally retryable.
 - Docker stop is best-effort and logs some errors instead of raising. Query all
   containers in this exact Compose project separately and require no running,
   paused, or restarting process before considering mounted logs stable.
@@ -34,8 +36,6 @@ exact historical state. Exec/exit races can cause temporary read failures too.
 - Keep parsed usage in `session_reported_usage` with `complete: false` and null
   canonical totals. Preserve warming usage; do not mistake a partial response's
   missing usage for zero. Write the trajectory for later audit.
-- End the inference deadline after a successful adapter return, rather than
-  accidentally extending it into shutdown work.
 
 ## First review follow-up
 
@@ -52,6 +52,41 @@ exact historical state. Exec/exit races can cause temporary read failures too.
 - Recover into the active multi-step context when applicable, while leaving
   prior steps unchanged. Shutdown confirmation and mounted-log guards still
   apply, and verification/downloads remain prohibited.
+
+## Scoped untangle and independent review
+
+Pi's normal trajectory and cleanup recovery use one `PiUsage` ledger for usage
+source selection, warming deduplication, validation and known subtotals. Their
+shared price policy distinguishes unknown pricing from explicitly free models.
+File-output failure cannot erase already-populated accounting. The recovery
+view preserves known individual input/cache components if an interrupted record
+omits another component, but never claims exact canonical totals.
+
+`AgentProcessCleanupError` owns primary-error preservation and a separate late
+cancellation request. `TrialExecution` attaches the failing context and translates
+execution deadlines. Trial serialization does not infer deadlines from arbitrary
+error types or dynamically assigned current-step attributes. Failed multi-step
+local logs are relocated after confirmed stop; evidence must not be moved while
+the sandbox might still be writing it.
+
+Adapters retain the actual cleanup error rather than a second mutable failed
+boolean. OpenCode re-raises that stored error instead of replacing it and losing
+shutdown proof. Already-failed adapter cleanup does not trigger a second sandbox
+fallback. The adjacent Codex/Gemini changes only consume this shared error state;
+they do not change routing, task execution or tool configuration.
+
+Cancellation, retry-policy, cost and adapter error-replacement boundaries have
+behavior-level regressions. Redundant test variants for a second fallback
+were removed once the second fallback was removed; timeout/error/cancel coverage
+remains. Tests bypassing `TrialExecution` now exercise the real execution boundary.
+Deadline-versus-operator cancellation uses the pending task cancellation count
+after `asyncio.timeout` removes its own request. Saved statistics, live job state
+and the existing resume filter all use `TrialResult.is_cancelled`; that does not
+authorize any automatic resumption of a stopped benchmark. Usage records with no
+warming payload retain the normal converter's prior ignore behavior. Invalid
+negative/boolean token counts remain unknown rather than usable accounting.
+Exact cost requires all records; incomplete recovery retains positive known-cost
+subtotals as observed values and never labels default missing pricing as free.
 
 ## Safety limits
 

@@ -176,6 +176,8 @@ class BaseInstalledAgent(BaseAgent, ABC):
             Path(prompt_template_path) if prompt_template_path else None
         )
         self._version = version
+        self._run_processes: AgentProcesses | None = None
+        self._process_cleanup_error: AgentProcessCleanupError | None = None
 
     def _resolve_raw_value(
         self,
@@ -353,22 +355,20 @@ class BaseInstalledAgent(BaseAgent, ABC):
     ) -> None:
         async with await AgentProcesses.start(environment) as processes:
             self._run_processes = processes
-            self._process_cleanup_failed = False
+            self._process_cleanup_error = None
             try:
                 async with asyncio.timeout(timeout_sec) as deadline:
                     self._run_deadline = deadline
                     await self.run(instruction, environment, context)
-                    self.finish_execution()
             except AgentProcessCleanupError as exc:
-                # Adapter cleanup in a finally block can replace the deadline's
-                # CancelledError before asyncio.timeout sees it. Restore timeout
-                # classification without confusing an operator cancellation.
-                if deadline.expired() and isinstance(
-                    exc.primary_exception, asyncio.CancelledError
-                ):
-                    exc.primary_exception = TimeoutError(
-                        "Agent execution deadline expired"
-                    )
+                # asyncio.timeout has removed its own cancellation here. Any
+                # remaining request is external, including a same-tick cancel.
+                # Callers that intentionally swallow cancellation must uncancel().
+                task = asyncio.current_task()
+                if task is not None and task.cancelling():
+                    exc.cancellation = exc.cancellation or asyncio.CancelledError()
+                if exc.cancellation is None:
+                    exc.classify_deadline(deadline.expired())
                 raise
             finally:
                 self._run_deadline = None
@@ -392,16 +392,13 @@ class BaseInstalledAgent(BaseAgent, ABC):
     async def stop_processes(self, keep_pids: tuple[int, ...] = ()) -> None:
         """Stop tools before an adapter copies its native session logs."""
         primary = sys.exception()
-        if isinstance(primary, AgentProcessCleanupError):
-            primary = primary.primary_exception
         self.finish_execution()
-        if processes := getattr(self, "_run_processes", None):
+        if processes := self._run_processes:
             try:
                 await processes.wait_stopped(keep_pids)
             except AgentProcessCleanupError as exc:
-                self._process_cleanup_failed = True
-                if primary is not None:
-                    exc.primary_exception = primary
+                self._process_cleanup_error = exc
+                exc.preserve_primary(primary)
                 raise
 
     async def _exec(
@@ -442,7 +439,7 @@ class BaseInstalledAgent(BaseAgent, ABC):
         )
 
         process_env = environment.agent_process_env(merged_env)
-        if processes := getattr(self, "_run_processes", None):
+        if processes := self._run_processes:
             process_env = {**(process_env or {}), AGENT_RUN_ENV: processes.token}
 
         result = await environment.exec(

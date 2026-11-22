@@ -82,6 +82,7 @@ class TrialResult(BaseModel):
     started_at: datetime | None = None
     agent_cleanup_error: ExceptionInfo | None = None
     agent_sandbox_stopped_after_cleanup_error: bool | None = None
+    agent_cleanup_cancelled: bool = False
     finished_at: datetime | None = None
     environment_setup: TimingInfo | None = None
     agent_setup: TimingInfo | None = None
@@ -90,6 +91,13 @@ class TrialResult(BaseModel):
     n_agent_steps: int | None = None
     step_results: list[StepResult] | None = None
     attempt: int = Field(default=1, ge=1)
+
+    @property
+    def is_cancelled(self) -> bool:
+        return self.agent_cleanup_cancelled or (
+            self.exception_info is not None
+            and self.exception_info.exception_type == "CancelledError"
+        )
 
     def agent_step_count(self) -> int | None:
         if self.n_agent_steps is not None:

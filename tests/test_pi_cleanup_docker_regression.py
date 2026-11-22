@@ -4,6 +4,9 @@ import asyncio
 import os
 import shlex
 import uuid
+import logging
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -135,3 +138,39 @@ async def test_same_uid_nondumpable_process_never_silently_passes_cleanup(transi
             stderr=asyncio.subprocess.DEVNULL,
         )
         await remove.wait()
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(os.getenv("PIER_TEST_DOCKER") != "1", reason="opt-in Docker test")
+async def test_compose_fallback_shutdown_is_confirmed_on_the_same_project(tmp_path):
+    name = f"pier-pi-cleanup-compose-{uuid.uuid4().hex[:8]}"
+    compose = tmp_path / "compose.yaml"
+    compose.write_text(
+        "services:\n  main:\n    image: python:3.13-slim\n    pull_policy: never\n"
+        '    network_mode: none\n    command: ["sleep", "infinity"]\n'
+    )
+
+    class ComposeEnvironment(DockerEnvironment):
+        @property
+        def _docker_compose_paths(self):
+            return [compose]
+
+    environment = ComposeEnvironment.__new__(ComposeEnvironment)
+    environment.session_id = environment.environment_name = name
+    environment.environment_dir = tmp_path
+    environment._env_vars = SimpleNamespace(
+        to_env_dict=lambda **kwargs: os.environ.copy()
+    )
+    environment._compose_task_env = environment._persistent_env = {}
+    environment._windows_container_name = None
+    environment._keep_containers = False
+    environment.prepare_logs_for_host = AsyncMock()
+    environment._cleanup_resources_compose_file = lambda: None
+    environment.logger = logging.getLogger(__name__)
+    try:
+        await environment._run_docker_compose_command(["up", "--detach", "--wait"])
+        assert not await environment.agent_sandbox_is_stopped()
+        await environment.stop(delete=False)
+        assert await environment.agent_sandbox_is_stopped()
+    finally:
+        await environment._run_docker_compose_command(["down", "--remove-orphans"])

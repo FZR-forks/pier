@@ -22,6 +22,7 @@ from pier.models.task.config import TaskOS
 from pier.models.task.task import Task
 from pier.models.trial.config import AgentConfig, EnvironmentConfig
 from pier.models.trial.paths import TrialPaths
+from pier.trial.processes import AgentProcessCleanupError
 
 
 class AgentSetupTimeoutError(asyncio.TimeoutError):
@@ -270,6 +271,13 @@ class TrialExecution:
                     ),
                     timeout=timeout,
                 )
+        except AgentProcessCleanupError as e:
+            e.agent_context = context
+            if isinstance(e.primary_exception, TimeoutError):
+                e.primary_exception = AgentTimeoutError(
+                    f"Agent execution timed out after {timeout} seconds before cleanup failed"
+                )
+            raise
         except asyncio.TimeoutError as e:
             raise AgentTimeoutError(
                 f"Agent execution timed out after {timeout} seconds"

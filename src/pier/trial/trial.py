@@ -654,11 +654,6 @@ class Trial:
                 context=step_result.agent_result,
                 timeout_sec=timeout,
             )
-        except AgentProcessCleanupError:
-            # The outer fail-closed handler needs this step's context. Logs are
-            # still in the common agent directory: relocation has not run yet.
-            self._cleanup_failure_step = step_result
-            raise
         except (asyncio.TimeoutError, NonZeroAgentExitCodeError) as e:
             step_result.exception_info = ExceptionInfo.from_exception(e)
         finally:
@@ -1061,24 +1056,27 @@ class Trial:
         except AgentProcessCleanupError as e:
             self.result.agent_cleanup_error = ExceptionInfo.from_exception(e)
             self.result.agent_sandbox_stopped_after_cleanup_error = e.sandbox_stopped
-            # Cleanup must not mask an execution timeout. Keep both failures,
-            # but retain the original execution failure as the primary outcome.
             primary = e.primary_exception
-            if isinstance(primary, TimeoutError):
-                primary = AgentTimeoutError(
-                    "Agent execution timed out before sandbox cleanup failed"
-                )
+            cancellation = e.cancellation or (
+                primary if isinstance(primary, asyncio.CancelledError) else None
+            )
+            self.result.agent_cleanup_cancelled = cancellation is not None
             self.result.exception_info = ExceptionInfo.from_exception(primary or e)
-            step = getattr(self, "_cleanup_failure_step", None)
+            recovery_context = e.agent_context or self.result.agent_result
+            step = next(
+                (
+                    step
+                    for step in self.result.step_results or []
+                    if recovery_context is not None
+                    and step.agent_result is recovery_context
+                ),
+                None,
+            )
             if step is not None:
                 step.exception_info = self.result.exception_info
-            recovery_context = (
-                step.agent_result if step is not None else self.result.agent_result
-            )
             self._trial_paths.exception_message_path.write_text(traceback.format_exc())
-            # stop() on some backends is best-effort: only a strict independent
-            # runtime check can make local logs safe. Never download, collect
-            # artifacts, or verify on this branch, even after successful stop.
+            # Confirmed stop permits local accounting only, never grading or
+            # sandbox reads on the cleanup-failure path.
             if (
                 e.sandbox_stopped
                 and self._environment.capabilities.mounted
@@ -1089,15 +1087,25 @@ class Trial:
                     self._agent.populate_local_context_after_cleanup_failure(
                         recovery_context
                     )
+                    if recovery_context.n_agent_steps is None:
+                        recovery_context.n_agent_steps = (
+                            _agent_step_count_from_trajectory_path(
+                                self._trial_paths.agent_dir / "trajectory.json"
+                            )
+                        )
                 except Exception:
                     self._logger.warning(
                         "Failed to recover local usage after cleanup failure",
                         exc_info=True,
                     )
-            if isinstance(primary, asyncio.CancelledError):
-                # Keep the operator's cancellation semantics after recording the
-                # secondary failure; don't turn it into a normal trial return.
-                raise primary
+                if step is not None:
+                    _relocate_dir_contents(
+                        self._trial_paths.agent_dir,
+                        self._trial_paths.step_agent_dir(step.step_name),
+                    )
+            if cancellation is not None:
+                await self._invoke_hooks(TrialEvent.CANCEL)
+                raise cancellation
 
         except Exception as e:
             self._logger.debug(f"Trial {self.config.trial_name} failed: {e}")

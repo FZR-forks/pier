@@ -4,8 +4,12 @@ import asyncio
 import contextlib
 import shlex
 import uuid
+from typing import TYPE_CHECKING
 
 from pier.environments.base import BaseEnvironment
+
+if TYPE_CHECKING:
+    from pier.models.agent.context import AgentContext
 
 
 class AgentProcessCleanupError(RuntimeError):
@@ -15,6 +19,23 @@ class AgentProcessCleanupError(RuntimeError):
         super().__init__(message)
         self.sandbox_stopped = sandbox_stopped
         self.primary_exception: BaseException | None = None
+        self.cancellation: asyncio.CancelledError | None = None
+        self.agent_context: AgentContext | None = None
+
+    def preserve_primary(self, primary: BaseException | None) -> None:
+        while isinstance(primary, AgentProcessCleanupError):
+            if primary.cancellation is not None:
+                self.cancellation = primary.cancellation
+            primary = primary.primary_exception
+        if primary is not None:
+            self.primary_exception = primary
+
+    def classify_deadline(self, expired: bool) -> None:
+        if expired and (
+            self.primary_exception is None
+            or isinstance(self.primary_exception, asyncio.CancelledError)
+        ):
+            self.primary_exception = TimeoutError("Agent execution deadline expired")
 
 
 AGENT_RUN_ENV = "PIER_AGENT_RUN"
@@ -52,9 +73,8 @@ class AgentProcesses:
     async def stop(self, keep_pids: tuple[int, ...] = ()) -> None:
         if self.stopped:
             return
-        # Use /proc and shell builtins, without requiring Python or ps. The
-        # cleanup exec is untagged. Preserve collectors and their exec shells
-        # temporarily when OpenCode needs them for final session collection.
+        # Task images need not provide Python or ps. OpenCode collectors and
+        # their exec shells must survive until final session collection.
         command = f"""
 tag={shlex.quote(AGENT_RUN_ENV + "=" + self.token)}
 my_uid=$(id -u) || exit 1
@@ -88,8 +108,7 @@ for signal in TERM KILL KILL CHECK; do
         }} 2>/dev/null < "$path/environ" || readable=false
         if [ "$readable" = false ]; then
             [ -d "$path" ] || continue
-            # A process can exit between stat and environ (zombies keep /proc
-            # entries but are no longer able to write). Recheck before failing.
+            # Zombies retain /proc entries but cannot write the workspace.
             IFS= read -r stat 2>/dev/null < "$path/stat" || continue
             fields=${{stat##*) }}
             set -- $fields
@@ -99,12 +118,9 @@ for signal in TERM KILL KILL CHECK; do
                 [ "$key" = Uid: ] && {{ uid=$value; break; }}
             done 2>/dev/null < "$path/status"
             [ -n "$uid" ] || exit 1
-            # Retry other owners as their own UID. An unreadable environment
-            # even as its owner is unknown, not evidence that it is unowned.
+            # Unreadability is unknown ownership, not evidence of no owner.
             if [ "$uid" = "$my_uid" ]; then
-                # Do not leak command lines or environment values. Return a
-                # distinct transient status so the caller can recheck a process
-                # which is currently execing/exiting, without ignoring it.
+                # No command lines or environment values belong in diagnostics.
                 echo "Unreadable process environment: pid=$pid uid=$uid state=$1" >&2
                 exit 75
             fi
@@ -147,27 +163,28 @@ done
                     if uid not in users and uid != "0":
                         users.append(uid)
         except Exception as cause:
-            # Do not allow verification on a workspace that is still changing.
-            # A successful stop() alone isn't proof: some backends intentionally
-            # log stop errors without raising. Only a backend's strict check can
-            # authorize parsing already-local, now immutable logs.
-            sandbox_stopped = False
-            try:
-                await asyncio.wait_for(
-                    self.environment.stop(delete=False), timeout=self._STOP_TIMEOUT_SEC
-                )
-                checker = getattr(self.environment, "agent_sandbox_is_stopped", None)
-                if checker is not None:
-                    sandbox_stopped = (
-                        await asyncio.wait_for(checker(), timeout=10) is True
-                    )
-            except Exception:
-                pass
+            # stop() is best-effort on some backends; runtime confirmation is
+            # required before already-local logs can be considered immutable.
+            sandbox_stopped = await self._stop_sandbox()
             raise AgentProcessCleanupError(
                 "Could not stop sandbox agent processes",
                 sandbox_stopped=sandbox_stopped,
             ) from cause
         self.stopped = not keep_pids
+
+    async def _stop_sandbox(self) -> bool:
+        try:
+            await asyncio.wait_for(
+                self.environment.stop(delete=False), timeout=self._STOP_TIMEOUT_SEC
+            )
+            return (
+                await asyncio.wait_for(
+                    self.environment.agent_sandbox_is_stopped(), timeout=10
+                )
+                is True
+            )
+        except Exception:
+            return False
 
     async def wait_stopped(self, keep_pids: tuple[int, ...] = ()) -> None:
         """Do not leave cleanup running in the background on cancellation."""
@@ -181,8 +198,9 @@ done
                         await asyncio.shield(cleanup)
                 cleanup.result()
             except AgentProcessCleanupError as exc:
+                exc.cancellation = cancelled
                 if exc.primary_exception is None:
-                    exc.primary_exception = cancelled
+                    exc.preserve_primary(cancelled)
                 raise
             raise
 
@@ -190,13 +208,12 @@ done
         return self
 
     async def __aexit__(self, _type=None, primary=None, _tb=None) -> None:
+        if isinstance(primary, AgentProcessCleanupError):
+            # Adapter cleanup already performed the fallback and captured its
+            # runtime proof. A second sweep cannot improve that evidence.
+            return
         try:
             await self.wait_stopped()
         except AgentProcessCleanupError as exc:
-            # Don't lose the execution timeout (or other primary error) when a
-            # second, independent failure occurs during shutdown.
-            if isinstance(primary, AgentProcessCleanupError):
-                primary = primary.primary_exception
-            if primary is not None:
-                exc.primary_exception = primary
+            exc.preserve_primary(primary)
             raise

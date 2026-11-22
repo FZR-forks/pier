@@ -467,6 +467,7 @@ async def test_cleanup_recovery_only_after_confirmed_stop_and_never_grades(
 ):
     from pier.agents.installed.pi import Pi
     from pier.trial.processes import AgentProcessCleanupError
+    from pier.trial.execution import TrialExecution
 
     config = trial_result(tmp_path).config
     trial = lifecycle_trial(config)
@@ -486,7 +487,10 @@ async def test_cleanup_recovery_only_after_confirmed_stop_and_never_grades(
         trial.result.agent_result = AgentContext()
         error = AgentProcessCleanupError("failed", sandbox_stopped=confirmed)
         error.primary_exception = TimeoutError("agent deadline") if timed_out else None
-        raise error
+        agent.run_with_cleanup = AsyncMock(side_effect=error)
+        await TrialExecution(None, agent, trial._environment, 1, 1, 1).run_agent(
+            instruction="task", context=trial.result.agent_result
+        )
 
     trial._execute_agent = unsafe
     trial._run_verification = AsyncMock()
@@ -524,25 +528,88 @@ async def test_cleanup_failure_does_not_swallow_operator_cancellation(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_multistep_cleanup_recovers_into_current_step_only(tmp_path):
+@pytest.mark.parametrize("timed_out", [False, True])
+async def test_real_lifecycle_late_cancel_keeps_original_error_and_cancel_hook(
+    tmp_path, timed_out
+):
+    from pier.agents.installed.pi import Pi
+    from pier.trial.execution import TrialExecution
+    from pier.trial.hooks import TrialEvent
+
+    trial = lifecycle_trial(trial_result(tmp_path).config)
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    async def scan(*args, **kwargs):
+        entered.set()
+        await release.wait()
+        raise TimeoutError("cleanup")
+
+    trial._environment.exec = scan
+    agent = Pi(logs_dir=trial._trial_paths.agent_dir, model_name="anthropic/test")
+
+    async def run(*args, **kwargs):
+        if not timed_out:
+            raise ValueError("original")
+        await asyncio.Event().wait()
+
+    agent.run = run
+    trial._agent = agent
+    trial._execution = TrialExecution(
+        None, agent, trial._environment, 0.01 if timed_out else 10, 1, 1
+    )
+    trial._execute_agent = Trial._execute_agent.__get__(trial)
+    trial._run_verification = AsyncMock()
+    trial._invoke_hooks = AsyncMock()
+    task = asyncio.create_task(trial.run())
+    await entered.wait()
+    task.cancel()
+    await asyncio.sleep(0)
+    release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert trial.result.exception_info.exception_type == (
+        "AgentTimeoutError" if timed_out else "ValueError"
+    )
+    assert trial.result.agent_cleanup_cancelled is True
+    assert Job._is_cancelled_result(trial.result)
+    assert any(
+        call.args[0] == TrialEvent.CANCEL
+        for call in trial._invoke_hooks.await_args_list
+    )
+    trial._run_verification.assert_not_awaited()
+    trial._maybe_download_logs.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("recovery_fails", [False, True])
+async def test_multistep_cleanup_recovers_into_current_step_only(
+    tmp_path, recovery_fails
+):
     from pier.agents.installed.pi import Pi
     from pier.trial.processes import AgentProcessCleanupError
+    from pier.trial.execution import TrialExecution
 
     trial = lifecycle_trial(trial_result(tmp_path).config)
     trial._task.has_steps = True
     trial._task.step_instruction = lambda name: "step instruction"
     trial._environment.capabilities = SimpleNamespace(mounted=True)
-    trial._execution = SimpleNamespace(
-        run_agent=AsyncMock(
-            side_effect=AgentProcessCleanupError("failed", sandbox_stopped=True)
-        )
-    )
     agent = Pi(
         logs_dir=trial._trial_paths.agent_dir, model_name="anthropic/claude-haiku-5-5"
     )
     calls = []
-    agent.populate_local_context_after_cleanup_failure = calls.append
+
+    def recover(context):
+        calls.append(context)
+        (trial._trial_paths.agent_dir / "trajectory.json").write_text("local evidence")
+        if recovery_fails:
+            raise OSError("recovery failed after opening local logs")
+
+    agent.populate_local_context_after_cleanup_failure = recover
     trial._agent = agent
+    agent.run_with_cleanup = AsyncMock(
+        side_effect=AgentProcessCleanupError("failed", sandbox_stopped=True)
+    )
+    trial._execution = TrialExecution(None, agent, trial._environment, 1, 1, 1)
     trial._run_verification = AsyncMock()
     previous = StepResult(
         step_name="previous", agent_result=AgentContext(n_input_tokens=12)
@@ -560,5 +627,22 @@ async def test_multistep_cleanup_recovers_into_current_step_only(tmp_path):
     assert calls == [current.agent_result]
     assert calls[0] is not previous.agent_result
     assert current.exception_info.exception_type == "AgentProcessCleanupError"
+    assert (
+        trial._trial_paths.step_agent_dir("current") / "trajectory.json"
+    ).read_text() == "local evidence"
+    assert not (trial._trial_paths.agent_dir / "trajectory.json").exists()
     trial._run_verification.assert_not_awaited()
     trial._maybe_download_logs.assert_not_awaited()
+
+
+def test_cleanup_cancellation_uses_same_definition_in_live_and_saved_job_stats(
+    tmp_path,
+):
+    result = trial_result(tmp_path, "ValueError")
+    result.agent_cleanup_cancelled = True
+    assert result.is_cancelled
+    assert Job._is_cancelled_result(result)
+    stats = JobStats.from_trial_results([result])
+    assert stats.n_cancelled_trials == 1
+    stats.remove_trial(result)
+    assert stats.n_cancelled_trials == 0

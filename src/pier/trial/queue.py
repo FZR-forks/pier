@@ -155,7 +155,8 @@ class TrialQueue:
             # Once evaluation completed, even an allowlisted cleanup failure
             # is not permission to buy another model attempt/change the reward.
             if (
-                result.verifier_result is not None
+                result.agent_cleanup_error is not None
+                or result.verifier_result is not None
                 or (
                     result.verifier is not None
                     and result.verifier.finished_at is not None

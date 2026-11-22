@@ -109,11 +109,9 @@ def test_known_usage_survives_interrupted_response_and_trajectory_write_failure(
 
         monkeypatch.setattr(Path, "write_text", write)
     agent = Pi(logs_dir=tmp_path, model_name="anthropic/claude-haiku-5-5")
-    # Normal conversion still refuses exact totals for a response missing usage.
-    assert (
-        agent._convert_events_to_trajectory(events).final_metrics.total_prompt_tokens
-        is None
-    )
+    normal = AgentContext()
+    agent.populate_context_post_run(normal)
+    assert normal.n_input_tokens is normal.n_output_tokens is None
     context = AgentContext()
     agent.populate_local_context_after_cleanup_failure(context)
     assert context.session_reported_usage.complete is False
@@ -133,3 +131,226 @@ def test_no_reported_usage_is_unknown_not_zero(tmp_path):
     Pi(logs_dir=tmp_path).populate_local_context_after_cleanup_failure(context)
     assert context.session_reported_usage.n_input_tokens is None
     assert context.session_reported_usage.n_output_tokens is None
+
+
+def test_partial_warming_summary_preserves_present_input_components(tmp_path):
+    events = [
+        {
+            "type": "message_end",
+            "message": {
+                "role": "assistant",
+                "content": [],
+                "stopReason": "stop",
+                "usage": {"input": 1, "output": 2, "cacheRead": 0, "cacheWrite": 0},
+            },
+        },
+        {
+            "type": "entry_appended",
+            "entry": {
+                "type": "usage",
+                "id": "w1",
+                "kind": "cache_warm",
+                "usage": {"input": 7, "cacheRead": 300, "output": 2},
+            },
+        },
+    ]
+    (tmp_path / "pi.txt").write_text("\n".join(json.dumps(e) for e in events))
+    context = AgentContext()
+    Pi(logs_dir=tmp_path).populate_context_post_run(context)
+    saved = json.loads((tmp_path / "trajectory.json").read_text())
+    assert (
+        saved["final_metrics"]["extra"]["usage_entries"]["cache_warm"]["prompt_tokens"]
+        == 307
+    )
+    assert context.n_input_tokens is None
+
+
+def test_invalid_warming_entry_does_not_erase_completed_exact_totals(tmp_path):
+    message = {
+        "role": "assistant",
+        "content": [],
+        "stopReason": "stop",
+        "usage": {"input": 10, "cacheRead": 100, "cacheWrite": 5, "output": 20},
+    }
+    events = [
+        {"type": "turn_end", "message": message, "toolResults": []},
+        {
+            "type": "entry_appended",
+            "entry": {"type": "usage", "id": "bad", "usage": None},
+        },
+    ]
+    (tmp_path / "pi.txt").write_text("\n".join(json.dumps(e) for e in events))
+    exact, recovered = AgentContext(), AgentContext()
+    agent = Pi(logs_dir=tmp_path)
+    agent.populate_context_post_run(exact)
+    agent.populate_local_context_after_cleanup_failure(recovered)
+    assert (
+        exact.n_input_tokens == recovered.session_reported_usage.n_input_tokens == 115
+    )
+
+
+def test_partial_recovery_retains_known_cost_as_observed_not_exact(tmp_path):
+    events = [
+        {
+            "type": "message_end",
+            "message": {
+                "role": "assistant",
+                "content": [],
+                "stopReason": "toolUse",
+                "usage": {
+                    "input": 10,
+                    "cacheRead": 100,
+                    "cacheWrite": 5,
+                    "output": 20,
+                    "cost": {"total": 0.01},
+                },
+            },
+        },
+        {
+            "type": "message_end",
+            "message": {"role": "assistant", "content": [], "stopReason": "aborted"},
+        },
+    ]
+    (tmp_path / "pi.txt").write_text("\n".join(json.dumps(e) for e in events))
+    agent = Pi(logs_dir=tmp_path)
+    context = AgentContext()
+    agent.populate_local_context_after_cleanup_failure(context)
+    assert context.cost_usd is None
+    assert context.session_reported_usage.cost_usd == 0.01
+    assert context.session_reported_usage.complete is False
+
+
+def test_exact_and_recovered_usage_share_tool_compaction_and_warming_sources(tmp_path):
+    def usage(input_tokens, cached, output):
+        return {
+            "input": input_tokens,
+            "cacheRead": cached,
+            "cacheWrite": 0,
+            "output": output,
+            "cost": {"total": 0.01},
+        }
+
+    message = {
+        "role": "assistant",
+        "content": [
+            {"type": "toolCall", "id": "t1", "name": "llm_tool", "arguments": {}}
+        ],
+        "stopReason": "stop",
+        "usage": usage(2, 3, 5),
+        "responseId": "r1",
+        "timestamp": 1,
+    }
+    tool = {
+        "role": "toolResult",
+        "content": [],
+        "toolCallId": "t1",
+        "usage": usage(7, 11, 13),
+    }
+    warming = {
+        "type": "entry_appended",
+        "entry": {
+            "type": "usage",
+            "id": "w1",
+            "kind": "cache_warm",
+            "usage": usage(17, 19, 23),
+        },
+    }
+    events = [
+        {"type": "turn_end", "message": message, "toolResults": [tool]},
+        {
+            "type": "compaction_end",
+            "result": {"summary": "summary", "usage": usage(29, 31, 37)},
+        },
+        warming,
+        warming,
+    ]
+    (tmp_path / "pi.txt").write_text("\n".join(json.dumps(e) for e in events))
+    agent = Pi(logs_dir=tmp_path)
+    exact, recovered = AgentContext(), AgentContext()
+    agent.populate_context_post_run(exact)
+    agent.populate_local_context_after_cleanup_failure(recovered)
+    observed = recovered.session_reported_usage
+    assert [exact.n_input_tokens, exact.n_cache_tokens, exact.n_output_tokens] == [
+        119,
+        64,
+        78,
+    ]
+    assert [
+        observed.n_input_tokens,
+        observed.n_cache_tokens,
+        observed.n_output_tokens,
+    ] == [119, 64, 78]
+    assert recovered.n_input_tokens is None
+
+
+@pytest.mark.parametrize("free", [False, True])
+def test_default_zero_cost_is_not_misreported_as_free_recovery(
+    tmp_path, monkeypatch, free
+):
+    import litellm
+
+    monkeypatch.setattr(litellm, "model_cost", {})
+    message = {
+        "role": "assistant",
+        "content": [],
+        "stopReason": "stop",
+        "usage": {
+            "input": 1,
+            "output": 2,
+            "cacheRead": 0,
+            "cacheWrite": 0,
+            "cost": {"total": 0},
+        },
+    }
+    (tmp_path / "pi.txt").write_text(
+        json.dumps({"type": "message_end", "message": message})
+    )
+    config = (
+        {
+            "providers": {
+                "openai": {
+                    "modelOverrides": {
+                        "unknown": {
+                            "cost": {
+                                "input": 0,
+                                "output": 0,
+                                "cacheRead": 0,
+                                "cacheWrite": 0,
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if free
+        else None
+    )
+    agent = Pi(logs_dir=tmp_path, model_name="openai/unknown", pi_config=config)
+    exact, recovered = AgentContext(), AgentContext()
+    agent.populate_context_post_run(exact)
+    agent.populate_local_context_after_cleanup_failure(recovered)
+    assert exact.cost_usd == (0 if free else None)
+    assert recovered.session_reported_usage.cost_usd == exact.cost_usd
+
+
+def test_partial_usage_retains_known_components_without_claiming_zero_missing_cache(
+    tmp_path,
+):
+    message = {
+        "role": "assistant",
+        "content": [],
+        "stopReason": "aborted",
+        "usage": {"input": 7, "cacheRead": 11, "output": 3},
+    }
+    (tmp_path / "pi.txt").write_text(
+        json.dumps({"type": "message_end", "message": message})
+    )
+    agent = Pi(logs_dir=tmp_path)
+    exact, recovered = AgentContext(), AgentContext()
+    agent.populate_context_post_run(exact)
+    agent.populate_local_context_after_cleanup_failure(recovered)
+    reported = recovered.session_reported_usage
+    assert reported.n_input_tokens == 18
+    assert reported.n_output_tokens == 3
+    assert reported.complete is False
+    assert exact.n_input_tokens is recovered.n_input_tokens is None

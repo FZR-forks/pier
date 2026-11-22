@@ -43,3 +43,30 @@ def test_resume_cleanup_preserves_retry_attempt_archives(tmp_path):
 
     assert archive_dir.is_dir()
     assert (archive_dir / "trial.log").read_text(encoding="utf-8") == "failed"
+
+
+def test_default_resume_filter_recognizes_cleanup_cancel_with_primary_error(
+    tmp_path, monkeypatch
+):
+    import pytest
+    from pier.cli.jobs import resume
+    from pier.environments.factory import EnvironmentFactory
+    from test_trial_queue_retry_archives import trial_result
+
+    config = JobConfig(job_name="job", jobs_dir=tmp_path)
+    job = tmp_path / "job"
+    job.mkdir()
+    (job / "config.json").write_text(config.model_dump_json())
+    result = trial_result(job, "ValueError")
+    result.agent_cleanup_cancelled = True
+    trial = job / result.trial_name
+    trial.mkdir()
+    (trial / "result.json").write_text(result.model_dump_json())
+
+    def no_launch(**kwargs):
+        raise RuntimeError("stop before starting any resumed job")
+
+    monkeypatch.setattr(EnvironmentFactory, "run_preflight", no_launch)
+    with pytest.raises(RuntimeError, match="stop before"):
+        resume(job)
+    assert not trial.exists()

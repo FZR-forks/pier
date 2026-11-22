@@ -2404,7 +2404,7 @@ class Codex(BaseInstalledAgent):
             try:
                 await self.stop_processes()
             finally:
-                if not getattr(self, "_process_cleanup_failed", False):
+                if self._process_cleanup_error is None:
                     try:
                         await self.exec_as_agent(
                             environment,
