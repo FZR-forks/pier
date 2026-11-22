@@ -71,6 +71,7 @@ async def test_retry_keeps_observation_if_archiving_fails(monkeypatch, tmp_path)
     (failed_trial_dir / "trial.log").write_text("failed", encoding="utf-8")
 
     failed_result = SimpleNamespace(
+        agent_cleanup_error=None,
         exception_info=SimpleNamespace(exception_type="ConnectionError"),
         attempt=1,
         verifier_result=None,
@@ -131,6 +132,38 @@ async def test_retry_keeps_observation_if_archiving_fails(monkeypatch, tmp_path)
 )
 def test_default_retries_only_explicit_infrastructure_types(error, eligible):
     assert TrialQueue(1)._should_retry_exception(error) is eligible
+
+
+@pytest.mark.asyncio
+async def test_retryable_primary_with_cleanup_error_never_buys_new_attempt(
+    tmp_path, monkeypatch
+):
+    failed = trial_result(tmp_path, "ConnectionError")
+    failed.agent_cleanup_error = failed.exception_info.model_copy(
+        update={"exception_type": "AgentProcessCleanupError"}
+    )
+    attempts = []
+
+    class FakeTrial:
+        def add_hook(self, *args):
+            pass
+
+        async def run(self, **kwargs):
+            attempts.append(kwargs["attempt"])
+            return failed
+
+    async def create(cls, config):
+        return FakeTrial()
+
+    monkeypatch.setattr(Trial, "create", classmethod(create))
+    result = await TrialQueue(
+        1,
+        RetryConfig(
+            max_retries=2, include_exceptions={"ConnectionError"}, min_wait_sec=0
+        ),
+    )._execute_trial_with_retries(failed.config)
+    assert result is failed
+    assert attempts == [1]
 
 
 def test_explicit_retry_policy_empty_set_and_exclusions():

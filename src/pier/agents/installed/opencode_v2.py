@@ -1303,12 +1303,8 @@ class OpenCodeV2(BaseInstalledAgent):
             raise
         finally:
             self.finish_execution()
-            if getattr(self, "_process_cleanup_failed", False):
-                # The fallback already stopped the environment. Do not spend
-                # the runner grace period probing it or read mutable evidence.
-                from pier.trial.processes import AgentProcessCleanupError
-
-                raise AgentProcessCleanupError("OpenCode process shutdown failed")
+            if self._process_cleanup_error is not None:
+                raise self._process_cleanup_error
             # A timed-out agent is cancelled host-side, and killing a
             # `docker compose exec` client does not signal the process inside
             # the container. Without this the runner, the OpenCode server and
@@ -1321,7 +1317,7 @@ class OpenCodeV2(BaseInstalledAgent):
             try:
                 await self.stop_processes()
             finally:
-                if not getattr(self, "_process_cleanup_failed", False):
+                if self._process_cleanup_error is None:
                     try:
                         await self._collect_runner_artifacts(environment)
                     except Exception:

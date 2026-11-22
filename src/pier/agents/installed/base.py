@@ -1,6 +1,7 @@
 import asyncio
 import functools
 import os
+import sys
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from pathlib import Path
@@ -175,6 +176,8 @@ class BaseInstalledAgent(BaseAgent, ABC):
             Path(prompt_template_path) if prompt_template_path else None
         )
         self._version = version
+        self._run_processes: AgentProcesses | None = None
+        self._process_cleanup_error: AgentProcessCleanupError | None = None
 
     def _resolve_raw_value(
         self,
@@ -352,11 +355,21 @@ class BaseInstalledAgent(BaseAgent, ABC):
     ) -> None:
         async with await AgentProcesses.start(environment) as processes:
             self._run_processes = processes
-            self._process_cleanup_failed = False
+            self._process_cleanup_error = None
             try:
                 async with asyncio.timeout(timeout_sec) as deadline:
                     self._run_deadline = deadline
                     await self.run(instruction, environment, context)
+            except AgentProcessCleanupError as exc:
+                # asyncio.timeout has removed its own cancellation here. Any
+                # remaining request is external, including a same-tick cancel.
+                # Callers that intentionally swallow cancellation must uncancel().
+                task = asyncio.current_task()
+                if task is not None and task.cancelling():
+                    exc.cancellation = exc.cancellation or asyncio.CancelledError()
+                if exc.cancellation is None:
+                    exc.classify_deadline(deadline.expired())
+                raise
             finally:
                 self._run_deadline = None
                 self._run_processes = None
@@ -367,14 +380,30 @@ class BaseInstalledAgent(BaseAgent, ABC):
         if deadline is not None and not deadline.expired():
             deadline.reschedule(None)
 
+    def populate_local_context_after_cleanup_failure(
+        self, context: "AgentContext"
+    ) -> None:
+        """Optional offline-only recovery after runtime-confirmed sandbox stop.
+
+        Only adapters whose native evidence is already local may override this.
+        Never issue environment commands/downloads here or imply full usage.
+        """
+
     async def stop_processes(self, keep_pids: tuple[int, ...] = ()) -> None:
         """Stop tools before an adapter copies its native session logs."""
+        primary = sys.exception()
+        deadline = getattr(self, "_run_deadline", None)
+        expired_before_cleanup = deadline is not None and deadline.expired()
         self.finish_execution()
-        if processes := getattr(self, "_run_processes", None):
+        if processes := self._run_processes:
             try:
                 await processes.wait_stopped(keep_pids)
-            except AgentProcessCleanupError:
-                self._process_cleanup_failed = True
+            except AgentProcessCleanupError as exc:
+                self._process_cleanup_error = exc
+                exc.preserve_primary(primary)
+                # Snapshot the execution deadline before awaiting cleanup so a
+                # later operator cancel cannot erase the original timeout.
+                exc.classify_deadline(expired_before_cleanup)
                 raise
 
     async def _exec(
@@ -415,7 +444,7 @@ class BaseInstalledAgent(BaseAgent, ABC):
         )
 
         process_env = environment.agent_process_env(merged_env)
-        if processes := getattr(self, "_run_processes", None):
+        if processes := self._run_processes:
             process_env = {**(process_env or {}), AGENT_RUN_ENV: processes.token}
 
         result = await environment.exec(

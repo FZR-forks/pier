@@ -191,8 +191,8 @@ class JobStats(BaseModel):
             ).append(trial_result.trial_name)
             eval_stats.n_errors += 1
             self.n_errored_trials += 1
-            if trial_result.exception_info.exception_type == "CancelledError":
-                self.n_cancelled_trials += 1
+        if trial_result.is_cancelled:
+            self.n_cancelled_trials += 1
 
         n_input, n_cache, n_output, cost = trial_result.compute_token_cost_totals()
         if n_input is not None:
@@ -235,8 +235,8 @@ class JobStats(BaseModel):
                 trial_list.remove(trial_result.trial_name)
             eval_stats.n_errors -= 1
             self.n_errored_trials -= 1
-            if exception_type == "CancelledError":
-                self.n_cancelled_trials -= 1
+        if trial_result.is_cancelled:
+            self.n_cancelled_trials -= 1
 
         n_input, n_cache, n_output, cost = trial_result.compute_token_cost_totals()
         if n_input is not None and self.n_input_tokens is not None:

@@ -1054,10 +1054,64 @@ class Trial:
             raise e
 
         except AgentProcessCleanupError as e:
-            # Neither downloads nor grading are safe when the sandbox could
-            # still be changing. Retain local evidence without reading more.
-            self.result.exception_info = ExceptionInfo.from_exception(e)
+            self.result.agent_cleanup_error = ExceptionInfo.from_exception(e)
+            self.result.agent_sandbox_stopped_after_cleanup_error = e.sandbox_stopped
+            primary = e.primary_exception
+            cancellation = e.cancellation or (
+                primary if isinstance(primary, asyncio.CancelledError) else None
+            )
+            self.result.agent_cleanup_cancelled = cancellation is not None
+            self.result.exception_info = ExceptionInfo.from_exception(primary or e)
+            recovery_context = e.agent_context or self.result.agent_result
+            step = next(
+                (
+                    step
+                    for step in self.result.step_results or []
+                    if recovery_context is not None
+                    and step.agent_result is recovery_context
+                ),
+                None,
+            )
+            if step is not None:
+                step.exception_info = self.result.exception_info
             self._trial_paths.exception_message_path.write_text(traceback.format_exc())
+            # Confirmed stop permits local accounting only, never grading or
+            # sandbox reads on the cleanup-failure path.
+            if (
+                e.sandbox_stopped
+                and self._environment.capabilities.mounted
+                and isinstance(self._agent, BaseInstalledAgent)
+                and recovery_context is not None
+            ):
+                try:
+                    self._agent.populate_local_context_after_cleanup_failure(
+                        recovery_context
+                    )
+                    if recovery_context.n_agent_steps is None:
+                        recovery_context.n_agent_steps = (
+                            _agent_step_count_from_trajectory_path(
+                                self._trial_paths.agent_dir / "trajectory.json"
+                            )
+                        )
+                except Exception:
+                    self._logger.warning(
+                        "Failed to recover local usage after cleanup failure",
+                        exc_info=True,
+                    )
+                if step is not None:
+                    try:
+                        _relocate_dir_contents(
+                            self._trial_paths.agent_dir,
+                            self._trial_paths.step_agent_dir(step.step_name),
+                        )
+                    except OSError:
+                        self._logger.warning(
+                            "Failed to relocate agent logs after cleanup failure",
+                            exc_info=True,
+                        )
+            if cancellation is not None:
+                await self._invoke_hooks(TrialEvent.CANCEL)
+                raise cancellation
 
         except Exception as e:
             self._logger.debug(f"Trial {self.config.trial_name} failed: {e}")
