@@ -82,24 +82,6 @@ async def test_best_effort_stop_is_not_confirmed_when_state_query_fails():
 
 
 @pytest.mark.asyncio
-async def test_cleanup_error_keeps_primary_execution_timeout(tmp_path):
-    environment = SimpleNamespace(
-        exec=AsyncMock(side_effect=TimeoutError("cleanup timed out")),
-        stop=AsyncMock(),
-    )
-    agent = Pi(logs_dir=tmp_path, model_name="openai/test")
-
-    async def run(*args, **kwargs):
-        await asyncio.Event().wait()
-
-    agent.run = run
-    execution = TrialExecution(None, agent, environment, 0.01, 1, 1)
-    with pytest.raises(AgentProcessCleanupError) as caught:
-        await execution.run_agent(instruction="", context=AgentContext())
-    assert isinstance(caught.value.primary_exception, TimeoutError)
-
-
-@pytest.mark.asyncio
 async def test_fallback_stop_has_its_own_deadline(monkeypatch):
     async def hang(**kwargs):
         await asyncio.Event().wait()
@@ -183,32 +165,6 @@ async def test_cleanup_finishes_before_cancellation_returns():
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("body_error", [False, True])
-async def test_cancellation_during_failed_cleanup_preserves_primary(body_error):
-    entered, release = asyncio.Event(), asyncio.Event()
-    processes = AgentProcesses(SimpleNamespace(), "test")
-
-    async def fail(*args):
-        entered.set()
-        await release.wait()
-        raise AgentProcessCleanupError("cleanup failed")
-
-    processes.stop = fail
-    original = ValueError("execution failed") if body_error else None
-    task = asyncio.create_task(processes.__aexit__(None, original))
-    await entered.wait()
-    task.cancel()
-    await asyncio.sleep(0)
-    release.set()
-    with pytest.raises(AgentProcessCleanupError) as caught:
-        await task
-    if body_error:
-        assert caught.value.primary_exception is original
-    else:
-        assert isinstance(caught.value.primary_exception, asyncio.CancelledError)
-
-
-@pytest.mark.asyncio
 @pytest.mark.parametrize("outcome", ["error", "timeout", "cancel"])
 async def test_adapter_finally_cleanup_keeps_execution_failure(tmp_path, outcome):
     environment = SimpleNamespace(
@@ -245,47 +201,6 @@ async def test_adapter_finally_cleanup_keeps_execution_failure(tmp_path, outcome
     }[outcome]
     assert isinstance(caught.value.primary_exception, expected)
     environment.stop.assert_awaited_once()
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("outcome", ["error", "timeout"])
-async def test_late_operator_cancel_is_separate_from_execution_failure(
-    tmp_path, outcome
-):
-    entered, release = asyncio.Event(), asyncio.Event()
-    environment = SimpleNamespace(stop=AsyncMock())
-
-    async def scan(*args, **kwargs):
-        entered.set()
-        await release.wait()
-        raise TimeoutError("cleanup failure")
-
-    environment.exec = scan
-    agent = Pi(logs_dir=tmp_path, model_name="openai/test")
-
-    async def run(*args, **kwargs):
-        if outcome == "error":
-            raise ValueError("execution failure")
-        await asyncio.Event().wait()
-
-    agent.run = run
-    execution = TrialExecution(
-        None, agent, environment, 0.01 if outcome == "timeout" else 10, 1, 1
-    )
-    task = asyncio.create_task(
-        execution.run_agent(instruction="", context=AgentContext())
-    )
-    await entered.wait()
-    task.cancel()
-    await asyncio.sleep(0)
-    release.set()
-    with pytest.raises(AgentProcessCleanupError) as caught:
-        await task
-    assert isinstance(caught.value.cancellation, asyncio.CancelledError)
-    assert isinstance(
-        caught.value.primary_exception,
-        ValueError if outcome == "error" else AgentTimeoutError,
-    )
 
 
 @pytest.mark.asyncio

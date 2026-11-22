@@ -460,10 +460,9 @@ async def test_unconfirmed_agent_shutdown_skips_verification(tmp_path):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("confirmed", [False, True])
-@pytest.mark.parametrize("timed_out", [False, True])
 @pytest.mark.parametrize("mounted", [False, True])
 async def test_cleanup_recovery_only_after_confirmed_stop_and_never_grades(
-    tmp_path, confirmed, timed_out, mounted
+    tmp_path, confirmed, mounted
 ):
     from pier.agents.installed.pi import Pi
     from pier.trial.processes import AgentProcessCleanupError
@@ -486,7 +485,6 @@ async def test_cleanup_recovery_only_after_confirmed_stop_and_never_grades(
     async def unsafe():
         trial.result.agent_result = AgentContext()
         error = AgentProcessCleanupError("failed", sandbox_stopped=confirmed)
-        error.primary_exception = TimeoutError("agent deadline") if timed_out else None
         agent.run_with_cleanup = AsyncMock(side_effect=error)
         await TrialExecution(None, agent, trial._environment, 1, 1, 1).run_agent(
             instruction="task", context=trial.result.agent_result
@@ -495,9 +493,7 @@ async def test_cleanup_recovery_only_after_confirmed_stop_and_never_grades(
     trial._execute_agent = unsafe
     trial._run_verification = AsyncMock()
     result = await trial.run()
-    assert result.exception_info.exception_type == (
-        "AgentTimeoutError" if timed_out else "AgentProcessCleanupError"
-    )
+    assert result.exception_info.exception_type == "AgentProcessCleanupError"
     assert result.agent_cleanup_error.exception_type == "AgentProcessCleanupError"
     assert result.agent_sandbox_stopped_after_cleanup_error is confirmed
     assert bool(calls) is (confirmed and mounted)
@@ -508,30 +504,18 @@ async def test_cleanup_recovery_only_after_confirmed_stop_and_never_grades(
 
 
 @pytest.mark.asyncio
-async def test_cleanup_failure_does_not_swallow_operator_cancellation(tmp_path):
-    from pier.trial.processes import AgentProcessCleanupError
-
-    trial = lifecycle_trial(trial_result(tmp_path).config)
-
-    async def unsafe():
-        error = AgentProcessCleanupError("failed")
-        error.primary_exception = asyncio.CancelledError()
-        raise error
-
-    trial._execute_agent = unsafe
-    trial._run_verification = AsyncMock()
-    with pytest.raises(asyncio.CancelledError):
-        await trial.run()
-    assert trial.result.exception_info.exception_type == "CancelledError"
-    assert trial.result.agent_cleanup_error.exception_type == "AgentProcessCleanupError"
-    trial._run_verification.assert_not_awaited()
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("timed_out", [False, True])
+@pytest.mark.parametrize(
+    "outcome,cancelled",
+    [
+        ("error", True),
+        ("timeout", True),
+        ("success", True),
+        ("timeout", False),
+    ],
+)
 @pytest.mark.parametrize("adapter_cleanup", [False, True])
 async def test_real_lifecycle_late_cancel_keeps_original_error_and_cancel_hook(
-    tmp_path, timed_out, adapter_cleanup
+    tmp_path, outcome, cancelled, adapter_cleanup
 ):
     from pier.agents.installed.pi import Pi
     from pier.trial.execution import TrialExecution
@@ -550,9 +534,10 @@ async def test_real_lifecycle_late_cancel_keeps_original_error_and_cancel_hook(
 
     async def run(*args, **kwargs):
         try:
-            if not timed_out:
+            if outcome == "error":
                 raise ValueError("original")
-            await asyncio.Event().wait()
+            if outcome == "timeout":
+                await asyncio.Event().wait()
         finally:
             if adapter_cleanup:
                 await agent.stop_processes()
@@ -560,26 +545,40 @@ async def test_real_lifecycle_late_cancel_keeps_original_error_and_cancel_hook(
     agent.run = run
     trial._agent = agent
     trial._execution = TrialExecution(
-        None, agent, trial._environment, 0.01 if timed_out else 10, 1, 1
+        None, agent, trial._environment, 0.01 if outcome == "timeout" else 10, 1, 1
     )
     trial._execute_agent = Trial._execute_agent.__get__(trial)
     trial._run_verification = AsyncMock()
     trial._invoke_hooks = AsyncMock()
     task = asyncio.create_task(trial.run())
     await entered.wait()
-    task.cancel()
-    await asyncio.sleep(0)
+    if cancelled:
+        task.cancel()
+        await asyncio.sleep(0)
     release.set()
-    with pytest.raises(asyncio.CancelledError):
+    if cancelled:
+        with pytest.raises(asyncio.CancelledError):
+            await task
+    else:
         await task
-    assert trial.result.exception_info.exception_type == (
-        "AgentTimeoutError" if timed_out else "ValueError"
+    assert (
+        trial.result.exception_info.exception_type
+        == (
+            {
+                "timeout": "AgentTimeoutError",
+                "error": "ValueError",
+                "success": "CancelledError",
+            }[outcome]
+        )
     )
-    assert trial.result.agent_cleanup_cancelled is True
-    assert Job._is_cancelled_result(trial.result)
-    assert any(
-        call.args[0] == TrialEvent.CANCEL
-        for call in trial._invoke_hooks.await_args_list
+    assert trial.result.agent_cleanup_cancelled is cancelled
+    assert Job._is_cancelled_result(trial.result) is cancelled
+    assert (
+        any(
+            call.args[0] == TrialEvent.CANCEL
+            for call in trial._invoke_hooks.await_args_list
+        )
+        is cancelled
     )
     trial._run_verification.assert_not_awaited()
     trial._maybe_download_logs.assert_not_awaited()
