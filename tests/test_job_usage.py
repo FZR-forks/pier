@@ -529,8 +529,9 @@ async def test_cleanup_failure_does_not_swallow_operator_cancellation(tmp_path):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("timed_out", [False, True])
+@pytest.mark.parametrize("adapter_cleanup", [False, True])
 async def test_real_lifecycle_late_cancel_keeps_original_error_and_cancel_hook(
-    tmp_path, timed_out
+    tmp_path, timed_out, adapter_cleanup
 ):
     from pier.agents.installed.pi import Pi
     from pier.trial.execution import TrialExecution
@@ -548,9 +549,13 @@ async def test_real_lifecycle_late_cancel_keeps_original_error_and_cancel_hook(
     agent = Pi(logs_dir=trial._trial_paths.agent_dir, model_name="anthropic/test")
 
     async def run(*args, **kwargs):
-        if not timed_out:
-            raise ValueError("original")
-        await asyncio.Event().wait()
+        try:
+            if not timed_out:
+                raise ValueError("original")
+            await asyncio.Event().wait()
+        finally:
+            if adapter_cleanup:
+                await agent.stop_processes()
 
     agent.run = run
     trial._agent = agent
@@ -646,3 +651,58 @@ def test_cleanup_cancellation_uses_same_definition_in_live_and_saved_job_stats(
     assert stats.n_cancelled_trials == 1
     stats.remove_trial(result)
     assert stats.n_cancelled_trials == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cancelled", [False, True])
+async def test_log_relocation_failure_cannot_replace_cleanup_or_cancel(
+    tmp_path, monkeypatch, cancelled
+):
+    from pier.agents.installed.pi import Pi
+    from pier.trial.execution import TrialExecution
+    from pier.trial.hooks import TrialEvent
+    from pier.trial.processes import AgentProcessCleanupError
+
+    trial = lifecycle_trial(trial_result(tmp_path).config)
+    trial._task.has_steps = True
+    trial._task.step_instruction = lambda name: "task"
+    trial._environment.capabilities = SimpleNamespace(mounted=True)
+    agent = Pi(logs_dir=trial._trial_paths.agent_dir, model_name="anthropic/test")
+    error = AgentProcessCleanupError("cleanup failed", sandbox_stopped=True)
+    error.cancellation = asyncio.CancelledError() if cancelled else None
+    agent.run_with_cleanup = AsyncMock(side_effect=error)
+    trial._agent = agent
+    trial._execution = TrialExecution(None, agent, trial._environment, 1, 1, 1)
+    trial._run_verification = AsyncMock()
+    trial._invoke_hooks = AsyncMock()
+    current = StepResult(step_name="current")
+
+    async def steps():
+        trial.result.step_results = [current]
+        (trial._trial_paths.agent_dir / "pi.txt").write_text("saved evidence")
+        await trial._execute_step_agent(
+            SimpleNamespace(name="current", agent=SimpleNamespace(timeout_sec=1)),
+            current,
+        )
+
+    def cannot_move(*args):
+        raise PermissionError("step directory is read-only")
+
+    trial._run_steps = steps
+    monkeypatch.setattr("pier.trial.trial._relocate_dir_contents", cannot_move)
+    if cancelled:
+        with pytest.raises(asyncio.CancelledError):
+            await trial.run()
+    else:
+        await trial.run()
+    assert trial.result.exception_info.exception_type == "AgentProcessCleanupError"
+    assert trial.result.agent_cleanup_cancelled is cancelled
+    assert (trial._trial_paths.agent_dir / "pi.txt").read_text() == "saved evidence"
+    cancel_hooks = [
+        call
+        for call in trial._invoke_hooks.await_args_list
+        if call.args[0] == TrialEvent.CANCEL
+    ]
+    assert bool(cancel_hooks) is cancelled
+    trial._run_verification.assert_not_awaited()
+    trial._maybe_download_logs.assert_not_awaited()

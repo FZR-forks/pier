@@ -392,6 +392,8 @@ class BaseInstalledAgent(BaseAgent, ABC):
     async def stop_processes(self, keep_pids: tuple[int, ...] = ()) -> None:
         """Stop tools before an adapter copies its native session logs."""
         primary = sys.exception()
+        deadline = getattr(self, "_run_deadline", None)
+        expired_before_cleanup = deadline is not None and deadline.expired()
         self.finish_execution()
         if processes := self._run_processes:
             try:
@@ -399,6 +401,9 @@ class BaseInstalledAgent(BaseAgent, ABC):
             except AgentProcessCleanupError as exc:
                 self._process_cleanup_error = exc
                 exc.preserve_primary(primary)
+                # Snapshot the execution deadline before awaiting cleanup so a
+                # later operator cancel cannot erase the original timeout.
+                exc.classify_deadline(expired_before_cleanup)
                 raise
 
     async def _exec(

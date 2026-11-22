@@ -1099,10 +1099,16 @@ class Trial:
                         exc_info=True,
                     )
                 if step is not None:
-                    _relocate_dir_contents(
-                        self._trial_paths.agent_dir,
-                        self._trial_paths.step_agent_dir(step.step_name),
-                    )
+                    try:
+                        _relocate_dir_contents(
+                            self._trial_paths.agent_dir,
+                            self._trial_paths.step_agent_dir(step.step_name),
+                        )
+                    except OSError:
+                        self._logger.warning(
+                            "Failed to relocate agent logs after cleanup failure",
+                            exc_info=True,
+                        )
             if cancellation is not None:
                 await self._invoke_hooks(TrialEvent.CANCEL)
                 raise cancellation

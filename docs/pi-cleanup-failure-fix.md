@@ -87,6 +87,11 @@ warming payload retain the normal converter's prior ignore behavior. Invalid
 negative/boolean token counts remain unknown rather than usable accounting.
 Exact cost requires all records; incomplete recovery retains positive known-cost
 subtotals as observed values and never labels default missing pricing as free.
+Adapter cleanup snapshots an already-expired execution deadline before awaiting
+shutdown. A later operator cancel is independent: the primary timeout is retained
+and cancellation still propagates. A failed move of stable multi-step logs is
+logged without replacing either failure; files not yet moved remain available in
+the original agent directory.
 
 ## Safety limits
 

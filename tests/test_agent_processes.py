@@ -153,6 +153,7 @@ async def test_deadline_and_external_cancel_before_adapter_cleanup(
         await task
     assert task.cancelling() > 0
     assert isinstance(caught.value.cancellation, asyncio.CancelledError)
+    assert isinstance(caught.value.primary_exception, AgentTimeoutError)
 
 
 @pytest.mark.asyncio
